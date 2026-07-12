@@ -1,0 +1,15 @@
+[package]
+name = "ironcondor"
+version = "0.0.1"
+edition = "2024"
+authors = ["Joaquin Bejar <jb@taunais.com>"]
+description = "High-performance backtesting engine for options trading strategies with order-book-level fill simulation. Built on OptionStratLib."
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/joaquinbejar/IronCondor"
+homepage = "https://github.com/joaquinbejar/IronCondor"
+keywords = ["finance", "options", "trading", "backtesting", "quant"]
+categories = ["finance", "simulation"]
+include = ["src/**/*", "Cargo.toml", "README.md", "LICENSE"]
+
+[dependencies]
