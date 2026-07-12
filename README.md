@@ -34,6 +34,13 @@ Part of a family of Rust crates for options trading infrastructure:
 [PriceLevel](https://github.com/joaquinbejar/PriceLevel) ·
 [Option-Chain-OrderBook](https://github.com/joaquinbejar/Option-Chain-OrderBook)
 
+## Documentation
+
+The full design documentation (PRD, roadmap, domain model, engine
+architecture, execution models, analytics/reporting, Python bindings, and
+ADRs) is maintained locally during the design phase and will be published
+with the first implementation release (v0.1.0).
+
 ## License
 
 MIT — see [LICENSE](./LICENSE).
