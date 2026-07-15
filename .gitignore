@@ -1,7 +1,11 @@
 /target
 /.claude
+/.idea
 /docs
 /rules
 /AGENTS.md
 /CLAUDE.md
 /milestones
+.env
+proptest-regressions/
+*.hgrm
