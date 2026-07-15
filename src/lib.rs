@@ -86,8 +86,8 @@ pub mod python;
 
 pub use config::{BacktestConfig, FeeSchedule, ResourceLimits, SlippageModel};
 pub use data::{
-    DataFeed, DataSourceSpec, FeedKind, RawQuote, SnapshotMeta, TapeMeta, feed_catalogue,
-    raw_quotes_to_snapshot, snapshot_to_option_chain,
+    DataFeed, DataSourceSpec, FeedKind, ParquetFeed, RawQuote, SnapshotMeta, TapeMeta,
+    feed_catalogue, raw_quotes_to_snapshot, snapshot_to_option_chain,
 };
 pub use domain::{
     Cents, ChainSnapshot, ContractKey, ExecutionMode, Fill, InstrumentSpec, OrderCommand, OrderId,

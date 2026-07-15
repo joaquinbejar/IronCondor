@@ -37,6 +37,16 @@ optionstratlib = { version = "0.18", default-features = false }
 rust_decimal = { version = "1", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
+# Columnar stack for the Parquet historical feed (the default v0.1 release
+# feed) and, later, the result-bundle writer (#34, ADR-0004) — one stack,
+# read and write. `default-features = false` drops parquet's async path
+# (tokio/futures); `arrow` enables the record-batch reader, `snap` the
+# ubiquitous Snappy page codec. Licence: Apache-2.0.
+arrow = { version = "59", default-features = false }
+parquet = { version = "59", default-features = false, features = ["arrow", "snap"] }
+# Streaming file sha256 = the tape data-identity for file feeds. Licence:
+# MIT OR Apache-2.0.
+sha2 = "0.10"
 # simulator feed transport — feature-gated, absent from the default build.
 # reqwest: pure-Rust rustls TLS (no system OpenSSL, reproducible CI) + json.
 reqwest = { version = "0.12", default-features = false, features = [
@@ -56,3 +66,6 @@ positive = "0.5"
 proptest = "1"
 rust_decimal_macros = "1"
 serde_json = "1"
+# Scratch Parquet fixtures are generated into a tempdir in-test — no committed
+# binary. Licence: MIT OR Apache-2.0.
+tempfile = "3"
