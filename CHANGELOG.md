@@ -10,6 +10,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The `DataFeed` seam (`src/data/feed.rs`): a trait exposing exactly
+  `next` / `meta` / `tape_meta` (no peek/rewind — no look-ahead by
+  construction), the engine-facing `TapeMeta` (`data_identity`, `non_empty`,
+  `first_ts`, `final_step`) available before any writer exists so startup can
+  derive `run_id`, and the `FeedKind` catalogue classifying each feed by
+  feature flag and determinism source. Every feed materialises a validated,
+  strictly-ordered, immutable tape before the loop and yields from it
+  synchronously — `next` never blocks or `.await`s (#8).
+- `DataSourceSpec` gains the feature-gated `Simulator` variant (session,
+  base URL, intent-only `data_seed`, tape sha256, simulator version) (#8).
+
 - The single chain-conversion boundary (`src/data/convert.rs`, hot path H3):
   a DTO-independent validation core `raw_quotes_to_snapshot` (strike
   positivity, tick alignment, crossed-quote rejection, the one
