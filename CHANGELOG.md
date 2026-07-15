@@ -10,6 +10,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The `ExecutionModel` seam (`src/execution/mod.rs`): the command→fill trait
+  (`fill` appends into a caller-owned `&mut Vec<Fill>` so PB-1 is satisfiable
+  by the signature; `mode()`), and the shared `assemble_fill` helper — the
+  single place a `Fill` is stamped with its mode, its signed `slippage` (via
+  the `sign_convention` helper, never reinvented), and its `fees` — so both
+  fill models are byte-shape identical. The per-order-once fee split is
+  expressed by a caller-supplied `FeeCharge {FirstFill, LaterFill}` (the
+  domain `Fill` has no `fill_seq`; that ordinal lives on the bundle `FillRow`
+  at v0.3) (#12).
+
 - `IronCondor` wired as the single v0.1 strategy: `StrategySpec` /
   `IronCondorSpec` (the manifest's strategy kind + parameters, money in
   integer cents, analytics `Decimal`) and `OptStratAdapter::from_spec`

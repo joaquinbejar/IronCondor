@@ -1,12 +1,20 @@
 //! Property tests for the canonical domain types.
 
 use ironcondor::{
-    BacktestError, Cents, ContractKey, PriceCents, Quantity, RawQuote, SimClock, SimTime,
-    SnapshotMeta, StepIndex, Ticks, Underlying, raw_quotes_to_snapshot,
+    BacktestError, Cents, ContractKey, ExecutionMode, Fill, PriceCents, Quantity, RawQuote,
+    SimClock, SimTime, SnapshotMeta, StepIndex, Ticks, Underlying, raw_quotes_to_snapshot,
 };
 use optionstratlib::prelude::Positive;
-use optionstratlib::{ExpirationDate, OptionStyle};
+use optionstratlib::{ExpirationDate, OptionStyle, Side};
 use proptest::prelude::*;
+
+/// The JSON object keys of a serialised value, sorted — the field *shape* of
+/// a bundle/record type, independent of its values.
+fn json_object_keys(value: &serde_json::Value) -> Option<Vec<String>> {
+    let mut keys: Vec<String> = value.as_object()?.keys().cloned().collect();
+    keys.sort();
+    Some(keys)
+}
 
 /// The tape anchor `ts_0` used by the conversion property tests.
 const TS0: i64 = 1_750_291_200_000_000_000;
@@ -269,5 +277,69 @@ proptest! {
         // Integer oracle: pure ts_0 + n·86400e9, no calendar, no DST.
         let expected = TS0 + i64::from(n) * NANOS_PER_DAY;
         prop_assert!(matches!(key.expiration_ns(), Ok(ns) if ns == expected));
+    }
+
+    /// Scaffold for the v0.2 cross-mode parity guarantee: the shared `Fill`
+    /// shape is mode-agnostic. For any field values, a fill built under
+    /// `Naive` and one built under `Realistic` differ **only** in `mode` —
+    /// the serialised field *shape* (its JSON key set) is identical, and
+    /// re-stamping the mode makes the two fully equal, so analytics cannot
+    /// tell which model produced a fill from its structure. The assembler
+    /// that enforces this at the source is `pub(crate)` and unit-tested in
+    /// `src/execution/mod.rs`; this scaffold pins the invariant at the public
+    /// `Fill` boundary.
+    #[test]
+    fn fill_report_shape_mode_agnostic(
+        ts in any::<i64>(),
+        step in any::<u32>(),
+        strike in any::<u64>(),
+        is_call in any::<bool>(),
+        is_long in any::<bool>(),
+        quantity in 1u32..,
+        price in any::<u64>(),
+        fees in 0i64..,
+        slippage in any::<i64>(),
+    ) {
+        let underlying = Underlying::new("SPX");
+        prop_assert!(underlying.is_ok());
+        let Ok(underlying) = underlying else { return Ok(()); };
+        let quantity = Quantity::new(quantity);
+        prop_assert!(quantity.is_ok());
+        let Ok(quantity) = quantity else { return Ok(()); };
+        let contract = ContractKey {
+            underlying,
+            expiration: ExpirationDate::DateTime(chrono::DateTime::from_timestamp_nanos(ts)),
+            strike: PriceCents::new(strike),
+            style: if is_call { OptionStyle::Call } else { OptionStyle::Put },
+        };
+        let side = if is_long { Side::Long } else { Side::Short };
+        let fill = |mode| Fill {
+            ts: SimTime::new(ts),
+            step: StepIndex::new(step),
+            contract: contract.clone(),
+            side,
+            quantity,
+            price: PriceCents::new(price),
+            fees: Cents::new(fees),
+            slippage: Cents::new(slippage),
+            mode,
+        };
+        let naive = fill(ExecutionMode::Naive);
+        let realistic = fill(ExecutionMode::Realistic);
+
+        // The serialised field shape is identical regardless of mode.
+        let naive_json = serde_json::to_value(&naive);
+        let realistic_json = serde_json::to_value(&realistic);
+        prop_assert!(naive_json.is_ok() && realistic_json.is_ok());
+        let (Ok(naive_json), Ok(realistic_json)) = (naive_json, realistic_json) else {
+            return Ok(());
+        };
+        prop_assert_eq!(json_object_keys(&naive_json), json_object_keys(&realistic_json));
+
+        // Only `mode` differs: re-stamping it makes the two fully equal.
+        prop_assert_ne!(naive.mode, realistic.mode);
+        let mut rebadged = naive;
+        rebadged.mode = ExecutionMode::Realistic;
+        prop_assert_eq!(rebadged, realistic);
     }
 }
