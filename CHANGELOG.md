@@ -10,6 +10,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The golden determinism test over the v0.1 artifacts
+  (`tests/golden/iron_condor_naive/`): the committed equity curve and minimal
+  metrics for the canonical `IronCondor` naive run, the single reusable
+  comparison oracle (decode → sort by `step` → integer cents compared
+  exactly, analytic floats within the docs/05 §12.5 tolerance), a
+  same-environment run-twice byte-identity test, and a `BLESS=1` regeneration
+  path so a deliberate engine change re-blesses the artifact in the same
+  commit. Scoped to the equity curve + minimal metrics only — the four-table
+  bundle and `manifest.json` golden land at v0.3 (#17).
+- The `golden` CI job (`cargo test --test golden`); `proptest-regressions/`
+  is now tracked so generated regression seeds are committed (#17).
+
 - The v0.1 end-to-end slice is complete: `run_backtest`
   (`src/run.rs`) — a top-level composition root above both engine and
   analytics — ties `ParquetFeed` + `IronCondor` + `NaiveFill` + the ledger +
