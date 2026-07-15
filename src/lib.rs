@@ -97,7 +97,7 @@ pub use domain::{
 };
 pub use engine::{
     BacktestEngine, BacktestRun, ChainContext, ConfigOverride, Event, Ledger, OptStratAdapter,
-    PositionableStrategy, ScenarioParams, ScenarioType, SimClock, Strategy,
+    PositionMark, PositionableStrategy, ScenarioParams, ScenarioType, SimClock, Strategy,
 };
 pub use error::BacktestError;
 pub use execution::{ExecutionModel, NaiveFill};

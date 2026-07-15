@@ -22,6 +22,6 @@ pub mod strategy;
 
 pub use backtest::{BacktestEngine, BacktestRun};
 pub use clock::{Event, SimClock};
-pub use ledger::Ledger;
+pub use ledger::{Ledger, PositionMark};
 pub use scenario::{ConfigOverride, ScenarioParams, ScenarioType};
 pub use strategy::{ChainContext, OptStratAdapter, PositionableStrategy, Strategy};
