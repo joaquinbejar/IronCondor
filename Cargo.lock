@@ -1181,6 +1181,7 @@ dependencies = [
  "parquet",
  "positive",
  "proptest",
+ "rand_chacha 0.3.1",
  "reqwest",
  "rust_decimal",
  "rust_decimal_macros",

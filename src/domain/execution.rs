@@ -153,6 +153,49 @@ pub enum OrderCommand {
     },
 }
 
+/// A currently-open strategy leg as the engine tracks it — the read model a
+/// [`crate::engine::Strategy`] sees through [`crate::engine::ChainContext::open`].
+///
+/// The engine mints the stable [`PositionId`] when the opening intent fills
+/// and carries the per-contract `entry_premium` (integer cents) forward: that
+/// premium is the `initial_premium` an [`crate::engine::OptStratAdapter`]
+/// reconciles a price/percent [`optionstratlib::simulation::ExitPolicy`]
+/// against. The upstream `optionstratlib` strategy object is a static leg
+/// *definition*; this is the engine's authoritative *inventory* of what is
+/// actually open, so exit evaluation drives off it, not off the strategy's own
+/// `get_positions()`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenPosition {
+    /// The engine-minted stable identity — the handle a `Close` targets.
+    pub position_id: PositionId,
+    /// The open leg's contract identity (the join key into a snapshot quote).
+    pub contract: ContractKey,
+    /// The direction the leg was opened in (`Long` bought, `Short` sold);
+    /// closing it trades the opposite side.
+    pub side: Side,
+    /// The open contract count (`> 0`).
+    pub quantity: Quantity,
+    /// Per-contract premium paid/received at entry, integer cents — the
+    /// `initial_premium` reference for percent/price exit policies.
+    pub entry_premium: PriceCents,
+}
+
+/// A resting strategy order the engine still holds — the read model a strategy
+/// sees through [`crate::engine::ChainContext::pending`], addressable for
+/// cancel/replace by its stable [`OrderId`] handle.
+///
+/// Only the strategy's **own** resting orders appear here; seeded-maker
+/// liquidity is never visible or addressable, so membership in `pending` is
+/// exactly the ownership test for a `Cancel`/`Replace`
+/// ([docs/02 §4](../../../docs/02-engine-architecture.md#4-the-strategy-trait)).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingOrder {
+    /// The stable handle the strategy cancels or replaces this order by.
+    pub order_id: OrderId,
+    /// The resting intent still working in the book.
+    pub intent: OrderIntent,
+}
+
 /// One execution record — the identical shape in both fill modes, so
 /// analytics cannot tell which `ExecutionModel` produced it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

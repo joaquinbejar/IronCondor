@@ -10,6 +10,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The engine-facing `Strategy` seam (`src/engine/strategy.rs`): the `Strategy`
+  trait (`on_start` / `exits` / `on_snapshot` / `on_end`, each appending into a
+  caller-owned `&mut Vec<OrderCommand>` so PB-1 is satisfiable by the
+  signature), the step-scoped `ChainContext` (snapshot, open inventory,
+  pending orders, the sole seeded `ChaCha8Rng`, step), and `OptStratAdapter`
+  wrapping any `PositionableStrategy` — the **single** owner of exit-policy
+  evaluation, repricing the wrapped strategy and evaluating the configured
+  `optionstratlib` `ExitPolicy` via the per-leg `check_exit_policy`, appending
+  closing commands only (#10).
+- `OpenPosition` and `PendingOrder` domain records — the engine's authoritative
+  open-leg inventory and resting-order read models a strategy sees (#10).
+- `rand_chacha` dependency (seeded `ChaCha8Rng` — the run's sole randomness
+  source; `thread_rng` is never used) (#10).
+
 - The Parquet historical feed (`src/data/historical.rs`, `ParquetFeed`) — the
   single v0.1 release feed. Reads one columnar file, groups rows into
   `ChainSnapshot`s by ascending `step`, funnels each through the single

@@ -90,12 +90,13 @@ pub use data::{
     feed_catalogue, raw_quotes_to_snapshot, snapshot_to_option_chain,
 };
 pub use domain::{
-    Cents, ChainSnapshot, ContractKey, ExecutionMode, Fill, InstrumentSpec, OrderCommand, OrderId,
-    OrderIntent, PositionAction, PositionId, PriceCents, Quantity, QuoteView, SimTime, StepIndex,
-    Ticks, TimeInForce, TradeId, Underlying,
+    Cents, ChainSnapshot, ContractKey, ExecutionMode, Fill, InstrumentSpec, OpenPosition,
+    OrderCommand, OrderId, OrderIntent, PendingOrder, PositionAction, PositionId, PriceCents,
+    Quantity, QuoteView, SimTime, StepIndex, Ticks, TimeInForce, TradeId, Underlying,
 };
 pub use engine::{
-    ConfigOverride, Event, PositionableStrategy, ScenarioParams, ScenarioType, SimClock,
+    ChainContext, ConfigOverride, Event, OptStratAdapter, PositionableStrategy, ScenarioParams,
+    ScenarioType, SimClock, Strategy,
 };
 pub use error::BacktestError;
 
