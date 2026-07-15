@@ -84,8 +84,10 @@ pub mod execution;
 #[cfg(feature = "python")]
 pub mod python;
 
-// Public re-export surface — intentionally empty until the first canonical
-// types land (roadmap issues #2 and #3).
+pub use config::{BacktestConfig, FeeSchedule, ResourceLimits, SlippageModel};
+pub use data::DataSourceSpec;
+pub use domain::ExecutionMode;
+pub use error::BacktestError;
 
 #[cfg(test)]
 mod tests {
