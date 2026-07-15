@@ -10,6 +10,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Migrated the `OptionStratBacktest` core (reviewed, not copied): the async
+  `ApiClient` for OptionChain-Simulator sessions with locally defined wire
+  DTOs, the `MarketSimulator` step wrapper, the `PositionableStrategy` bound
+  (exactly `Positionable + Strategies + Optimizable`, no `Default`), and the
+  `ScenarioType`/`ScenarioParams` data types — all simulator networking
+  behind the `simulator` feature, absent from the default build (#6).
+- Feature-gated dependencies for the `simulator` feature: `reqwest 0.12`
+  (rustls, json), `tokio 1` (rt, macros), `serde_json 1` (#6).
+
+### Fixed
+
+- `MarketSimulator::is_terminated()` now returns `true` when no session
+  exists (was `false` in the migrated source — a loop built on it could
+  never start safely) (#6).
+- `MarketSimulator` per-step session state is derived from the server's
+  actual `session_info` step counters (`from_progress`) and the wire state
+  string on session creation (`from_wire`) instead of a hardcoded
+  `SessionState::InProgress` (#6).
+
 - `SimClock` (`src/engine/clock.rs`): the deterministic, no-wall-clock time
   source the replay loop advances — `advance_to` rejects a duplicate or
   reversed timestamp as `DataOutOfOrder` (gaps preserved, never reordered);

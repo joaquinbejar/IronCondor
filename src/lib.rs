@@ -91,8 +91,20 @@ pub use domain::{
     OrderIntent, PositionAction, PositionId, PriceCents, Quantity, QuoteView, SimTime, StepIndex,
     Ticks, TimeInForce, TradeId, Underlying,
 };
-pub use engine::{Event, SimClock};
+pub use engine::{
+    ConfigOverride, Event, PositionableStrategy, ScenarioParams, ScenarioType, SimClock,
+};
 pub use error::BacktestError;
+
+/// The migrated OptionChain-Simulator session surface (feature `simulator`):
+/// the async [`data::simulator::ApiClient`] and the bug-fixed
+/// [`data::simulator::MarketSimulator`] step wrapper, plus the local wire DTOs.
+#[cfg(feature = "simulator")]
+pub use data::simulator::{
+    ApiClient, ChainResponse, CreateSessionRequest, ErrorResponse, MarketSimulator, MarketState,
+    OptionContractResponse, OptionPriceResponse, SessionInfoResponse, SessionResponse,
+    SessionState, UpdateSessionRequest,
+};
 
 #[cfg(test)]
 mod tests {
