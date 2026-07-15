@@ -15,6 +15,8 @@ use sha2::{Digest, Sha256};
 
 use ironcondor::{DataFeed, DataSourceSpec, ParquetFeed, ResourceLimits};
 
+mod common;
+
 const TS0: i64 = 1_750_291_200_000_000_000;
 const NANOS_PER_DAY: i64 = 86_400_000_000_000;
 const EXPIRY: i64 = TS0 + 30 * NANOS_PER_DAY;
@@ -168,4 +170,71 @@ fn test_parquet_feed_drives_ordered_tape_to_exhaustion_with_verified_identity() 
     assert_eq!(count, 3, "three steps materialise into three snapshots");
     // Exhaustion is sticky.
     assert!(matches!(feed.next(), Ok(None)));
+}
+
+#[test]
+fn test_iron_condor_run_over_parquet_fixture_produces_equity_curve() {
+    let Ok(dir) = tempfile::tempdir() else {
+        panic!("tempdir must create");
+    };
+    let path = dir.path().join("condor.parquet");
+    let rows = common::condor_rows(4, None);
+    if let Err(e) = common::write_parquet(&path, &rows) {
+        panic!("the condor fixture must write: {e}");
+    }
+
+    let Ok(run) = common::run_condor(&path, 11) else {
+        panic!("the iron-condor run over the fixture must succeed");
+    };
+
+    // One equity point per step (four snapshots), in step order.
+    assert_eq!(run.equity_curve.len(), 4);
+    let steps: Vec<u32> = run.equity_curve.iter().map(|p| p.step).collect();
+    assert_eq!(steps, vec![0, 1, 2, 3]);
+
+    // on_end closed every leg at the terminal step (no leg left open).
+    assert!(run.open_at_end.is_empty(), "on_end closes all four legs");
+
+    // The upstream result carries the fields #14 populates.
+    assert_eq!(run.result.strategy_name, "iron_condor");
+    assert_eq!(
+        run.result.initial_capital,
+        rust_decimal::Decimal::new(10_000_000, 2)
+    );
+    // The test period spans the tape's first and last snapshot timestamps (UTC),
+    // derived from SimTime ns — never Utc::now.
+    assert_eq!(
+        run.result.test_period_start.timestamp_nanos_opt(),
+        Some(common::TS0)
+    );
+    assert_eq!(
+        run.result.test_period_end.timestamp_nanos_opt(),
+        Some(common::TS0 + 3 * common::NANOS_PER_DAY)
+    );
+}
+
+#[test]
+fn test_iron_condor_run_is_byte_identical_across_two_runs() {
+    let Ok(dir) = tempfile::tempdir() else {
+        panic!("tempdir must create");
+    };
+    let path = dir.path().join("condor.parquet");
+    let rows = common::condor_rows(5, None);
+    if let Err(e) = common::write_parquet(&path, &rows) {
+        panic!("the condor fixture must write: {e}");
+    }
+
+    let Ok(first) = common::run_condor(&path, 99) else {
+        panic!("first run must succeed");
+    };
+    let Ok(second) = common::run_condor(&path, 99) else {
+        panic!("second run must succeed");
+    };
+
+    // Same (seed, config, data) ⇒ byte-identical equity curve, open tail, and
+    // the populated result scalars.
+    assert_eq!(first.equity_curve, second.equity_curve);
+    assert_eq!(first.open_at_end, second.open_at_end);
+    assert_eq!(first.result.final_capital, second.result.final_capital);
+    assert_eq!(first.result.initial_capital, second.result.initial_capital);
 }

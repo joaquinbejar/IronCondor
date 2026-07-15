@@ -90,14 +90,14 @@ pub use data::{
     feed_catalogue, raw_quotes_to_snapshot, snapshot_to_option_chain,
 };
 pub use domain::{
-    Cents, ChainSnapshot, ContractKey, ExecutionMode, Fill, InstrumentSpec, IronCondorSpec,
-    OpenPosition, OrderCommand, OrderId, OrderIntent, PendingOrder, PositionAction, PositionId,
-    PriceCents, Quantity, QuoteView, SimTime, StepIndex, StrategySpec, Ticks, TimeInForce, TradeId,
-    Underlying,
+    Cents, ChainSnapshot, ContractKey, EquityPoint, ExecutionMode, Fill, InstrumentSpec,
+    IronCondorSpec, OpenPosition, OrderCommand, OrderId, OrderIntent, PendingOrder, PositionAction,
+    PositionId, PriceCents, Quantity, QuoteView, SimTime, StepIndex, StrategySpec, Ticks,
+    TimeInForce, TradeId, Underlying,
 };
 pub use engine::{
-    ChainContext, ConfigOverride, Event, OptStratAdapter, PositionableStrategy, ScenarioParams,
-    ScenarioType, SimClock, Strategy,
+    BacktestEngine, BacktestRun, ChainContext, ConfigOverride, Event, Ledger, OptStratAdapter,
+    PositionableStrategy, ScenarioParams, ScenarioType, SimClock, Strategy,
 };
 pub use error::BacktestError;
 pub use execution::{ExecutionModel, NaiveFill};

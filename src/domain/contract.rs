@@ -18,6 +18,7 @@
 //! different expiry is a different contract, never "close enough".
 
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 
 use chrono::DateTime;
 use optionstratlib::{ExpirationDate, OptionStyle};
@@ -34,9 +35,22 @@ const CONTRACT_ID_VERSION: &str = "v1";
 /// Enforces the colon-free grammar `^[A-Z0-9._]{1,32}$` so a `contract_id`
 /// splits unambiguously on `:`. Serialises as a bare string; deserialisation
 /// re-validates the grammar.
+///
+/// # Interning (`Arc<str>`)
+///
+/// The ticker is held as an [`Arc<str>`] rather than an owned `String`, so
+/// cloning an `Underlying` — and therefore cloning a [`ContractKey`] and every
+/// `Fill` / `FillDraft` / `OpenPosition` / `QuoteView` that owns one — is a
+/// refcount bump, not a heap allocation. This removes the per-fill `String`
+/// allocation from the warm replay-step body (PB-1,
+/// [docs/07 §4](../../../docs/07-performance-and-security.md#4-allocation-discipline-on-the-replay-loop)):
+/// the one allocation happens once, in [`Underlying::new`], when the validated
+/// ticker is interned. `Arc<str>` derefs to `str`, so the derived
+/// `Eq`/`Ord`/`Hash` compare and hash the ticker bytes exactly as the previous
+/// `String` field did — the semantics are unchanged.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(into = "String", try_from = "String")]
-pub struct Underlying(String);
+pub struct Underlying(Arc<str>);
 
 impl Underlying {
     /// Wrap a canonical uppercase ticker.
@@ -57,7 +71,9 @@ impl Underlying {
                 "underlying {ticker:?} violates the grammar ^[A-Z0-9._]{{1,32}}$"
             )));
         }
-        Ok(Self(ticker))
+        // Intern the validated ticker once — every later clone is a refcount
+        // bump, not a heap allocation.
+        Ok(Self(Arc::from(ticker)))
     }
 
     /// The inner canonical ticker.
@@ -77,7 +93,7 @@ impl TryFrom<String> for Underlying {
 
 impl From<Underlying> for String {
     fn from(value: Underlying) -> Self {
-        value.0
+        value.0.as_ref().to_owned()
     }
 }
 

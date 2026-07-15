@@ -13,6 +13,13 @@ use optionstratlib::{ExpirationDate, OptionStyle, Side};
 use proptest::prelude::*;
 use rust_decimal::Decimal;
 
+use ironcondor::{
+    BacktestEngine, BacktestRun, ChainContext, ParquetFeed, ResourceLimits, Strategy,
+};
+use rand_chacha::rand_core::RngCore;
+
+mod common;
+
 /// The JSON object keys of a serialised value, sorted — the field *shape* of
 /// a bundle/record type, independent of its values.
 fn json_object_keys(value: &serde_json::Value) -> Option<Vec<String>> {
@@ -455,4 +462,164 @@ proptest! {
         };
         prop_assert_eq!(json_object_keys(&naive_json), json_object_keys(&realistic_json));
     }
+}
+
+// --- engine replay-loop properties (issue #14) -----------------------------
+
+/// A strategy that draws from `ctx.rng` every snapshot and opens the short call
+/// once when a draw is even — exercises the RNG path so two same-seed runs must
+/// produce byte-identical output.
+struct RngProbe {
+    opened: bool,
+}
+
+impl Strategy for RngProbe {
+    fn on_start(
+        &mut self,
+        _ctx: &mut ChainContext,
+        _out: &mut Vec<OrderCommand>,
+    ) -> Result<(), BacktestError> {
+        Ok(())
+    }
+
+    fn on_snapshot(
+        &mut self,
+        ctx: &mut ChainContext,
+        out: &mut Vec<OrderCommand>,
+    ) -> Result<(), BacktestError> {
+        let draw = ctx.rng.next_u32();
+        if self.opened || !draw.is_multiple_of(2) {
+            return Ok(());
+        }
+        let target = ctx.snapshot.quotes.values().find(|q| {
+            q.contract.strike == PriceCents::new(510_000) && q.contract.style == OptionStyle::Call
+        });
+        if let Some(quote) = target {
+            let Ok(quantity) = Quantity::new(1) else {
+                return Ok(());
+            };
+            out.push(OrderCommand::Submit(OrderIntent {
+                contract: quote.contract.clone(),
+                action: PositionAction::Open,
+                side: Side::Long,
+                quantity,
+                limit: None,
+                tif: TimeInForce::Ioc,
+                decision_mid: quote.mid,
+            }));
+            self.opened = true;
+        }
+        Ok(())
+    }
+
+    fn on_end(
+        &mut self,
+        _ctx: &mut ChainContext,
+        _out: &mut Vec<OrderCommand>,
+    ) -> Result<(), BacktestError> {
+        Ok(())
+    }
+}
+
+/// Run the RNG-consuming strategy over a fixture at `path` with `seed`.
+fn run_rng_probe(path: &std::path::Path, seed: u64) -> BacktestRun {
+    let config = common::condor_config(path, seed);
+    let Ok(feed) = ParquetFeed::open(path, &ResourceLimits::default()) else {
+        panic!("the fixture opens");
+    };
+    let execution = NaiveFill::new(config.slippage.clone(), config.fees);
+    let Ok(run) = BacktestEngine::run(&config, feed, execution, RngProbe { opened: false }, "rng")
+    else {
+        panic!("the rng run succeeds");
+    };
+    run
+}
+
+/// No look-ahead: perturbing a **future** snapshot leaves every earlier step's
+/// equity point byte-identical, because the loop reads only `S_n` (and marks
+/// from `S_n`'s mid) — it can never see `S_{n+1}`.
+#[test]
+fn test_no_look_ahead_future_perturbation_preserves_prefix() {
+    let Ok(dir) = tempfile::tempdir() else {
+        panic!("tempdir creates");
+    };
+    let base_path = dir.path().join("base.parquet");
+    let perturbed_path = dir.path().join("perturbed.parquet");
+
+    let base_rows = common::condor_rows(4, None);
+    // Overwrite the short-call quote at step 2 (a FUTURE snapshot) with a
+    // different tick-aligned mid; steps 0 and 1 must be unaffected.
+    let perturb = common::Perturb {
+        step: 2,
+        strike: 510_000,
+        style: "call",
+        bid: 2_495,
+        ask: 2_505,
+    };
+    let perturbed_rows = common::condor_rows(4, Some(perturb));
+
+    if common::write_parquet(&base_path, &base_rows).is_err()
+        || common::write_parquet(&perturbed_path, &perturbed_rows).is_err()
+    {
+        panic!("both fixtures must write");
+    }
+
+    let Ok(base) = common::run_condor(&base_path, 5) else {
+        panic!("base run succeeds");
+    };
+    let Ok(perturbed) = common::run_condor(&perturbed_path, 5) else {
+        panic!("perturbed run succeeds");
+    };
+
+    // Steps 0 and 1 (strictly before the perturbed step 2) are byte-identical.
+    assert!(base.equity_curve.len() >= 3 && perturbed.equity_curve.len() >= 3);
+    for step in 0..2usize {
+        let (Some(a), Some(b)) = (
+            base.equity_curve.get(step),
+            perturbed.equity_curve.get(step),
+        ) else {
+            panic!("both curves have a point at step {step}");
+        };
+        assert_eq!(a, b, "future perturbation must not change step {step}");
+    }
+    // Sanity: the perturbation DID change the affected step, so the test is not
+    // vacuous.
+    let (Some(a2), Some(b2)) = (base.equity_curve.get(2), perturbed.equity_curve.get(2)) else {
+        panic!("both curves have a point at step 2");
+    };
+    assert_ne!(
+        a2.position_value_cents, b2.position_value_cents,
+        "the perturbed step 2 mark must differ"
+    );
+}
+
+/// Same seed + config + data ⇒ byte-identical output — for both a real
+/// `IronCondor` (`from_spec`) and an RNG-consuming strategy that draws from
+/// `ctx.rng`, so the randomness path is exercised.
+#[test]
+fn test_same_seed_same_result_iron_condor_and_rng_strategy() {
+    let Ok(dir) = tempfile::tempdir() else {
+        panic!("tempdir creates");
+    };
+    let path = dir.path().join("condor.parquet");
+    let rows = common::condor_rows(5, None);
+    if common::write_parquet(&path, &rows).is_err() {
+        panic!("the fixture writes");
+    }
+
+    // Real IronCondor via from_spec.
+    let (Ok(a), Ok(b)) = (
+        common::run_condor(&path, 314),
+        common::run_condor(&path, 314),
+    ) else {
+        panic!("both condor runs succeed");
+    };
+    assert_eq!(a.equity_curve, b.equity_curve);
+    assert_eq!(a.open_at_end, b.open_at_end);
+
+    // RNG-consuming strategy: same seed ⇒ identical draws ⇒ identical output.
+    let c = run_rng_probe(&path, 271);
+    let d = run_rng_probe(&path, 271);
+    assert_eq!(c.equity_curve, d.equity_curve);
+    assert_eq!(c.open_at_end, d.open_at_end);
 }
