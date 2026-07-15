@@ -1,11 +1,60 @@
 //! Property tests for the canonical domain types.
 
 use ironcondor::{
-    BacktestError, Cents, ContractKey, PriceCents, Quantity, SimClock, SimTime, StepIndex, Ticks,
-    Underlying,
+    BacktestError, Cents, ContractKey, PriceCents, Quantity, RawQuote, SimClock, SimTime,
+    SnapshotMeta, StepIndex, Ticks, Underlying, raw_quotes_to_snapshot,
 };
+use optionstratlib::prelude::Positive;
 use optionstratlib::{ExpirationDate, OptionStyle};
 use proptest::prelude::*;
+
+/// The tape anchor `ts_0` used by the conversion property tests.
+const TS0: i64 = 1_750_291_200_000_000_000;
+/// Nanoseconds in one calendar day of exactly 86 400 s (UTC).
+const NANOS_PER_DAY: i64 = 86_400_000_000_000;
+
+/// Build a conversion meta with a 5-cent tick and a 100x multiplier anchored
+/// at `TS0`.
+fn conversion_meta() -> SnapshotMeta {
+    let underlying = match Underlying::new("SPX") {
+        Ok(u) => u,
+        Err(e) => unreachable!("SPX is valid: {e}"),
+    };
+    SnapshotMeta {
+        ts: SimTime::new(TS0),
+        step: StepIndex::new(0),
+        anchor_ts: SimTime::new(TS0),
+        underlying,
+        underlying_price: PriceCents::new(510_000),
+        tick_size_cents: PriceCents::new(5),
+        contract_multiplier: 100,
+    }
+}
+
+/// A tick-aligned raw call quote at absolute expiry `TS0 + 30 days`.
+fn abs_raw(strike: u64, bid: u64, ask: u64) -> RawQuote {
+    let expiration = ExpirationDate::DateTime(chrono::DateTime::from_timestamp_nanos(
+        TS0 + 30 * NANOS_PER_DAY,
+    ));
+    let size = match Quantity::new(1) {
+        Ok(q) => q,
+        Err(e) => unreachable!("1 is a valid quantity: {e}"),
+    };
+    RawQuote {
+        expiration,
+        strike: PriceCents::new(strike),
+        style: OptionStyle::Call,
+        bid: PriceCents::new(bid),
+        ask: PriceCents::new(ask),
+        bid_size: size,
+        ask_size: size,
+        implied_volatility: 0.2,
+        delta: 0.5,
+        gamma: 0.01,
+        theta: -0.05,
+        vega: 0.1,
+    }
+}
 
 proptest! {
     /// Every money newtype serialises as its bare inner scalar and
@@ -153,5 +202,72 @@ proptest! {
         prop_assert!(reversed_is_ooo);
         prop_assert_eq!(clock.ts().value(), last_ts);
         prop_assert_eq!(clock.step().value(), step);
+    }
+
+    /// Conversion preserves exactly the input strikes (tick-aligned, distinct),
+    /// in sorted order, regardless of the feed's array order.
+    #[test]
+    fn chain_conversion_preserves_strikes(
+        // Distinct tick multiples in [20, 20000) → strikes 100..100000 cents.
+        multiples in prop::collection::hash_set(20u64..20_000, 1..40),
+    ) {
+        let mut strikes: Vec<u64> = multiples.iter().map(|m| m * 5).collect();
+        strikes.sort_unstable();
+        // Insert in reverse to prove the BTreeMap fixes the order.
+        let quotes: Vec<RawQuote> = strikes
+            .iter()
+            .rev()
+            .map(|&strike| abs_raw(strike, 100, 110))
+            .collect();
+        let snap = raw_quotes_to_snapshot(&conversion_meta(), &quotes);
+        prop_assert!(snap.is_ok());
+        let Ok(snap) = snap else { return Ok(()); };
+        let got: Vec<u64> = snap.quotes.keys().map(|k| k.strike.value()).collect();
+        prop_assert_eq!(got, strikes);
+    }
+
+    /// A bid/ask/strike that is not a multiple of the tick is rejected with
+    /// `PriceNotTickAligned` — never silently rounded.
+    #[test]
+    fn price_rejected_when_not_tick_aligned(offset in 1u64..=4) {
+        // ask = 110 + offset is not a multiple of the 5-cent tick.
+        let quote = abs_raw(510_000, 100, 110 + offset);
+        let result = raw_quotes_to_snapshot(&conversion_meta(), &[quote]);
+        match result {
+            Err(BacktestError::PriceNotTickAligned { price, tick }) => {
+                prop_assert_eq!(price, 110 + offset);
+                prop_assert_eq!(tick, 5);
+            }
+            other => prop_assert!(false, "expected PriceNotTickAligned, got {:?}", other.is_ok()),
+        }
+    }
+
+    /// `Days(n)` resolves to exactly `ts_0 + n·86400·1e9` ns for integer `n`,
+    /// anchored on `ts_0`, regardless of the snapshot's own timestamp — proven
+    /// against an integer oracle.
+    #[test]
+    fn expiration_days_resolves_utc_calendar(
+        n in 0u32..=3650,
+        step_days in 0i64..=365,
+    ) {
+        let days = match Positive::new(f64::from(n)) {
+            Ok(p) => p,
+            Err(_) => return Ok(()),
+        };
+        let mut quote = abs_raw(510_000, 100, 110);
+        quote.expiration = ExpirationDate::Days(days);
+        // A meta whose snapshot ts is far from ts_0 must NOT change the anchor.
+        let mut meta = conversion_meta();
+        meta.ts = SimTime::new(TS0 + step_days * NANOS_PER_DAY);
+        meta.step = StepIndex::new(1);
+        let snap = raw_quotes_to_snapshot(&meta, &[quote]);
+        prop_assert!(snap.is_ok());
+        let Ok(snap) = snap else { return Ok(()); };
+        let key = snap.quotes.keys().next();
+        prop_assert!(key.is_some());
+        let Some(key) = key else { return Ok(()); };
+        // Integer oracle: pure ts_0 + n·86400e9, no calendar, no DST.
+        let expected = TS0 + i64::from(n) * NANOS_PER_DAY;
+        prop_assert!(matches!(key.expiration_ns(), Ok(ns) if ns == expected));
     }
 }

@@ -85,7 +85,9 @@ pub mod execution;
 pub mod python;
 
 pub use config::{BacktestConfig, FeeSchedule, ResourceLimits, SlippageModel};
-pub use data::DataSourceSpec;
+pub use data::{
+    DataSourceSpec, RawQuote, SnapshotMeta, raw_quotes_to_snapshot, snapshot_to_option_chain,
+};
 pub use domain::{
     Cents, ChainSnapshot, ContractKey, ExecutionMode, Fill, InstrumentSpec, OrderCommand, OrderId,
     OrderIntent, PositionAction, PositionId, PriceCents, Quantity, QuoteView, SimTime, StepIndex,
@@ -99,6 +101,8 @@ pub use error::BacktestError;
 /// The migrated OptionChain-Simulator session surface (feature `simulator`):
 /// the async [`data::simulator::ApiClient`] and the bug-fixed
 /// [`data::simulator::MarketSimulator`] step wrapper, plus the local wire DTOs.
+#[cfg(feature = "simulator")]
+pub use data::chain_response_to_snapshot;
 #[cfg(feature = "simulator")]
 pub use data::simulator::{
     ApiClient, ChainResponse, CreateSessionRequest, ErrorResponse, MarketSimulator, MarketState,

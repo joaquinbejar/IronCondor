@@ -10,6 +10,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The single chain-conversion boundary (`src/data/convert.rs`, hot path H3):
+  a DTO-independent validation core `raw_quotes_to_snapshot` (strike
+  positivity, tick alignment, crossed-quote rejection, the one
+  `mid = floor_to_tick((bid + ask) / 2)`, `Days(n)` anchored once on the
+  tape's first `ts_0`, NaN/inf-analytic rejection, `BTreeMap` assembly)
+  reused by every feed; the simulator-gated `chain_response_to_snapshot`
+  where f64 prices die once via banker's rounding; and
+  `snapshot_to_option_chain`, the reverse view the strategy adapter
+  reprices against (#7).
+- Conversion property tests: strike preservation, tick-alignment
+  rejection, and `Days(n) ⇒ ts_0 + n·86400e9 ns` UTC-calendar resolution
+  independent of snapshot timing (#7).
+
 - Migrated the `OptionStratBacktest` core (reviewed, not copied): the async
   `ApiClient` for OptionChain-Simulator sessions with locally defined wire
   DTOs, the `MarketSimulator` step wrapper, the `PositionableStrategy` bound
