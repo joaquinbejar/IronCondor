@@ -637,8 +637,22 @@ pub fn snapshot_to_option_chain(snap: &ChainSnapshot) -> Result<OptionChain, Bac
 
 /// Convert integer-cents money to a `Positive` dollar amount (lossless),
 /// mapping the upstream `Positive` error to [`BacktestError::Conversion`].
+///
+/// `pub(crate)` so the strategy adapter's exit seam can source `underlying`
+/// from `snap.underlying_price` through the **same** derivation this module
+/// uses for `chain.underlying_price` (keeping the two byte-identical), without
+/// rebuilding the whole `OptionChain`.
+///
+/// # Errors
+///
+/// Returns [`BacktestError::Conversion`] if `price` is not a valid non-negative
+/// `Positive` dollar amount (unreachable for a well-formed [`PriceCents`], but
+/// propagated rather than unwrapped).
 #[inline]
-fn positive_from_price(field: &str, price: PriceCents) -> Result<Positive, BacktestError> {
+pub(crate) fn positive_from_price(
+    field: &str,
+    price: PriceCents,
+) -> Result<Positive, BacktestError> {
     Positive::new_decimal(price.to_decimal_dollars()).map_err(|e| {
         BacktestError::Conversion(format!(
             "{field} {} is not a valid positive dollar amount: {e}",

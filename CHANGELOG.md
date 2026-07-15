@@ -10,6 +10,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The zero-steady-state-allocation replay-loop CI gate (`tests/zero_alloc.rs`,
+  the `zero-alloc` CI job): a test-only per-thread counting allocator plus a
+  sampling-strategy decorator measure the per-step-body (steps b–g) allocation
+  delta between a warmup step and the last step over the **real**
+  `OptStratAdapter<IronCondor>` and assert it is **zero**; a deliberately
+  injected per-step allocation makes the delta non-zero, proving the gate
+  bites. A build-failing invariant gate, distinct from the throughput bench
+  (#19).
+
+### Changed
+
+- `OptStratAdapter::exits()` no longer rebuilds an `OptionChain` or reprices
+  the wrapped strategy every step in v0.1: `underlying` is sourced directly
+  from the snapshot scalar (byte-identical to the old
+  `chain.underlying_price`), and the reprice — with its transitive upstream
+  `Utc::now()` reach — is deferred behind `policy_reads_inner` (false for
+  every v0.1 exit policy; re-enabled when a Greek-driven policy is wired).
+  Output-preserving (the golden passes unblessed), this closes a wall-clock
+  determinism reach on the replay path and removes ~44 heap allocations per
+  step. The naive per-step throughput baseline was re-measured accordingly —
+  p50 **2354 ns/step** (down from 4172), ≈ 25.5 × 10⁶ steps/min/core — and
+  `BENCH.md` supersedes the #18 baseline that baked in the removed dead work
+  (#19).
+
 - The `criterion` + `hdrhistogram` bench suite (`benches/`, the `bench-hdr`
   convention) and the first **measured** performance baseline in `BENCH.md`:
   the naive-mode throughput bench (`benches/naive_throughput.rs`) drives the
