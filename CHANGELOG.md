@@ -10,6 +10,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Canonical domain newtypes: `Cents` (signed ledger money, checked
+  arithmetic returning `ArithmeticOverflow` — never a silent wrap),
+  `PriceCents` with the two `Decimal` boundary helpers (banker's rounding on
+  the `Decimal → cents` edge only, lossless reverse), `Quantity` (strictly
+  positive), `Ticks`, `SimTime`, `StepIndex` — all `#[serde(transparent)]`
+  bare scalars (#3).
+- Contract identity: `Underlying` (grammar `^[A-Z0-9._]{1,32}$`),
+  `ContractKey` reusing the upstream `ExpirationDate`/`OptionStyle` with
+  hand-written **exact** equality/hashing (documented divergence from the
+  upstream epsilon-tolerant semantics), and the round-trippable versioned
+  `contract_id` (`"v1:{UNDERLYING}:{expiration_ns}:{strike_cents}:{style}"`)
+  (#3).
+- Property-test suite (`tests/property.rs`): money serde round-trips,
+  no-silent-overflow cents arithmetic, `contract_id` round-trip identity,
+  deterministic dollar→cents conversion (#3).
+
 - `BacktestError` (thiserror): the single typed error boundary — every
   documented kind from the domain model, with lowercase messages carrying the
   offending value; upstream errors convert into these kinds in `src/error.rs`

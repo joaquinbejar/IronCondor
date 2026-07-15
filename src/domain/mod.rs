@@ -1,9 +1,18 @@
 //! Canonical domain types.
 //!
-//! Integer-cents money newtypes, contract identity, market-data and
-//! execution-record types shared by every layer (roadmap issues #3 and #4).
-//! Only [`ExecutionMode`] exists so far — the remaining types land with
-//! those issues.
+//! Integer-cents money newtypes ([`Cents`], [`PriceCents`], [`Quantity`],
+//! [`Ticks`]), simulated time ([`SimTime`], [`StepIndex`]), contract
+//! identity ([`Underlying`], [`ContractKey`] and the canonical
+//! `contract_id`), and [`ExecutionMode`]. Market-data and execution-record
+//! types land with roadmap issue #4.
+
+pub mod contract;
+pub mod money;
+pub mod time;
+
+pub use contract::{ContractKey, Underlying};
+pub use money::{Cents, PriceCents, Quantity, Ticks};
+pub use time::{SimTime, StepIndex};
 
 use serde::{Deserialize, Serialize};
 
