@@ -214,6 +214,74 @@ fn test_iron_condor_run_over_parquet_fixture_produces_equity_curve() {
 }
 
 #[test]
+fn test_run_backtest_over_parquet_fixture_populates_minimal_metrics() {
+    use optionstratlib::simulation::ExitPolicy;
+    use rust_decimal::Decimal;
+
+    let Ok(dir) = tempfile::tempdir() else {
+        panic!("tempdir must create");
+    };
+    let path = dir.path().join("condor.parquet");
+    let rows = common::condor_rows(6, None);
+    if let Err(e) = common::write_parquet(&path, &rows) {
+        panic!("the condor fixture must write: {e}");
+    }
+
+    // The v0.1 end-to-end entry: Parquet in, equity curve + metrics out.
+    let config = common::condor_config(&path, 7);
+    let spec = common::iron_condor_spec();
+    // Non-triggering exit so on_end performs the single clean close at the end.
+    let exit = ExitPolicy::TimeSteps(1_000_000);
+    let Ok(run) = ironcondor::run_backtest(&config, &spec, exit) else {
+        panic!("the run_backtest slice over the fixture must succeed");
+    };
+
+    // The equity-curve artifact is non-empty: one point per snapshot, in order.
+    assert!(
+        !run.equity_curve.is_empty(),
+        "the equity curve is the artifact"
+    );
+    assert_eq!(run.equity_curve.len(), 6);
+    let steps: Vec<u32> = run.equity_curve.iter().map(|p| p.step).collect();
+    assert_eq!(steps, vec![0, 1, 2, 3, 4, 5]);
+
+    // The minimal metrics are populated on the UPSTREAM BacktestResult — the
+    // cents magnitude key is always inserted by the metrics pass.
+    assert!(
+        run.result
+            .custom_metrics
+            .contains_key(ironcondor::analytics::metrics::MAX_DRAWDOWN_CENTS_KEY),
+        "the drawdown cents magnitude is populated"
+    );
+    // max_drawdown is the non-negative magnitude of the worst ledger ratio.
+    assert!(run.result.drawdown_analysis.max_drawdown >= Decimal::ZERO);
+
+    // The populated cents magnitude equals an INDEPENDENT recomputation from
+    // the returned equity curve + the run's initial capital — proving the
+    // metrics ran and are correct (not fabricated).
+    let mut peak = 10_000_000_i64;
+    let mut worst = 0_i64;
+    for pnt in &run.equity_curve {
+        if pnt.equity_cents > peak {
+            peak = pnt.equity_cents;
+        }
+        let decline = peak - pnt.equity_cents;
+        if decline > worst {
+            worst = decline;
+        }
+    }
+    assert!(
+        matches!(
+            run.result
+                .custom_metrics
+                .get(ironcondor::analytics::metrics::MAX_DRAWDOWN_CENTS_KEY),
+            Some(v) if *v == Decimal::from(worst)
+        ),
+        "the populated cents magnitude matches an independent recomputation"
+    );
+}
+
+#[test]
 fn test_iron_condor_run_is_byte_identical_across_two_runs() {
     let Ok(dir) = tempfile::tempdir() else {
         panic!("tempdir must create");
