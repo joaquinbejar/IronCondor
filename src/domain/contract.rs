@@ -122,6 +122,34 @@ impl PartialEq for ContractKey {
 
 impl Eq for ContractKey {}
 
+/// Exact expiration ordering, consistent with [`expiration_exact_eq`]:
+/// `Days` sorts before `DateTime`; within a variant the exact values
+/// compare — deliberately NOT the upstream day-count comparison.
+fn expiration_exact_cmp(a: &ExpirationDate, b: &ExpirationDate) -> std::cmp::Ordering {
+    match (a, b) {
+        (ExpirationDate::Days(da), ExpirationDate::Days(db)) => da.to_dec().cmp(&db.to_dec()),
+        (ExpirationDate::DateTime(ta), ExpirationDate::DateTime(tb)) => ta.cmp(tb),
+        (ExpirationDate::Days(_), ExpirationDate::DateTime(_)) => std::cmp::Ordering::Less,
+        (ExpirationDate::DateTime(_), ExpirationDate::Days(_)) => std::cmp::Ordering::Greater,
+    }
+}
+
+impl PartialOrd for ContractKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ContractKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.underlying
+            .cmp(&other.underlying)
+            .then_with(|| expiration_exact_cmp(&self.expiration, &other.expiration))
+            .then_with(|| self.strike.cmp(&other.strike))
+            .then_with(|| self.style.cmp(&other.style))
+    }
+}
+
 impl Hash for ContractKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.underlying.hash(state);

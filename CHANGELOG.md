@@ -10,6 +10,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Market-data types: `InstrumentSpec` (validated `> 0` tick size and
+  contract multiplier — the single authoritative cents↔ticks / scaling
+  source), `QuoteView` (per-contract unit Greeks in native `optionstratlib`
+  bases, `Decimal` analytics as the documented exception), and
+  `ChainSnapshot` with `BTreeMap` quotes so iteration order is part of the
+  determinism contract (#4).
+- Execution-record types: lifecycle ids (`PositionId`, `OrderId`,
+  `TradeId`), `PositionAction`, `TimeInForce`, `OrderIntent`,
+  `OrderCommand`, and the mode-agnostic `Fill` carrying
+  `mode: ExecutionMode`; `ExecutionMode` moved to `domain::execution` (#4).
+- The `sign_convention` helper module encoding the one truth table:
+  `side_sign`, checked `slippage_cents` (positive = adverse, both sides
+  tested), and `spread_capture_cents = −Σ slippage` — the single sign flip
+  (#4).
+- Exact hand-written `Ord` on `ContractKey` (consistent with its exact
+  `Eq`/`Hash`) so `BTreeMap` snapshot ordering is deterministic (#4).
+
 - Canonical domain newtypes: `Cents` (signed ledger money, checked
   arithmetic returning `ArithmeticOverflow` — never a silent wrap),
   `PriceCents` with the two `Decimal` boundary helpers (banker's rounding on

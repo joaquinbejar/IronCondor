@@ -87,7 +87,9 @@ pub mod python;
 pub use config::{BacktestConfig, FeeSchedule, ResourceLimits, SlippageModel};
 pub use data::DataSourceSpec;
 pub use domain::{
-    Cents, ContractKey, ExecutionMode, PriceCents, Quantity, SimTime, StepIndex, Ticks, Underlying,
+    Cents, ChainSnapshot, ContractKey, ExecutionMode, Fill, InstrumentSpec, OrderCommand, OrderId,
+    OrderIntent, PositionAction, PositionId, PriceCents, Quantity, QuoteView, SimTime, StepIndex,
+    Ticks, TimeInForce, TradeId, Underlying,
 };
 pub use error::BacktestError;
 
