@@ -91,6 +91,7 @@ pub use domain::{
     OrderIntent, PositionAction, PositionId, PriceCents, Quantity, QuoteView, SimTime, StepIndex,
     Ticks, TimeInForce, TradeId, Underlying,
 };
+pub use engine::{Event, SimClock};
 pub use error::BacktestError;
 
 #[cfg(test)]

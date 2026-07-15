@@ -1,6 +1,9 @@
 //! Property tests for the canonical domain types.
 
-use ironcondor::{BacktestError, Cents, ContractKey, PriceCents, Quantity, Ticks, Underlying};
+use ironcondor::{
+    BacktestError, Cents, ContractKey, PriceCents, Quantity, SimClock, SimTime, StepIndex, Ticks,
+    Underlying,
+};
 use optionstratlib::{ExpirationDate, OptionStyle};
 use proptest::prelude::*;
 
@@ -97,5 +100,58 @@ proptest! {
             (Err(_), Err(_)) => {}
             _ => prop_assert!(false, "non-deterministic conversion outcome"),
         }
+    }
+
+    /// `SimClock` is monotonic across a simulated run: driving a
+    /// strictly-increasing `ts` sequence keeps `step` non-decreasing and `ts`
+    /// strictly increasing, gaps are preserved, and any non-advancing `ts`
+    /// (duplicate or reversed) is a `DataOutOfOrder` that leaves the clock
+    /// state intact.
+    #[test]
+    fn clock_monotonic(
+        start in -1_000_000_000_000i64..=1_000_000_000_000i64,
+        gaps in prop::collection::vec(1i64..=1_000_000i64, 0..64),
+    ) {
+        let mut clock = SimClock::new();
+        let mut prev_ts = clock.ts().value();
+        let mut prev_step = clock.step().value();
+
+        // First snapshot: the sentinel start guarantees the first advance
+        // succeeds for any valid feed timestamp.
+        let first = clock.advance_to(SimTime::new(start), StepIndex::new(0));
+        prop_assert!(matches!(first, Ok(())));
+        prop_assert!(clock.ts().value() > prev_ts);
+        prop_assert!(clock.step().value() >= prev_step);
+        prop_assert_eq!(clock.ts().value(), start);
+        prev_ts = clock.ts().value();
+        prev_step = clock.step().value();
+
+        // Each gap advances ts strictly and step by one, gaps preserved exactly.
+        let mut cur = start;
+        let mut step: u32 = 0;
+        for gap in &gaps {
+            cur += *gap;
+            step += 1;
+            let outcome = clock.advance_to(SimTime::new(cur), StepIndex::new(step));
+            prop_assert!(matches!(outcome, Ok(())));
+            prop_assert!(clock.ts().value() > prev_ts);
+            prop_assert!(clock.step().value() >= prev_step);
+            prop_assert_eq!(clock.ts().value(), cur);
+            prop_assert_eq!(clock.step().value(), step);
+            prev_ts = clock.ts().value();
+            prev_step = clock.step().value();
+        }
+
+        // A non-advancing ts errors and does not mutate the clock.
+        let last_ts = clock.ts().value();
+        let next_step = step + 1;
+        let duplicate = clock.advance_to(SimTime::new(last_ts), StepIndex::new(next_step));
+        let duplicate_is_ooo = matches!(duplicate, Err(BacktestError::DataOutOfOrder { .. }));
+        prop_assert!(duplicate_is_ooo);
+        let reversed = clock.advance_to(SimTime::new(last_ts - 1), StepIndex::new(next_step));
+        let reversed_is_ooo = matches!(reversed, Err(BacktestError::DataOutOfOrder { .. }));
+        prop_assert!(reversed_is_ooo);
+        prop_assert_eq!(clock.ts().value(), last_ts);
+        prop_assert_eq!(clock.step().value(), step);
     }
 }
