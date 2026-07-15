@@ -12,4 +12,21 @@ keywords = ["finance", "options", "trading", "backtesting", "quant"]
 categories = ["finance", "simulation"]
 include = ["src/**/*", "Cargo.toml", "README.md", "LICENSE"]
 
+[lib]
+name = "ironcondor"
+path = "src/lib.rs"
+# Declared unconditionally — Cargo cannot toggle crate-type by feature.
+# Without the `python` feature the cdylib links no PyO3 and is inert.
+crate-type = ["rlib", "cdylib"]
+
+[features]
+# default — engine + naive execution + historical feeds.
+default = []
+# orderbook — realistic execution via option-chain-orderbook.
+orderbook = []
+# simulator — synthetic chain sessions via OptionChain-Simulator over HTTP.
+simulator = []
+# python — PyO3 bindings built with maturin.
+python = []
+
 [dependencies]
