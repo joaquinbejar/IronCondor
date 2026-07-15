@@ -100,7 +100,7 @@ pub use engine::{
     ScenarioType, SimClock, Strategy,
 };
 pub use error::BacktestError;
-pub use execution::ExecutionModel;
+pub use execution::{ExecutionModel, NaiveFill};
 
 /// The migrated OptionChain-Simulator session surface (feature `simulator`):
 /// the async [`data::simulator::ApiClient`] and the bug-fixed

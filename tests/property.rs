@@ -1,12 +1,17 @@
 //! Property tests for the canonical domain types.
 
+use std::collections::BTreeMap;
+
 use ironcondor::{
-    BacktestError, Cents, ContractKey, ExecutionMode, Fill, PriceCents, Quantity, RawQuote,
-    SimClock, SimTime, SnapshotMeta, StepIndex, Ticks, Underlying, raw_quotes_to_snapshot,
+    BacktestError, Cents, ChainSnapshot, ContractKey, ExecutionMode, ExecutionModel, FeeSchedule,
+    Fill, InstrumentSpec, NaiveFill, OrderCommand, OrderIntent, PositionAction, PriceCents,
+    Quantity, QuoteView, RawQuote, SimClock, SimTime, SlippageModel, SnapshotMeta, StepIndex,
+    Ticks, TimeInForce, Underlying, raw_quotes_to_snapshot,
 };
 use optionstratlib::prelude::Positive;
 use optionstratlib::{ExpirationDate, OptionStyle, Side};
 use proptest::prelude::*;
+use rust_decimal::Decimal;
 
 /// The JSON object keys of a serialised value, sorted — the field *shape* of
 /// a bundle/record type, independent of its values.
@@ -62,6 +67,48 @@ fn abs_raw(strike: u64, bid: u64, ask: u64) -> RawQuote {
         theta: -0.05,
         vega: 0.1,
     }
+}
+
+/// A resolved contract key for the naive-fill property tests.
+fn naive_contract(strike: u64) -> Option<ContractKey> {
+    let underlying = Underlying::new("SPX").ok()?;
+    Some(ContractKey {
+        underlying,
+        expiration: ExpirationDate::DateTime(chrono::DateTime::from_timestamp_nanos(TS0)),
+        strike: PriceCents::new(strike),
+        style: OptionStyle::Call,
+    })
+}
+
+/// A single-quote snapshot whose only contract has `mid == bid == ask` so a
+/// `FixedCents` slippage is measured against a clean mid.
+fn naive_snapshot(contract: &ContractKey, mid: u64) -> Option<ChainSnapshot> {
+    let underlying = Underlying::new("SPX").ok()?;
+    let spec = InstrumentSpec::new(PriceCents::new(5), 100).ok()?;
+    let size = Quantity::new(1).ok()?;
+    let quote = QuoteView {
+        contract: contract.clone(),
+        bid: PriceCents::new(mid),
+        ask: PriceCents::new(mid),
+        mid: PriceCents::new(mid),
+        bid_size: size,
+        ask_size: size,
+        implied_volatility: Decimal::ZERO,
+        delta: Decimal::ZERO,
+        gamma: Decimal::ZERO,
+        theta: Decimal::ZERO,
+        vega: Decimal::ZERO,
+    };
+    let mut quotes = BTreeMap::new();
+    quotes.insert(contract.clone(), quote);
+    Some(ChainSnapshot {
+        ts: SimTime::new(TS0),
+        step: StepIndex::new(0),
+        underlying,
+        underlying_price: PriceCents::new(mid),
+        spec,
+        quotes,
+    })
 }
 
 proptest! {
@@ -341,5 +388,71 @@ proptest! {
         let mut rebadged = naive;
         rebadged.mode = ExecutionMode::Realistic;
         prop_assert_eq!(rebadged, realistic);
+    }
+
+    /// The naive fill model, driven through the public seam, is honest about
+    /// the two invariants analytics leans on: (a) a `FixedCents` slippage
+    /// measured against `decision_mid == mid` is **always adverse**, i.e.
+    /// `Fill.slippage ≥ 0` for both a buy filled above mid and a sell filled
+    /// below mid (the §7.1 sign truth table, feeding
+    /// `fill_and_step_sign_reconciliation`); and (b) the produced `Fill` has
+    /// the mode-agnostic field shape and is stamped `Naive`. Zero configured
+    /// slippage records exactly zero.
+    #[test]
+    fn naive_fill_slippage_is_adverse_and_shape_stable(
+        strike in 100u64..1_000_000,
+        mid in 1u64..1_000_000,
+        cents in 0u64..500,
+        is_long in any::<bool>(),
+        quantity in 1u32..1_000,
+    ) {
+        let contract = naive_contract(strike);
+        prop_assert!(contract.is_some());
+        let Some(contract) = contract else { return Ok(()); };
+        let snap = naive_snapshot(&contract, mid);
+        prop_assert!(snap.is_some());
+        let Some(snap) = snap else { return Ok(()); };
+        let quantity = Quantity::new(quantity);
+        prop_assert!(quantity.is_ok());
+        let Ok(quantity) = quantity else { return Ok(()); };
+        let side = if is_long { Side::Long } else { Side::Short };
+
+        let mut model = NaiveFill::new(
+            SlippageModel::FixedCents { cents },
+            FeeSchedule { per_contract_cents: 0, per_order_cents: 0 },
+        );
+        let commands = [OrderCommand::Submit(OrderIntent {
+            contract: contract.clone(),
+            action: PositionAction::Open,
+            side,
+            quantity,
+            limit: None,
+            tif: TimeInForce::Ioc,
+            decision_mid: PriceCents::new(mid), // decision_mid == mid
+        })];
+        let mut out = Vec::new();
+        let result = model.fill(&commands, &snap, &mut out);
+        prop_assert!(matches!(result, Ok(())));
+        prop_assert_eq!(out.len(), 1); // always single-shot, always fills
+        let Some(fill) = out.first() else { return Ok(()); };
+
+        // (a) slippage is adverse (≥ 0); zero cents records exactly zero.
+        prop_assert!(fill.slippage.value() >= 0);
+        if cents == 0 {
+            prop_assert_eq!(fill.slippage.value(), 0);
+        }
+        // filled the full intent, stamped Naive.
+        prop_assert_eq!(fill.quantity.value(), quantity.value());
+        prop_assert_eq!(fill.mode, ExecutionMode::Naive);
+
+        // (b) the produced fill has the same field shape as a Realistic fill.
+        let realistic = Fill { mode: ExecutionMode::Realistic, ..fill.clone() };
+        let naive_json = serde_json::to_value(fill);
+        let realistic_json = serde_json::to_value(&realistic);
+        prop_assert!(naive_json.is_ok() && realistic_json.is_ok());
+        let (Ok(naive_json), Ok(realistic_json)) = (naive_json, realistic_json) else {
+            return Ok(());
+        };
+        prop_assert_eq!(json_object_keys(&naive_json), json_object_keys(&realistic_json));
     }
 }
