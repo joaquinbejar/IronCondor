@@ -34,13 +34,14 @@ use rust_decimal::prelude::ToPrimitive;
 use optionstratlib::Side;
 use optionstratlib::prelude::Positive;
 use optionstratlib::simulation::{ExitPolicy, check_exit_policy};
-use optionstratlib::strategies::Strategies;
 use optionstratlib::strategies::base::{Optimizable, Positionable};
+use optionstratlib::strategies::{IronCondor, Strategies};
 
 use crate::data::convert::snapshot_to_option_chain;
 use crate::domain::{
-    ChainSnapshot, ContractKey, OpenPosition, OrderCommand, OrderId, OrderIntent, PendingOrder,
-    PositionAction, PriceCents, Quantity, SimTime, StepIndex, TimeInForce,
+    ChainSnapshot, ContractKey, IronCondorSpec, OpenPosition, OrderCommand, OrderId, OrderIntent,
+    PendingOrder, PositionAction, PriceCents, Quantity, SimTime, StepIndex, StrategySpec,
+    TimeInForce,
 };
 use crate::error::BacktestError;
 
@@ -54,7 +55,7 @@ use crate::error::BacktestError;
 /// wraps an **already-constructed** strategy instance by value and never calls
 /// `S::default()`. Requiring `Default` would reject valid upstream strategies
 /// whose constructors take required arguments (e.g. `IronCondor::new` takes
-/// sixteen) for no benefit
+/// seventeen) for no benefit
 /// ([docs/02 §4.1](../../../docs/02-engine-architecture.md#41-the-optionstratlib-adapter)).
 ///
 /// A blanket impl covers every type satisfying the three bounds, so upstream
@@ -178,7 +179,7 @@ const NANOS_PER_DAY: i128 = 86_400_000_000_000;
 ///
 /// `new` takes an **already-constructed** strategy by value (there is no
 /// `Default` bound), so a strategy with required constructor arguments — e.g.
-/// `IronCondor::new`, which takes sixteen — wraps unchanged. Entry runs once,
+/// `IronCondor::new`, which takes seventeen — wraps unchanged. Entry runs once,
 /// guarded by `entered`; exit evaluation reprices `inner` from each snapshot
 /// and applies the configured [`ExitPolicy`].
 ///
@@ -320,6 +321,112 @@ impl<S: PositionableStrategy> OptStratAdapter<S> {
             out.push(close_command(snapshot, leg));
         }
     }
+}
+
+impl OptStratAdapter<IronCondor> {
+    /// Build an iron-condor adapter from a [`StrategySpec`] and the
+    /// [`ExitPolicy`] the adapter evaluates each step.
+    ///
+    /// This is the **single** `StrategySpec → optionstratlib` construction
+    /// path for v0.1: it converts the spec's integer-cents money into
+    /// `Positive` dollars, calls the 17-argument `IronCondor::new`
+    /// ([specs/optionstratlib.md §3](../../../docs/specs/optionstratlib.md#3-strategy-types-and-traits)),
+    /// and wraps the result in [`OptStratAdapter::new`]. The v0.1 [`StrategySpec`]
+    /// has exactly one kind ([`StrategySpec::IronCondor`]), so the match is
+    /// currently total on that arm; a `ShortStrangle` arm is v0.2.
+    ///
+    /// # Determinism
+    ///
+    /// The construction is a pure function of the spec — no wall-clock and no
+    /// RNG on this path. (`IronCondor::new` timestamps its internal `Position`s
+    /// with `Utc::now()`, but that date is never read by [`Strategy::exits`]
+    /// or the entry path, which source decisions from snapshot scalars and leg
+    /// definitions only — so it cannot reach a result. See the reprice
+    /// invariant in [`Strategy::exits`].)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BacktestError::Strategy`] when the upstream constructor
+    /// rejects the parameters or a volatility/yield is not a valid `Positive`,
+    /// and [`BacktestError::Conversion`] when a cents → `Positive` money
+    /// conversion fails.
+    pub fn from_spec(spec: &StrategySpec, exit: ExitPolicy) -> Result<Self, BacktestError> {
+        match spec {
+            StrategySpec::IronCondor(inner) => Ok(Self::new(build_iron_condor(inner)?, exit)),
+        }
+    }
+}
+
+/// Convert an integer-cents money value into `optionstratlib`'s `Positive`
+/// dollars at the strategy-construction seam.
+///
+/// # Errors
+///
+/// Returns [`BacktestError::Conversion`] if the cents value is not a valid
+/// non-negative `Positive` dollar amount (unreachable for a well-formed
+/// [`PriceCents`], but propagated rather than unwrapped).
+fn positive_dollars(price: PriceCents) -> Result<Positive, BacktestError> {
+    Positive::new_decimal(price.to_decimal_dollars()).map_err(|e| {
+        BacktestError::Conversion(format!(
+            "price {} cents is not a valid positive dollar amount: {e}",
+            price.value()
+        ))
+    })
+}
+
+/// Validate an analytic `Decimal` (volatility, dividend yield) into a
+/// `Positive` at the strategy-construction seam.
+///
+/// # Errors
+///
+/// Returns [`BacktestError::Strategy`] if `value` is negative (a `Positive`
+/// wraps a non-negative `Decimal`).
+fn positive_rate(value: Decimal, field: &str) -> Result<Positive, BacktestError> {
+    Positive::new_decimal(value).map_err(|e| {
+        BacktestError::Strategy(format!(
+            "iron condor {field} {value} must be non-negative: {e}"
+        ))
+    })
+}
+
+/// Build an `optionstratlib::strategies::IronCondor` from its
+/// [`IronCondorSpec`], converting integer-cents money into `Positive` dollars
+/// and mapping the upstream `StrategyError` into [`BacktestError::Strategy`] —
+/// the one strategy-construction conversion place.
+///
+/// # Errors
+///
+/// Returns [`BacktestError::Strategy`] if `IronCondor::new` rejects the
+/// parameters or a volatility/yield/quantity is not a valid `Positive`, and
+/// [`BacktestError::Conversion`] if a cents → `Positive` money conversion
+/// fails.
+fn build_iron_condor(spec: &IronCondorSpec) -> Result<IronCondor, BacktestError> {
+    let quantity = Positive::new_decimal(Decimal::from(spec.quantity.value())).map_err(|e| {
+        BacktestError::Strategy(format!(
+            "iron condor quantity {} is invalid: {e}",
+            spec.quantity.value()
+        ))
+    })?;
+    IronCondor::new(
+        spec.underlying.as_str().to_string(),
+        positive_dollars(spec.underlying_price)?,
+        positive_dollars(spec.short_call_strike)?,
+        positive_dollars(spec.short_put_strike)?,
+        positive_dollars(spec.long_call_strike)?,
+        positive_dollars(spec.long_put_strike)?,
+        spec.expiration,
+        positive_rate(spec.implied_volatility, "implied volatility")?,
+        spec.risk_free_rate,
+        positive_rate(spec.dividend_yield, "dividend yield")?,
+        quantity,
+        positive_dollars(spec.premium_short_call)?,
+        positive_dollars(spec.premium_short_put)?,
+        positive_dollars(spec.premium_long_call)?,
+        positive_dollars(spec.premium_long_put)?,
+        positive_dollars(spec.open_fee)?,
+        positive_dollars(spec.close_fee)?,
+    )
+    .map_err(|e| BacktestError::Strategy(format!("iron condor construction rejected: {e}")))
 }
 
 impl<S: PositionableStrategy> Strategy for OptStratAdapter<S> {
@@ -552,9 +659,9 @@ mod tests {
 
     use super::{ChainContext, OptStratAdapter, PositionableStrategy, Strategy, policy_triggered};
     use crate::domain::{
-        ChainSnapshot, ContractKey, InstrumentSpec, OpenPosition, OrderCommand, OrderId,
-        OrderIntent, PendingOrder, PositionAction, PositionId, PriceCents, Quantity, QuoteView,
-        SimTime, StepIndex, Underlying,
+        ChainSnapshot, ContractKey, InstrumentSpec, IronCondorSpec, OpenPosition, OrderCommand,
+        OrderId, OrderIntent, PendingOrder, PositionAction, PositionId, PriceCents, Quantity,
+        QuoteView, SimTime, StepIndex, StrategySpec, Underlying,
     };
     use crate::error::BacktestError;
 
@@ -689,6 +796,36 @@ mod tests {
         OptStratAdapter::new(iron_condor(), exit)
     }
 
+    /// A [`StrategySpec`] whose IronCondor strikes match the [`snapshot`]
+    /// quotes (cents): short call 5100, short put 4900, long call 5200, long
+    /// put 4800; money fields are integer cents, rates/vol are `Decimal`.
+    fn iron_condor_spec() -> StrategySpec {
+        StrategySpec::IronCondor(IronCondorSpec {
+            underlying: und(),
+            underlying_price: PriceCents::new(500_000),
+            short_call_strike: PriceCents::new(510_000),
+            short_put_strike: PriceCents::new(490_000),
+            long_call_strike: PriceCents::new(520_000),
+            long_put_strike: PriceCents::new(480_000),
+            expiration: ExpirationDate::DateTime(DateTime::from_timestamp_nanos(EXP_NS)),
+            implied_volatility: dec!(0.20),
+            risk_free_rate: dec!(0.05),
+            dividend_yield: Decimal::ZERO,
+            quantity: qty(1),
+            premium_short_call: PriceCents::new(2_000),
+            premium_short_put: PriceCents::new(1_800),
+            premium_long_call: PriceCents::new(800),
+            premium_long_put: PriceCents::new(700),
+            open_fee: PriceCents::new(65),
+            close_fee: PriceCents::new(65),
+        })
+    }
+
+    /// Build the adapter through the `StrategySpec → IronCondor` seam.
+    fn adapter_from_spec(exit: ExitPolicy) -> Result<OptStratAdapter<IronCondor>, BacktestError> {
+        OptStratAdapter::<IronCondor>::from_spec(&iron_condor_spec(), exit)
+    }
+
     /// The four open legs the engine would hold after entry, with matching
     /// contracts and per-contract entry premia (cents).
     fn open_legs() -> Vec<OpenPosition> {
@@ -782,6 +919,92 @@ mod tests {
         out.clear();
         assert!(matches!(adapter.on_snapshot(&mut ctx, &mut out), Ok(())));
         assert!(out.is_empty(), "entered flag prevents a second entry");
+    }
+
+    // --- StrategySpec -> IronCondor construction seam (issue #11) -----------
+
+    #[test]
+    fn test_iron_condor_satisfies_positionable_strategy_bound() {
+        // The full triple (Positionable + Strategies + Optimizable, no Default)
+        // holds for IronCondor — the Optimizable open question is resolved
+        // affirmative (docs/02 §4.1). Referencing the monomorphised guard fn
+        // proves the bound at compile time; building the adapter through
+        // from_spec proves the concrete construction path accepts it.
+        let _bound_holds: fn() = assert_positionable_strategy::<IronCondor>;
+        assert!(adapter_from_spec(ExitPolicy::Expiration).is_ok());
+    }
+
+    #[test]
+    fn test_iron_condor_entry_emits_four_open_intents() {
+        let mut rng = ChaCha8Rng::seed_from_u64(20);
+        let snap = snapshot(0);
+        let mut ctx = ChainContext {
+            snapshot: &snap,
+            open: &[],
+            pending: &[],
+            rng: &mut rng,
+            step: StepIndex::new(0),
+        };
+        let Ok(mut adapter) = adapter_from_spec(ExitPolicy::Expiration) else {
+            panic!("the iron condor spec builds a valid adapter");
+        };
+        let mut out = Vec::new();
+        assert!(matches!(adapter.on_snapshot(&mut ctx, &mut out), Ok(())));
+        assert_eq!(
+            out.len(),
+            4,
+            "the four condor legs emit four opens in one step"
+        );
+        assert!(out.iter().all(is_open), "entry appends opens only");
+        assert!(adapter.has_entered());
+        // Dormancy guard: each Open's decision_mid is the SNAPSHOT quote mid,
+        // never a repriced inner premium — so no wall-clock reprice reaches the
+        // emitted intent.
+        for cmd in &out {
+            let OrderCommand::Submit(intent) = cmd else {
+                panic!("entry emits Submit intents");
+            };
+            let Some(quote) = snap.quotes.get(&intent.contract) else {
+                panic!("each entry leg matches a snapshot quote");
+            };
+            assert_eq!(intent.decision_mid, quote.mid);
+        }
+    }
+
+    #[test]
+    fn test_iron_condor_from_spec_exits_emits_closes_when_policy_triggers() {
+        let mut rng = ChaCha8Rng::seed_from_u64(21);
+        let snap = snapshot(7);
+        let legs = open_legs();
+        let ctx = ChainContext {
+            snapshot: &snap,
+            open: &legs,
+            pending: &[],
+            rng: &mut rng,
+            step: StepIndex::new(7),
+        };
+        // TimeSteps(0) always triggers; exits reprices inner (best-effort,
+        // wall-clock error dropped) then decides from snapshot scalars.
+        let Ok(mut adapter) = adapter_from_spec(ExitPolicy::TimeSteps(0)) else {
+            panic!("the iron condor spec builds a valid adapter");
+        };
+        let mut out = Vec::new();
+        assert!(matches!(adapter.exits(&ctx, &mut out), Ok(())));
+        assert_eq!(out.len(), 4, "one close per open leg when the policy fires");
+        assert!(out.iter().all(is_close), "exits appends closes only");
+    }
+
+    #[test]
+    fn test_strategy_error_maps_to_backtest_error() {
+        // IronCondor::new is effectively infallible for valid `Positive`
+        // inputs, so the reliable upstream rejection is a parameter the
+        // `Positive` domain refuses: a negative implied volatility. It surfaces
+        // as BacktestError::Strategy at the construction seam, never a panic.
+        let StrategySpec::IronCondor(mut inner) = iron_condor_spec();
+        inner.implied_volatility = dec!(-0.20);
+        let spec = StrategySpec::IronCondor(inner);
+        let result = OptStratAdapter::<IronCondor>::from_spec(&spec, ExitPolicy::Expiration);
+        assert!(matches!(result, Err(BacktestError::Strategy(_))));
     }
 
     #[test]
