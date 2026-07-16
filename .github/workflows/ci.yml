@@ -186,13 +186,41 @@ jobs:
       - name: Install maturin + pytest + the pandas extra
         run: python -m pip install --upgrade "maturin>=1.7,<2.0" pytest pandas pyarrow
       # Builds the wheel from `python/pyproject.toml` (manifest-path points at the
-      # root crate). `--features "python orderbook"` mirrors the pyproject
-      # `[tool.maturin] features` (a self-contained naive+realistic backtester,
-      # docs/06 §7); `pyo3/extension-module` is injected there for the wheel link.
-      # --out keeps the wheel next to the project for install.
+      # root crate). `--features "python orderbook simulator"` mirrors the
+      # pyproject `[tool.maturin] features` — the PUBLISHED wheel is a
+      # self-contained backtester: naive + realistic execution (`orderbook`) AND
+      # the synthetic-chain feed (`simulator`), docs/06 §7. maturin MERGES these
+      # CLI features with the pyproject list, so `pyo3/extension-module` (injected
+      # there for the wheel link) is still present. `simulator` adds no new
+      # lockfile entry / licence (its rustls stack is already allow-listed in
+      # deny.toml). --out keeps the wheel next to the project for install. This PR
+      # job builds the SAME feature set the release wheels ship, so a break shows
+      # up on every pipeline, not only on a tag.
       - name: Build the cp310-abi3 wheel
         working-directory: python
-        run: maturin build --release --features "python orderbook" --out dist
+        run: maturin build --release --features "python orderbook simulator" --out dist
+      # Version single-source guard (#41, extends the #38 __version__ check): the
+      # wheel FILENAME must carry the crate `[package].version`, so the packaging
+      # metadata (not just the runtime `__version__`) is proven to track the one
+      # Cargo.toml string. maturin fills the wheel version from the crate, so a
+      # drift here means the dynamic-version wiring broke.
+      - name: Assert the built wheel filename carries the crate version
+        run: |
+          set -euo pipefail
+          CRATE_VERSION="$(grep -m1 '^version' Cargo.toml | sed -E 's/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')"
+          echo "crate version = ${CRATE_VERSION}"
+          shopt -s nullglob
+          found=0
+          for whl in python/dist/*.whl; do
+            found=1
+            base="$(basename "${whl}")"
+            echo "built wheel  = ${base}"
+            case "${base}" in
+              ironcondor-"${CRATE_VERSION}"-*) : ;;
+              *) echo "wheel filename version != crate version ${CRATE_VERSION}"; exit 1 ;;
+            esac
+          done
+          test "${found}" = 1 || { echo "no wheel produced in python/dist/"; exit 1; }
       - name: Install the built wheel
         working-directory: python
         run: python -m pip install --no-index --find-links dist ironcondor

@@ -1,0 +1,246 @@
+# Release — build release-grade abi3 wheels + sdist on a version tag and, only
+# after a manually-approved environment gate, publish them to PyPI via trusted
+# publishing (OIDC, NO long-lived token). #41, docs/06 §7–§8,
+# docs/RELEASE-PROCESS.md §5–§7, ADR-0005.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# WHY THIS WORKFLOW CANNOT PUBLISH BY ACCIDENT — the layered guards
+# ─────────────────────────────────────────────────────────────────────────────
+#   1. TAG-ONLY TRIGGER. It runs solely on `push: tags: ['v*']`. A branch push,
+#      a pull_request, or a manual dispatch never reach the publish job. The
+#      publish job additionally re-asserts the tag ref in its `if:` (defence in
+#      depth).
+#   2. ENVIRONMENT APPROVAL. `publish-pypi` runs in the GitHub `pypi`
+#      environment. The OWNER must create that environment with REQUIRED
+#      REVIEWERS (Settings → Environments → pypi → "Required reviewers"), so
+#      every publish pauses for a human approval click. This gate is USER-SIDE:
+#      until it exists (or without a reviewer approving), the job never uploads.
+#   3. OIDC, NO TOKEN. Publishing uses `pypa/gh-action-pypi-publish` with
+#      `permissions: id-token: write` and NO password/API token. It works ONLY
+#      once the OWNER registers a PyPI "trusted publisher" for this repo +
+#      workflow + environment (a one-time user-side step). Until then the upload
+#      fails LOUDLY with a "no trusted publisher configured" error — it cannot
+#      silently succeed, and there is no long-lived secret in CI to leak.
+#   4. "Private :: Do Not Upload" CLASSIFIER. `python/pyproject.toml` still
+#      carries this classifier; PyPI/Warehouse REJECTS any upload that declares
+#      it (HTTP 400). Removing it is part of the owner's FIRST-RELEASE commit,
+#      AFTER the name is registered — see the USER-ACTION list in the PR body.
+#      So even a tag + an approved environment + a configured publisher still
+#      cannot upload while the classifier is present.
+#   5. UNREGISTERED NAME. `ironcondor` is not yet a PyPI project. There is
+#      nothing to publish INTO until the owner registers it (or a pending
+#      trusted publisher). Registration precedes the first publish
+#      (docs/ROADMAP.md dependency notes).
+#
+# This issue (#41) WIRES the pipeline; it does NOT ship a public release. The
+# first real publish is a deliberate, owner-approved event (CLAUDE.md, docs/06
+# §8). Never run `maturin publish` / twine against a live index from here.
+#
+# crates.io ↔ PyPI SEQUENCING (docs/RELEASE-PROCESS.md §6 → §7): a release
+# publishes crates.io FIRST, then these PyPI wheels, both at the same X.Y.Z from
+# the same tag. `cargo publish` is owner-gated too, so the crates.io step is a
+# documented operator action (RELEASE-PROCESS.md §6) rather than a job here — see
+# the commented `publish-crates` placeholder below the publish job.
+#
+# WINDOWS WHEELS: intentionally deferred (wishlist, docs/06 §7, PRD Q-6). The
+# v0.4 matrix is Linux (manylinux) + macOS (x86_64 + arm64) only; adding Windows
+# is a later evaluation, not an oversight.
+
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# Least privilege at the top; the publish job re-grants `id-token: write` locally.
+permissions:
+  contents: read
+
+concurrency:
+  # A release is a DEPLOY: never cancel an in-flight build/publish for a tag
+  # (unlike the non-deploy CI jobs, which set cancel-in-progress: true).
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ───────────────────────────────────────────────────────────────────────────
+  # (a) Build release-grade abi3 wheels, one per platform target.
+  #
+  # Matrix rationale — SPLIT arch wheels, NOT universal2:
+  #   - Linux x86_64  : manylinux (portable across glibc distros) via
+  #                     maturin-action's `manylinux: auto` (builds in the
+  #                     official manylinux container).
+  #   - macOS x86_64  : native build on the Intel macos-13 runner.
+  #   - macOS arm64   : native build on the Apple-silicon macos-14 runner.
+  # Two NATIVE per-arch macOS wheels (not a single fat `universal2`) because:
+  #   * pip selects the right wheel per architecture — no wasted bytes for users;
+  #   * each wheel is ~half the size of a universal2 fat binary;
+  #   * native builds avoid cross-compile / linker edge cases, and the spec asks
+  #     for "macOS (x86_64 + arm64)" — two arch wheels map to that wording 1:1.
+  # One `cp310-abi3` wheel per target (abi3-py310) serves Python 3.10+, so there
+  # is NO per-minor build (docs/06 §7, ADR-0005 alt. 5).
+  build-wheels:
+    name: build-wheels (${{ matrix.target }} on ${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64
+            manylinux: auto
+          - runner: macos-13
+            target: x86_64
+            manylinux: ""
+          - runner: macos-14
+            target: aarch64
+            manylinux: ""
+    steps:
+      - uses: actions/checkout@v4
+      # abi3-py310 floor: build against 3.10 so the produced wheel is cp310-abi3.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      # Official maturin build action, PINNED to a full version (no floating
+      # major). NOTE: this tag-triggered workflow is not exercised until the
+      # owner pushes a `v*` tag, so bump/verify this pin (Dependabot can manage
+      # it) as part of the first-release rehearsal.
+      # `manylinux: auto` builds Linux wheels in the manylinux container; it is
+      # empty on macOS (native build, no container). The wheel features mirror
+      # python/pyproject.toml — `python orderbook simulator` (a self-contained
+      # backtester); maturin merges these with the pyproject list so
+      # `pyo3/extension-module` is still injected for the wheel link.
+      - name: Build the cp310-abi3 wheel
+        uses: PyO3/maturin-action@v1.49.3
+        with:
+          command: build
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          working-directory: python
+          args: --release --out dist --features "python orderbook simulator"
+      # Version single-source guard (#41): every produced wheel filename must
+      # carry the crate `[package].version`. maturin fills the wheel version from
+      # the crate (dynamic version), so a mismatch means the wiring broke — fail
+      # BEFORE anything can be published.
+      - name: Assert wheel filenames carry the crate version
+        shell: bash
+        run: |
+          set -euo pipefail
+          CRATE_VERSION="$(grep -m1 '^version' Cargo.toml | sed -E 's/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')"
+          echo "crate version = ${CRATE_VERSION}"
+          # One tag drives one X.Y.Z (RELEASE-PROCESS §2/§4): the pushed tag
+          # must equal v<crate version>, else a mis-tag (e.g. v9.9.9 over a
+          # 0.0.1 Cargo.toml) would ship wheels whose version contradicts the
+          # tag. Fails the build long before any publish.
+          test "${GITHUB_REF_NAME}" = "v${CRATE_VERSION}" || {
+            echo "tag ${GITHUB_REF_NAME} != v${CRATE_VERSION} (Cargo.toml)"; exit 1; }
+          shopt -s nullglob
+          found=0
+          for whl in python/dist/*.whl; do
+            found=1
+            base="$(basename "${whl}")"
+            echo "built wheel  = ${base}"
+            case "${base}" in
+              ironcondor-"${CRATE_VERSION}"-*) : ;;
+              *) echo "wheel filename version != crate version ${CRATE_VERSION}"; exit 1 ;;
+            esac
+          done
+          test "${found}" = 1 || { echo "no wheel produced in python/dist/"; exit 1; }
+      - name: Upload the wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.runner }}-${{ matrix.target }}
+          path: python/dist/*.whl
+          if-no-files-found: error
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # (a′) Build the source distribution (sdist) — one, platform-independent.
+  build-sdist:
+    name: build-sdist
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the sdist
+        uses: PyO3/maturin-action@v1.49.3
+        with:
+          command: sdist
+          working-directory: python
+          args: --out dist
+      - name: Upload the sdist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: python/dist/*.tar.gz
+          if-no-files-found: error
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # (b) Publish to PyPI via trusted publishing (OIDC). GATED four ways:
+  #     tag-only trigger + `if` tag guard + `environment: pypi` (manual approval)
+  #     + OIDC-no-token (needs the owner's trusted-publisher registration).
+  #     The "Private :: Do Not Upload" classifier is a fifth, upload-time guard.
+  publish-pypi:
+    name: publish-pypi
+    needs: [build-wheels, build-sdist]
+    runs-on: ubuntu-24.04
+    # Belt-and-suspenders: the trigger is already tag-only, but re-assert it so
+    # the publish path is structurally unreachable on any non-tag ref.
+    if: startsWith(github.ref, 'refs/tags/v')
+    # The USER-SIDE approval gate: create this environment with REQUIRED
+    # REVIEWERS so every publish pauses for a human. Until it exists / is
+    # approved, this job cannot upload.
+    environment:
+      name: pypi
+      url: https://pypi.org/project/ironcondor/
+    # OIDC only — NO API token / password anywhere. `id-token: write` lets the
+    # runner mint the short-lived OIDC token PyPI trusted publishing exchanges.
+    permissions:
+      id-token: write
+    steps:
+      - name: Download all wheel + sdist artifacts into dist/
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: List the release artifacts
+        run: ls -l dist
+      # Trusted publishing (OIDC). NO `password:` input → the action uses the
+      # OIDC token, which works ONLY once the owner has registered a PyPI trusted
+      # publisher for repo `joaquinbejar/IronCondor`, workflow `release.yml`,
+      # environment `pypi`. Until then this step FAILS with a clear
+      # "trusted publisher not configured" error — it never silently no-ops.
+      # Pinned to a full version (recommended for OIDC publishing).
+      - name: Publish to PyPI (trusted publishing, OIDC)
+        uses: pypa/gh-action-pypi-publish@v1.12.4
+        with:
+          packages-dir: dist
+          print-hash: true
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # (c) crates.io publish — DOCUMENTED PLACEHOLDER (sequencing note).
+  #
+  # RELEASE-PROCESS.md §6 → §7: crates.io publishes FIRST, then the PyPI wheels
+  # above, both at the same X.Y.Z. `cargo publish` is owner-gated (it needs
+  # CARGO_REGISTRY_TOKEN and a deliberate approval), and the release playbook has
+  # the OPERATOR run it (§6), so it is intentionally NOT wired as a live job here
+  # — mirroring the "never publish without approval" rule that also governs PyPI.
+  #
+  # If it is ever wired, it belongs here, BEFORE `publish-pypi` in the graph, and
+  # behind its OWN approval gate (e.g. `environment: crates-io`):
+  #
+  #   publish-crates:
+  #     name: publish-crates
+  #     runs-on: ubuntu-24.04
+  #     if: startsWith(github.ref, 'refs/tags/v')
+  #     environment: crates-io          # second user-side manual-approval gate
+  #     steps:
+  #       - uses: actions/checkout@v4
+  #       - uses: dtolnay/rust-toolchain@1.97.0
+  #       - run: cargo publish            # uses CARGO_REGISTRY_TOKEN; owner-gated
+  #
+  # …and `publish-pypi` would then `needs: [build-wheels, build-sdist,
+  # publish-crates]` to enforce the crates-first ordering. Left commented so this
+  # workflow cannot publish to crates.io by accident.
