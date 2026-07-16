@@ -32,8 +32,18 @@ orderbook = ["dep:option-chain-orderbook", "dep:optionstratlib_ob"]
 # bundle manifest + run_id derivation need it in every build — so it is no
 # longer feature-gated here.)
 simulator = ["dep:reqwest", "dep:tokio"]
-# python — PyO3 bindings built with maturin.
-python = []
+# python — PyO3 bindings built with maturin (#38, ADR-0005). Gates the PyO3
+# DEPENDENCY + the `#[pymodule]` code, NOT the crate-type: Cargo resolves
+# `[lib] crate-type` before feature unification, so it cannot be toggled by a
+# feature (see the `[lib]` note above). Off by default → the default /
+# crates.io build carries ZERO Python dependencies. Deliberately does NOT pull
+# `pyo3/extension-module`: that feature suppresses the libpython link, which is
+# correct for the importable cdylib but breaks the `cargo test` / `--all-features`
+# executable link (an executable cannot defer the `Py*` symbols a cdylib
+# resolves at import). maturin injects `pyo3/extension-module` for the wheel
+# build only (see `python/pyproject.toml`), so `cargo test --all-features`
+# stays green.
+python = ["dep:pyo3"]
 
 [dependencies]
 chrono = "0.4"
@@ -117,6 +127,32 @@ option-chain-orderbook = { version = "0.9", default-features = false, optional =
 # this shim once `option-chain-orderbook` republishes on optionstratlib 0.18 (or
 # re-exports `OptionStyle`); see the module docs in `realistic.rs`.
 optionstratlib_ob = { package = "optionstratlib", version = "0.17", default-features = false, optional = true }
+# PyO3 — the Rust↔Python FFI layer, feature `python` only (#38, ADR-0005),
+# absent from the default / crates.io build. `abi3-py310` targets the stable
+# ABI from Python 3.10, so ONE `cp310-abi3` wheel serves 3.10+ instead of one
+# wheel per (platform × minor). The default `macros` feature is kept (it
+# provides `#[pymodule]`); `extension-module` is intentionally NOT listed here
+# — maturin injects `pyo3/extension-module` for the wheel build only, so
+# `cargo test --all-features` still links libpython and runs (see the `python`
+# feature note above). The macro-generated glue is the ONLY tolerated `unsafe`;
+# the crate keeps `#![forbid(unsafe_code)]`, verified at build. Audit note:
+# what — the PyO3 binding leaf behind the `python` feature; why — the
+# first-class Python surface (ADR-0005); licence — MIT OR Apache-2.0. It adds
+# 7 crates to Cargo.lock (all vetted green by `cargo audit` + `cargo deny`):
+# pyo3 0.29.0, pyo3-ffi 0.29.0, pyo3-macros 0.29.0, pyo3-macros-backend 0.29.0,
+# pyo3-build-config 0.29.0 and heck 0.5.0 — all `MIT OR Apache-2.0`; plus the
+# build-dep target-lexicon 0.13.5 — `Apache-2.0 WITH LLVM-exception`, which a
+# plain `Apache-2.0` allow does NOT satisfy (a WITH expression needs its own
+# SPDX entry; there is no OR fallback), so `deny.toml` allow-lists it
+# explicitly with a note (the LLVM exception only relaxes Apache-2.0, strictly
+# more permissive). Adding these rewrites Cargo.lock, so the
+# `lockfile_sha256` build-identity shifts and the two run-id-stamped golden
+# fixtures (bundle_golden, conformance) are re-blessed in this same change — the
+# documented dependency-change workflow (tests/bundle_golden.rs §Build identity).
+# NOTE: `extension-module` is intentionally NOT a cargo feature — that would let
+# `--all-features` enable it and break the `cargo test` executable link; maturin
+# injects `pyo3/extension-module` for the wheel build only (python/pyproject.toml).
+pyo3 = { version = "0.29", features = ["abi3-py310"], optional = true }
 
 [dev-dependencies]
 positive = "0.5"
