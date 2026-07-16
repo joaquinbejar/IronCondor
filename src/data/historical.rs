@@ -29,8 +29,9 @@
 //! `max_file_bytes` from the filesystem metadata **before** any byte is read,
 //! `max_decompressed_bytes` from the Parquet row-group metadata **before**
 //! decoding (and again incrementally while decoding), and `max_steps` /
-//! `max_contracts_per_snapshot` **during** materialisation. There is no
-//! `.unwrap()` / `.expect()` / unchecked `[]` on the ingestion path.
+//! `max_contracts_per_snapshot` / `max_total_bytes` **during**
+//! materialisation. There is no `.unwrap()` / `.expect()` / unchecked `[]` on
+//! the ingestion path.
 //!
 //! # Corrupt bytes vs semantic failures
 //!
@@ -57,7 +58,9 @@ use crate::config::ResourceLimits;
 use crate::data::DataSourceSpec;
 use crate::data::convert::{RawQuote, SnapshotMeta, raw_quotes_to_snapshot};
 use crate::data::feed::{DataFeed, TapeMeta};
-use crate::domain::{ChainSnapshot, PriceCents, Quantity, SimTime, StepIndex, Underlying};
+use crate::domain::{
+    ChainSnapshot, ContractKey, PriceCents, Quantity, QuoteView, SimTime, StepIndex, Underlying,
+};
 use crate::error::BacktestError;
 
 /// Rows decoded per Arrow batch. Bounds the per-batch working set independently
@@ -96,8 +99,9 @@ impl ParquetFeed {
     /// read), the file `sha256` (streaming, bounded), the row-group
     /// `max_decompressed_bytes` guard (metadata, before decoding), the exact
     /// column/dtype schema (refusing float money columns), then per-group
-    /// materialisation with `max_steps` / `max_contracts_per_snapshot` and the
-    /// incremental decompression guard. The tape is finally checked non-empty
+    /// materialisation with `max_steps` / `max_contracts_per_snapshot` /
+    /// `max_total_bytes` and the incremental decompression guard. The tape is
+    /// finally checked non-empty
     /// and strictly `ts`-increasing via [`TapeMeta::from_tape`].
     ///
     /// # Errors
@@ -105,7 +109,7 @@ impl ParquetFeed {
     /// - [`BacktestError::DataIo`] — the file cannot be stat-ed, opened, or read.
     /// - [`BacktestError::TapeTooLarge`] — a `max_file_bytes` /
     ///   `max_decompressed_bytes` / `max_steps` / `max_contracts_per_snapshot`
-    ///   ceiling is crossed (`limit` names the field).
+    ///   / `max_total_bytes` ceiling is crossed (`limit` names the field).
     /// - [`BacktestError::Data`] — undecodable bytes: a truncated / corrupt
     ///   Parquet footer or row group.
     /// - [`BacktestError::Conversion`] — a schema or dtype mismatch (including
@@ -187,6 +191,9 @@ impl ParquetFeed {
         let mut current: Option<GroupBuilder> = None;
         let mut prev_step: Option<i32> = None;
         let mut decoded_bytes: u64 = 0;
+        // Running estimate of the materialised tape's in-memory byte size, for
+        // the `max_total_bytes` ceiling (accumulated in `push_snapshot`).
+        let mut total_bytes: u64 = 0;
 
         for batch in reader {
             let batch = batch.map_err(|e| conv("failed to decode a parquet row group", &e))?;
@@ -220,7 +227,7 @@ impl ParquetFeed {
                 };
                 if new_group {
                     if let Some(group) = current.take() {
-                        push_snapshot(&mut tape, group, &mut anchor_ts, limits)?;
+                        push_snapshot(&mut tape, group, &mut anchor_ts, &mut total_bytes, limits)?;
                     }
                     if let Some(previous) = prev_step
                         && step_raw <= previous
@@ -244,7 +251,7 @@ impl ParquetFeed {
             }
         }
         if let Some(group) = current.take() {
-            push_snapshot(&mut tape, group, &mut anchor_ts, limits)?;
+            push_snapshot(&mut tape, group, &mut anchor_ts, &mut total_bytes, limits)?;
         }
 
         // (5) Non-empty + strictly-increasing `ts`, via the shared tape core.
@@ -435,12 +442,13 @@ impl GroupBuilder {
     }
 }
 
-/// Finalise a group, thread the tape anchor `ts_0`, enforce `max_steps`, and
-/// push the resulting snapshot.
+/// Finalise a group, thread the tape anchor `ts_0`, enforce `max_steps` and
+/// `max_total_bytes`, and push the resulting snapshot.
 fn push_snapshot(
     tape: &mut Vec<ChainSnapshot>,
     group: GroupBuilder,
     anchor_ts: &mut Option<SimTime>,
+    total_bytes: &mut u64,
     limits: &ResourceLimits,
 ) -> Result<(), BacktestError> {
     // The first flushed group (first in replay order) sets ts_0 for the tape.
@@ -464,8 +472,62 @@ fn push_snapshot(
             cap: limits.max_steps,
         });
     }
+
+    // `max_total_bytes` ceiling: accumulate an estimate of the materialised
+    // tape's in-memory byte size with **checked** arithmetic on the real
+    // counter (no wrapping / saturating), and abort on the FIRST crossing —
+    // BEFORE this snapshot is pushed, so the `Vec` never grows past the cap.
+    let snapshot_bytes = snapshot_byte_estimate(&snapshot)?;
+    let next_total = total_bytes
+        .checked_add(snapshot_bytes)
+        .ok_or(BacktestError::ArithmeticOverflow)?;
+    if next_total > limits.max_total_bytes {
+        return Err(BacktestError::TapeTooLarge {
+            limit: "max_total_bytes",
+            value: next_total,
+            cap: limits.max_total_bytes,
+        });
+    }
+    *total_bytes = next_total;
+
     tape.push(snapshot);
     Ok(())
+}
+
+/// Estimate one materialised snapshot's in-memory byte footprint for the
+/// `max_total_bytes` tape ceiling.
+///
+/// Basis (documented): the fixed [`ChainSnapshot`] struct overhead plus, per
+/// quote, the `BTreeMap` entry's stack footprint — the key ([`ContractKey`])
+/// and the value ([`QuoteView`], which itself embeds a second `ContractKey`).
+/// This is a **proportional** estimate, not a strict physical upper bound: it
+/// charges the tight per-entry data size (the key stored twice matches physical
+/// storage) but does not add the `BTreeMap`'s node slack (B-tree nodes may be
+/// only part-filled) and counts the interned `Underlying` `Arc<str>` as its
+/// pointer footprint only (its heap bytes are shared across quotes and bounded
+/// by the `^[A-Z0-9._]{1,32}$` grammar). Those omitted terms are each bounded
+/// by a small constant factor, so peak memory stays within a constant multiple
+/// of `max_total_bytes` — growth is bounded, never unbounded, which is the
+/// anti-OOM guarantee. The estimate feeds only the ceiling check; it never
+/// affects a materialised value.
+///
+/// # Errors
+///
+/// Returns [`BacktestError::ArithmeticOverflow`] if the per-snapshot byte
+/// estimate overflows `u64` (unreachable for a snapshot bounded by
+/// `max_contracts_per_snapshot`, but checked rather than wrapped).
+#[must_use = "the byte estimate must feed the ceiling check"]
+fn snapshot_byte_estimate(snapshot: &ChainSnapshot) -> Result<u64, BacktestError> {
+    let per_quote = u64::try_from(size_of::<ContractKey>() + size_of::<QuoteView>())
+        .map_err(|_| BacktestError::ArithmeticOverflow)?;
+    let overhead =
+        u64::try_from(size_of::<ChainSnapshot>()).map_err(|_| BacktestError::ArithmeticOverflow)?;
+    let quotes =
+        u64::try_from(snapshot.quotes.len()).map_err(|_| BacktestError::ArithmeticOverflow)?;
+    quotes
+        .checked_mul(per_quote)
+        .and_then(|q| q.checked_add(overhead))
+        .ok_or(BacktestError::ArithmeticOverflow)
 }
 
 // ---------------------------------------------------------------------------
@@ -1101,6 +1163,30 @@ mod tests {
                 limit: "max_steps",
                 value: 3,
                 cap: 2
+            })
+        ));
+    }
+
+    #[test]
+    fn test_open_enforces_max_total_bytes_tape_too_large() {
+        // A multi-step tape opened with a 1-byte total ceiling: the first
+        // snapshot's byte estimate (fixed overhead + per-quote entries) already
+        // crosses the cap, so materialisation is cut off before the Vec grows.
+        let mut chain = Chain::default();
+        condor_step(&mut chain, 0, TS0);
+        condor_step(&mut chain, 1, TS0 + NANOS_PER_DAY);
+        let Ok((_dir, path)) = write_standard(&chain) else {
+            panic!("fixture must write");
+        };
+        let limits = ResourceLimits {
+            max_total_bytes: 1,
+            ..ResourceLimits::default()
+        };
+        assert!(matches!(
+            ParquetFeed::open(&path, &limits),
+            Err(BacktestError::TapeTooLarge {
+                limit: "max_total_bytes",
+                ..
             })
         ));
     }
