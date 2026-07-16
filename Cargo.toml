@@ -27,9 +27,11 @@ default = []
 # `[dependencies]` audit notes). Absent from the default build.
 orderbook = ["dep:option-chain-orderbook", "dep:optionstratlib_ob"]
 # simulator — synthetic chain sessions via OptionChain-Simulator over HTTP.
-# Pulls the async transport (reqwest) + a minimal tokio runtime + serde_json
-# for the wire DTOs; NONE of these compile in the default build.
-simulator = ["dep:reqwest", "dep:tokio", "dep:serde_json"]
+# Pulls the async transport (reqwest) + a minimal tokio runtime; NONE of these
+# compile in the default build. (serde_json is now a core dependency — the
+# bundle manifest + run_id derivation need it in every build — so it is no
+# longer feature-gated here.)
+simulator = ["dep:reqwest", "dep:tokio"]
 # python — PyO3 bindings built with maturin.
 python = []
 
@@ -83,8 +85,16 @@ tokio = { version = "1", default-features = false, features = [
     "rt",
     "macros",
 ], optional = true }
-# serde_json: the tagged `method`/`parameters` wire fields carry raw JSON.
-serde_json = { version = "1", optional = true }
+# serde_json — a core (non-optional) dependency from v0.3: the result-bundle
+# `manifest.json` is JSON, and the `run_id` derivation hashes a canonical-JSON
+# preimage of the semantic config + strategy + build identity (src/bundle/schema.rs).
+# The simulator feed also uses it for the tagged `method`/`parameters` raw-JSON
+# wire fields. Audit note: what — the serde JSON codec behind the bundle manifest
+# and run_id; why — the bundle is a core artifact, not feature-gated; licence —
+# MIT OR Apache-2.0. Already in the lockfile (dev-dep + prior optional dep), so
+# promoting it to non-optional adds no new crate; `cargo audit` / `cargo deny`
+# stay green.
+serde_json = "1"
 # realistic-fill matching engine — feature `orderbook` only, absent from the
 # default build (#22, ADR-0002). `default-features = false` disables its `nats`
 # (async-nats/tokio) and `sequencer` (tokio/journal) optional stacks, so nothing

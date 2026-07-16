@@ -21,6 +21,7 @@ use ironcondor::{
     LegAttributionSample, ParquetFeed, ResourceLimits, StepAttributionScalars, Strategy,
     UnitGreeks,
 };
+use ironcondor::{EquityPoint, FillRow, GreeksAttributionRow, PositionRow, RowCounts, RunId};
 use rand_chacha::rand_core::RngCore;
 
 mod common;
@@ -466,6 +467,144 @@ proptest! {
             return Ok(());
         };
         prop_assert_eq!(json_object_keys(&naive_json), json_object_keys(&realistic_json));
+    }
+}
+
+// --- result-bundle wire-shape properties (issue #33) -----------------------
+
+proptest! {
+    /// `bundle_serde_identity` — every bundle row type (and the manifest
+    /// `RowCounts` / `RunId`) round-trips through JSON unchanged: serialise →
+    /// deserialise → equal. This pins the wire shape of the four
+    /// `ironcondor.bundle.v1` tables ([docs/01 §9](../../docs/01-domain-model.md#9-result-bundle-record-types)).
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn bundle_serde_identity(
+        step in any::<u32>(),
+        ts_ns in any::<i64>(),
+        run_id in ".*",
+        trade_id in any::<u64>(),
+        position_id in any::<u64>(),
+        order_id in any::<u64>(),
+        fill_seq in any::<u32>(),
+        underlying in ".*",
+        expiration_ns in any::<i64>(),
+        contract_id in ".*",
+        strike_cents in any::<u64>(),
+        style in ".*",
+        side in ".*",
+        quantity in any::<u32>(),
+        price_cents in any::<u64>(),
+        fees_cents in any::<i64>(),
+        slippage_cents in any::<i64>(),
+        mode in ".*",
+        // finite drawdown ratio (≤ 0 by domain; NaN/Inf never reach a column).
+        drawdown in -1_000.0f64..=0.0,
+        cash_cents in any::<i64>(),
+        position_value_cents in any::<i64>(),
+        equity_cents in any::<i64>(),
+        avg_price_cents in any::<u64>(),
+        mark_cents in any::<u64>(),
+        unrealized_cents in any::<i64>(),
+        stale_mark in any::<bool>(),
+        exit_reason in prop::option::of(".*"),
+        open_at_end in any::<bool>(),
+        theta in any::<i64>(),
+        delta in any::<i64>(),
+        vega in any::<i64>(),
+        spread_capture in any::<i64>(),
+        residual in any::<i64>(),
+    ) {
+        // fills.parquet
+        let fill = FillRow {
+            step,
+            ts_ns,
+            strategy_run_id: run_id.clone(),
+            trade_id,
+            position_id,
+            order_id,
+            fill_seq,
+            underlying: underlying.clone(),
+            expiration_ns,
+            contract_id: contract_id.clone(),
+            strike_cents,
+            style: style.clone(),
+            side: side.clone(),
+            quantity,
+            price_cents,
+            fees_cents,
+            slippage_cents,
+            mode: mode.clone(),
+        };
+        let json = serde_json::to_string(&fill);
+        prop_assert!(json.is_ok());
+        let Ok(json) = json else { return Ok(()); };
+        let back: Result<FillRow, _> = serde_json::from_str(&json);
+        prop_assert!(matches!(back, Ok(ref r) if *r == fill));
+
+        // equity_curve.parquet — integer columns exact; the one float column
+        // (drawdown) within the oracle tolerance, since serde_json's default
+        // float codec is not bit-exact and rule 11 forbids exact float equality.
+        let point = EquityPoint::new(step, ts_ns, cash_cents, position_value_cents, equity_cents, drawdown);
+        let json = serde_json::to_string(&point);
+        prop_assert!(json.is_ok());
+        let Ok(json) = json else { return Ok(()); };
+        let back: Result<EquityPoint, _> = serde_json::from_str(&json);
+        prop_assert!(back.is_ok());
+        let Ok(back) = back else { return Ok(()); };
+        prop_assert_eq!(back.step, point.step);
+        prop_assert_eq!(back.ts_ns, point.ts_ns);
+        prop_assert_eq!(back.cash_cents, point.cash_cents);
+        prop_assert_eq!(back.position_value_cents, point.position_value_cents);
+        prop_assert_eq!(back.equity_cents, point.equity_cents);
+        let tol = f64::max(1e-9, 1e-6 * point.drawdown.abs().max(back.drawdown.abs()));
+        prop_assert!((back.drawdown - point.drawdown).abs() <= tol);
+
+        // positions.parquet — exit_reason is the only nullable column.
+        let position = PositionRow {
+            step,
+            ts_ns,
+            position_id,
+            trade_id,
+            contract_id,
+            side,
+            quantity,
+            avg_price_cents,
+            mark_cents,
+            unrealized_cents,
+            stale_mark,
+            exit_reason,
+            open_at_end,
+        };
+        let json = serde_json::to_string(&position);
+        prop_assert!(json.is_ok());
+        let Ok(json) = json else { return Ok(()); };
+        let back: Result<PositionRow, _> = serde_json::from_str(&json);
+        prop_assert!(matches!(back, Ok(ref r) if *r == position));
+
+        // greeks_attribution.parquet
+        let attribution = GreeksAttributionRow::new(step, ts_ns, theta, delta, vega, spread_capture, fees_cents, residual);
+        let json = serde_json::to_string(&attribution);
+        prop_assert!(json.is_ok());
+        let Ok(json) = json else { return Ok(()); };
+        let back: Result<GreeksAttributionRow, _> = serde_json::from_str(&json);
+        prop_assert!(matches!(back, Ok(ref r) if *r == attribution));
+
+        // manifest row_counts
+        let counts = RowCounts::new(trade_id, position_id, order_id, u64::from(fill_seq));
+        let json = serde_json::to_string(&counts);
+        prop_assert!(json.is_ok());
+        let Ok(json) = json else { return Ok(()); };
+        let back: Result<RowCounts, _> = serde_json::from_str(&json);
+        prop_assert!(matches!(back, Ok(ref r) if *r == counts));
+
+        // run_id is transparent over its bare string.
+        let id = RunId::from_hex(run_id.clone());
+        let json = serde_json::to_string(&id);
+        prop_assert!(json.is_ok());
+        let Ok(json) = json else { return Ok(()); };
+        let back: Result<RunId, _> = serde_json::from_str(&json);
+        prop_assert!(matches!(back, Ok(ref r) if r.as_str() == run_id));
     }
 }
 
