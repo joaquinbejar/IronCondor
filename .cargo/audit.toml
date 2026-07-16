@@ -1,0 +1,18 @@
+# cargo-audit configuration — RUSTSEC advisory gate for `ironcondor`.
+#
+# Read by the `audit` CI job (`.github/workflows/ci.yml`), which runs
+# `cargo audit --deny warnings` from the repo root so that ANY advisory — a
+# vulnerability OR an unmaintained/unsound warning — fails the build, EXCEPT the
+# single documented ignore below. Kept green from v0.1 (docs/07 §10,
+# docs/TESTING.md §12.4).
+
+[advisories]
+# The ONLY ignored advisory (mirrors deny.toml [advisories].ignore).
+# RUSTSEC-2024-0436: `paste 1.0.15` is unmaintained (author archived the repo) —
+# an UNMAINTAINED notice, NOT a vulnerability. It is transitive through
+# optionstratlib's numeric stack (optionstratlib -> statrs -> nalgebra -> simba
+# -> paste) and via parquet; it cannot be dropped without dropping
+# optionstratlib. `paste` is a stable, widely-used compile-time proc-macro in
+# maintenance-only mode with no known security impact. Revisit when
+# optionstratlib migrates off it. No other advisory is ignored.
+ignore = ["RUSTSEC-2024-0436"]

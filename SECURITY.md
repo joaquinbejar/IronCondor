@@ -8,9 +8,10 @@ pipelines**. A parser that panics, hangs, or exhausts memory on a malformed
 input is a denial-of-service vector in that CI, so its security posture is
 treated like that of any internal service that parses external bytes.
 
-> **Status:** `v0.0.1` is a name-reservation placeholder — no implementation
-> code exists yet. This policy is in force from the first line of code; the
-> threat model it summarises is a design commitment
+> **Status:** Implementation has landed — the v0.1 core engine (deterministic
+> replay loop and naive fill model) is in place, with the v0.x roadmap
+> ongoing. This policy is in force; the threat model it summarises is a design
+> commitment
 > ([ADR-0007](docs/adr/0007-production-grade-performance-and-security.md)).
 
 ## Reporting a vulnerability
