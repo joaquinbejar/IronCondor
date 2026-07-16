@@ -189,6 +189,8 @@ def test_accessor_columns_match_the_frozen_schema(bundle: ic.Bundle) -> None:
 
 
 def test_accessor_dtypes_are_integer_cents_with_one_float(bundle: ic.Bundle) -> None:
+    import pandas as pd  # the accessors already require it; local like theirs
+
     equity = bundle.equity_curve()
     # Money columns are integer cents; drawdown is the only float in the bundle.
     assert equity["step"].dtype == "int32"
@@ -202,7 +204,12 @@ def test_accessor_dtypes_are_integer_cents_with_one_float(bundle: ic.Bundle) -> 
     assert fills["price_cents"].dtype == "int64"
     assert fills["fees_cents"].dtype == "int64"
     assert fills["quantity"].dtype == "int32"
-    assert fills["mode"].dtype == object  # utf8 -> object
+    # utf8 decodes as `object` on pandas < 3.0 and as the string dtype on
+    # pandas >= 3.0 — accept either so the suite tracks whatever pandas the
+    # unpinned CI install resolves. Both are "a string column", the claim
+    # under test (the single float column is `drawdown`, everything else
+    # integer cents / strings).
+    assert fills["mode"].dtype == object or pd.api.types.is_string_dtype(fills["mode"])
 
 
 def test_load_bundle_round_trips(bundle: ic.Bundle) -> None:

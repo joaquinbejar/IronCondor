@@ -413,9 +413,17 @@ mod tests {
     use rust_decimal::Decimal;
 
     use super::{DEFAULT_OUTPUT_DIR, PyBacktestConfig};
-    use crate::config::{FeeSchedule, LiquidityProfile, ResourceLimits, SlippageModel};
+    use crate::config::{
+        BacktestConfig, FeeSchedule, LiquidityProfile, ResourceLimits, SlippageModel,
+    };
     use crate::data::DataSourceSpec;
     use crate::domain::{ExecutionMode, StrategySpec};
+
+    /// The tape anchor `ts_0` and the `ts_0 + 30 days` expiry, matching
+    /// `tests/common` and the `iron_condor_naive` golden.
+    const TS0_NS: i64 = 1_750_291_200_000_000_000;
+    /// The four condor legs' absolute expiry (`ts_0 + 30 days`).
+    const EXPIRY_NS: i64 = TS0_NS + 30 * 86_400_000_000_000;
 
     /// A directly-constructed wrapper (bypassing the GIL-bound builders) so
     /// `to_rust` marshalling is unit-testable without a live interpreter.
@@ -544,5 +552,123 @@ mod tests {
             panic!("realistic-mode config marshals (the feature gate is checked in run_backtest)");
         };
         assert_eq!(rust.mode, ExecutionMode::Realistic);
+    }
+
+    /// The iron-condor spec the **binding** marshals for the shared #42 parity
+    /// scenario. The analytic fields go through the *same* `Decimal::try_from`
+    /// conversion as [`super::decimal_from_f64`] (so `0.20 → "0.2"`), which is
+    /// value-equal to but serialises differently from the golden's
+    /// `Decimal::new(20, 2)`; the parity manifest / `run_id` are byte-stable
+    /// precisely because both sides pick the `try_from` scale.
+    fn parity_strategy() -> StrategySpec {
+        use chrono::DateTime;
+        use optionstratlib::ExpirationDate;
+
+        use crate::domain::{IronCondorSpec, PriceCents, Quantity, Underlying};
+
+        let Ok(underlying) = Underlying::new("SPX") else {
+            panic!("SPX is valid");
+        };
+        let Ok(quantity) = Quantity::new(1) else {
+            panic!("1 is a valid quantity");
+        };
+        let Ok(iv) = Decimal::try_from(0.20_f64) else {
+            panic!("0.20 is a representable decimal");
+        };
+        let Ok(rate) = Decimal::try_from(0.05_f64) else {
+            panic!("0.05 is a representable decimal");
+        };
+        let Ok(dividend) = Decimal::try_from(0.0_f64) else {
+            panic!("0.0 is a representable decimal");
+        };
+        StrategySpec::IronCondor(IronCondorSpec {
+            underlying,
+            underlying_price: PriceCents::new(500_000),
+            short_call_strike: PriceCents::new(510_000),
+            short_put_strike: PriceCents::new(490_000),
+            long_call_strike: PriceCents::new(520_000),
+            long_put_strike: PriceCents::new(480_000),
+            expiration: ExpirationDate::DateTime(DateTime::from_timestamp_nanos(EXPIRY_NS)),
+            implied_volatility: iv,
+            risk_free_rate: rate,
+            dividend_yield: dividend,
+            quantity,
+            premium_short_call: PriceCents::new(2_000),
+            premium_short_put: PriceCents::new(1_800),
+            premium_long_call: PriceCents::new(800),
+            premium_long_put: PriceCents::new(700),
+            open_fee: PriceCents::new(65),
+            close_fee: PriceCents::new(65),
+        })
+    }
+
+    /// **Config-marshal equality for the shared #42 parity scenario.** The Python
+    /// `BacktestConfig` for the canonical iron-condor run marshals to *exactly*
+    /// the Rust `BacktestConfig` + `StrategySpec` + `ExitPolicy` the Rust API
+    /// consumes (`tests/python_parity.rs::run_rust_path`). This is the struct-level
+    /// proof that "the same inputs" reach both surfaces — the load-bearing
+    /// precondition for the byte-identical bundle the integration parity test
+    /// asserts. Money stays integer cents throughout; the analytic fields are the
+    /// documented `Decimal` exception, converted identically on both sides.
+    #[test]
+    fn test_to_rust_matches_the_shared_parity_scenario() {
+        let cfg = PyBacktestConfig {
+            seed: 42,
+            capital_cents: 10_000_000,
+            data_parquet_path: Some("iron_condor.parquet".to_string()),
+            strategy: Some(parity_strategy()),
+            mode: ExecutionMode::Naive,
+            slippage: SlippageModel::None,
+            fees: FeeSchedule {
+                per_contract_cents: 65,
+                per_order_cents: 100,
+            },
+            exit: ExitPolicy::TimeSteps(1_000_000),
+            marketable_cap_ticks: 10,
+            liquidity_profile: LiquidityProfile::default(),
+            limits: ResourceLimits::default(),
+            output_dir: Some(std::path::PathBuf::from("runs/out")),
+            overwrite: false,
+        };
+
+        // The exact Rust config `tests/python_parity.rs::run_rust_path` builds
+        // (`common::condor_config` with a redirected output_dir).
+        let expected = BacktestConfig {
+            data_source: DataSourceSpec::Parquet {
+                path: "iron_condor.parquet".to_string(),
+                sha256: String::new(),
+            },
+            mode: ExecutionMode::Naive,
+            seed: 42,
+            initial_capital: 10_000_000,
+            fees: FeeSchedule {
+                per_contract_cents: 65,
+                per_order_cents: 100,
+            },
+            slippage: SlippageModel::None,
+            marketable_cap_ticks: 10,
+            liquidity_profile: LiquidityProfile::default(),
+            limits: ResourceLimits::default(),
+            output_dir: std::path::PathBuf::from("runs/out"),
+            overwrite: false,
+        };
+
+        let Ok((rust, strat, exit)) = cfg.to_rust() else {
+            panic!("the shared parity config must marshal");
+        };
+        assert_eq!(
+            rust, expected,
+            "the marshalled BacktestConfig must equal the Rust parity config field-for-field"
+        );
+        assert_eq!(
+            strat,
+            parity_strategy(),
+            "the marshalled strategy must equal the Rust parity spec (identical integer cents + decimals)"
+        );
+        assert_eq!(
+            exit,
+            ExitPolicy::TimeSteps(1_000_000),
+            "the exit policy must carry through unchanged"
+        );
     }
 }

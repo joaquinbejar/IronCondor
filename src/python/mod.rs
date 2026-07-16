@@ -81,13 +81,27 @@ pub(crate) fn crate_version() -> &'static str {
 /// classes, the `run` / `load_bundle` functions (#39), and the typed exception
 /// hierarchy rooted at `ic.IronCondorError` (#40).
 ///
+/// # Why `pub`
+///
+/// The `#[pymodule]` macro derives a hidden companion module from this
+/// function's visibility; making the function `pub` therefore also makes that
+/// companion `pub`, which is what lets an **embedding** caller register the
+/// module in the interpreter's init table via
+/// [`pyo3::append_to_inittab!`](pyo3::append_to_inittab) before
+/// `Python::initialize`. The determinism-parity integration test
+/// (`tests/python_parity.rs`, #42) uses exactly that to drive the *real*
+/// registered module in-process. This is a Rust-visibility change only: it does
+/// **not** alter what the Python module exposes (the same classes / functions
+/// are registered either way), and maturin still packages the identical
+/// `PyInit_ironcondor` symbol.
+///
 /// # Errors
 ///
 /// Returns a [`PyErr`] if registering an attribute, class, or function on the
 /// module fails (the interpreter is out of memory or the module object is
 /// invalid).
 #[pymodule]
-fn ironcondor(module: &Bound<'_, PyModule>) -> PyResult<()> {
+pub fn ironcondor(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("__version__", crate_version())?;
     module.add_class::<config::PyBacktestConfig>()?;
     module.add_class::<bundle::Bundle>()?;
