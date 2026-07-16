@@ -461,4 +461,83 @@ mod realistic {
             n_last.equity_cents
         );
     }
+
+    /// #026 golden-pair schema parity: the committed `iron_condor_naive` and
+    /// `iron_condor_realistic` goldens — the **same strategy** under both modes —
+    /// share an **identical schema** (JSON key shape + value dtypes) for both
+    /// produced artifacts (equity curve + minimal metrics) while their **values
+    /// diverge**. This proves a bundle is mode-agnostic end to end: analytics
+    /// cannot tell which mode produced it from its structure ([04 §2](../docs/04-execution-models.md#2-the-executionmodel-trait-and-the-shared-fill-report)).
+    /// It reads the committed `expected/` artifacts only — it never blesses.
+    #[test]
+    fn test_golden_pair_schema_is_mode_agnostic() {
+        /// The JSON kind of a value — its "dtype" at the serialised boundary.
+        fn json_kind(value: &serde_json::Value) -> &'static str {
+            match value {
+                serde_json::Value::Null => "null",
+                serde_json::Value::Bool(_) => "bool",
+                serde_json::Value::Number(_) => "number",
+                serde_json::Value::String(_) => "string",
+                serde_json::Value::Array(_) => "array",
+                serde_json::Value::Object(_) => "object",
+            }
+        }
+        /// The `(key, dtype)` pairs of a JSON object, sorted — its schema.
+        fn schema(value: &serde_json::Value) -> Vec<(String, &'static str)> {
+            let Some(obj) = value.as_object() else {
+                panic!("expected a JSON object to extract a schema from");
+            };
+            let mut pairs: Vec<(String, &'static str)> =
+                obj.iter().map(|(k, v)| (k.clone(), json_kind(v))).collect();
+            pairs.sort();
+            pairs
+        }
+        fn read_value(path: &Path) -> serde_json::Value {
+            let Ok(text) = std::fs::read_to_string(path) else {
+                panic!("golden artifact must be readable at {path:?}");
+            };
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+                panic!("golden artifact must be valid JSON at {path:?}");
+            };
+            value
+        }
+        /// The first row object of an equity-curve JSON array.
+        fn first_row(curve: &serde_json::Value) -> serde_json::Value {
+            let Some(first) = curve.as_array().and_then(|a| a.first()) else {
+                panic!("an equity curve must have at least one row");
+            };
+            first.clone()
+        }
+
+        let naive_dir = super::fixture_dir().join("expected");
+        let realistic_dir = fixture_dir().join("expected");
+
+        let naive_curve = read_value(&naive_dir.join("equity_curve.json"));
+        let realistic_curve = read_value(&realistic_dir.join("equity_curve.json"));
+        let naive_metrics = read_value(&naive_dir.join("metrics.json"));
+        let realistic_metrics = read_value(&realistic_dir.join("metrics.json"));
+
+        // Schema parity: identical equity-row and metrics key shape + dtypes.
+        assert_eq!(
+            schema(&first_row(&naive_curve)),
+            schema(&first_row(&realistic_curve)),
+            "equity-curve row schema must be mode-agnostic"
+        );
+        assert_eq!(
+            schema(&naive_metrics),
+            schema(&realistic_metrics),
+            "metrics schema must be mode-agnostic"
+        );
+
+        // Values diverge: the schema is shared but the two bundles are NOT equal —
+        // realistic pays the spread, so both the metrics and the curve differ.
+        assert_ne!(
+            naive_metrics, realistic_metrics,
+            "the two modes must produce different metric VALUES on the same scenario"
+        );
+        assert_ne!(
+            naive_curve, realistic_curve,
+            "the two modes must produce different equity-curve VALUES"
+        );
+    }
 }

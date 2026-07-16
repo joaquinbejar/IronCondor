@@ -874,3 +874,129 @@ fn test_realistic_resting_limit_fills_when_consecutive_snapshot_crosses() {
         "every fill at the fresh touch, none at a stale level"
     );
 }
+
+/// #026 cross-mode parity (feature `orderbook`): the **same strategy** over
+/// **one scenario** in **both** fill models — selected purely by `config.mode`
+/// through the config-driven `run_backtest` dispatch — produces a `Fill` that is
+/// **byte-shape identical** across modes (same serialised JSON key set) while
+/// the two runs' **P&L diverges** (terminal equity differs). This is the v0.2
+/// acceptance headline: the strategy code runs unchanged under either model, and
+/// analytics cannot tell which model produced a fill from its structure
+/// ([docs/04 §2](../docs/04-execution-models.md#2-the-executionmodel-trait-and-the-shared-fill-report)).
+#[cfg(feature = "orderbook")]
+#[test]
+fn test_cross_mode_parity_same_strategy_shape_identical_pnl_differs() {
+    use ironcondor::{
+        ExecutionMode, ExecutionModel, FeeSchedule, Fill, NaiveFill, OrderCommand, OrderIntent,
+        PositionAction, PriceCents, Quantity, RealisticFill, SlippageModel, TimeInForce,
+    };
+    use optionstratlib::Side;
+    use optionstratlib::simulation::ExitPolicy;
+
+    let Ok(dir) = tempfile::tempdir() else {
+        panic!("tempdir must create");
+    };
+    let path = dir.path().join("condor.parquet");
+    let rows = common::condor_rows(6, None);
+    if let Err(e) = common::write_parquet(&path, &rows) {
+        panic!("the condor fixture must write: {e}");
+    }
+    let spec = common::iron_condor_spec();
+
+    // --- (1) P&L divergence: the SAME strategy+scenario, both modes, selected
+    // ONLY by `config.mode` through the #026 run_backtest dispatch. ------------
+    let naive_config = common::condor_config(&path, 7); // condor_config is mode = Naive
+    let mut realistic_config = common::condor_config(&path, 7);
+    realistic_config.mode = ExecutionMode::Realistic;
+
+    let (Ok(naive_run), Ok(realistic_run)) = (
+        ironcondor::run_backtest(&naive_config, &spec, ExitPolicy::TimeSteps(1_000_000)),
+        ironcondor::run_backtest(&realistic_config, &spec, ExitPolicy::TimeSteps(1_000_000)),
+    ) else {
+        panic!("both config-selected runs must succeed");
+    };
+
+    // Same tape ⇒ same number of equity points; the mode changes values, not shape.
+    assert_eq!(
+        naive_run.equity_curve.len(),
+        realistic_run.equity_curve.len()
+    );
+    let (Some(n_last), Some(r_last)) = (
+        naive_run.equity_curve.last(),
+        realistic_run.equity_curve.last(),
+    ) else {
+        panic!("both curves have a terminal point");
+    };
+    // The two modes DIVERGE: realistic crosses the seeded spread on entry and
+    // exit, naive fills at mid — so terminal equity differs (the fill-risk signal
+    // the mode exists to surface). An equality here means realistic collapsed
+    // into naive.
+    assert_ne!(
+        n_last.equity_cents, r_last.equity_cents,
+        "naive and realistic must produce different P&L on the same scenario"
+    );
+
+    // --- (2) Shape parity: route the SAME intent through each fill model and
+    // assert the produced `Fill` is byte-shape identical (same serialised JSON
+    // key set), so analytics cannot tell which mode produced a bundle. ---------
+    let sorted_keys = |fill: &Fill| -> Vec<String> {
+        let Ok(value) = serde_json::to_value(fill) else {
+            panic!("a Fill must serialise");
+        };
+        let Some(obj) = value.as_object() else {
+            panic!("a Fill serialises as a JSON object");
+        };
+        let mut keys: Vec<String> = obj.keys().cloned().collect();
+        keys.sort();
+        keys
+    };
+
+    let fees = FeeSchedule {
+        per_contract_cents: 65,
+        per_order_cents: 100,
+    };
+    // A depth-seeded snapshot so the realistic model fills the marketable buy.
+    let snap = liquidity_fixture::snapshot(490, 500, 8, 8);
+    let contract = liquidity_fixture::contract();
+    let Ok(three) = Quantity::new(3) else {
+        panic!("3 is a valid quantity");
+    };
+    let buy = OrderCommand::Submit(OrderIntent {
+        contract,
+        action: PositionAction::Open,
+        side: Side::Long,
+        quantity: three,
+        limit: None,
+        tif: TimeInForce::Ioc,
+        decision_mid: PriceCents::new(500),
+    });
+
+    let mut naive_model = NaiveFill::new(SlippageModel::None, fees);
+    let mut realistic_model =
+        RealisticFill::with_liquidity_profile(fees, 10, 7, liquidity_fixture::canonical_profile());
+
+    let mut naive_out: Vec<Fill> = Vec::new();
+    let mut realistic_out: Vec<Fill> = Vec::new();
+    let (Ok(()), Ok(())) = (
+        naive_model.fill(std::slice::from_ref(&buy), &snap, &mut naive_out),
+        realistic_model.fill(std::slice::from_ref(&buy), &snap, &mut realistic_out),
+    ) else {
+        panic!("both models must fill the marketable buy");
+    };
+
+    let (Some(naive_fill), Some(realistic_fill)) = (naive_out.first(), realistic_out.first())
+    else {
+        panic!("both models produce at least one fill");
+    };
+    // Different mode tags — and different prices (naive mid 495 vs realistic touch
+    // 500), so the fills genuinely differ in VALUE...
+    assert_eq!(naive_fill.mode, ExecutionMode::Naive);
+    assert_eq!(realistic_fill.mode, ExecutionMode::Realistic);
+    assert_ne!(naive_fill.price, realistic_fill.price);
+    // ...but their serialised field SHAPE is identical (mode-agnostic).
+    assert_eq!(
+        sorted_keys(naive_fill),
+        sorted_keys(realistic_fill),
+        "the Fill shape must be mode-agnostic (identical serialised key set)"
+    );
+}

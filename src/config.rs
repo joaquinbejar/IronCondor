@@ -329,7 +329,12 @@ const fn default_marketable_cap_ticks() -> u32 {
 pub struct BacktestConfig {
     /// Where the chain data comes from.
     pub data_source: DataSourceSpec,
-    /// Which fill model executes order intents.
+    /// Which fill model executes order intents ([`ExecutionMode::Naive`] or
+    /// [`ExecutionMode::Realistic`]). **Semantic** config: the mode changes what
+    /// the run computes (naive and realistic fills of the same intent diverge),
+    /// so — unlike the operational `output_dir` / `overwrite` — it is part of the
+    /// semantic config the `run_id` hashes (v0.3, #33). Two modes therefore get
+    /// distinct `run_id`s / output dirs and never share a bundle directory.
     pub mode: ExecutionMode,
     /// The engine seed driving every seeded RNG in the run.
     pub seed: u64,
@@ -662,6 +667,60 @@ mod tests {
         }"#;
         let parsed: Result<BacktestConfig, _> = serde_json::from_str(json);
         assert!(parsed.is_err(), "unknown key must fail deserialisation");
+    }
+
+    #[test]
+    fn test_config_rejects_unknown_mode_value_fails_deserialisation() {
+        // `mode` is a closed-set `#[repr(u8)]` enum with snake_case serde, so an
+        // unknown discriminant — a typo (`"bogus"`), trailing whitespace
+        // (`"realistic "`), or wrong casing (`"Naive"`) — fails to deserialise
+        // rather than silently defaulting. This is the acceptance criterion that
+        // an unknown mode is rejected at the config boundary (#26).
+        for bad in ["\"bogus\"", "\"realistic \"", "\"Naive\"", "\"\""] {
+            let json = format!(
+                r#"{{
+                    "data_source": {{"kind": "parquet", "path": "p.parquet", "sha256": ""}},
+                    "mode": {bad},
+                    "seed": 1,
+                    "initial_capital": 1000,
+                    "fees": {{"per_contract_cents": 0, "per_order_cents": 0}},
+                    "slippage": {{"model": "none"}},
+                    "output_dir": "out"
+                }}"#
+            );
+            let parsed: Result<BacktestConfig, _> = serde_json::from_str(&json);
+            assert!(
+                parsed.is_err(),
+                "unknown mode value {bad} must fail deserialisation"
+            );
+        }
+    }
+
+    #[test]
+    fn test_config_accepts_both_known_mode_values() {
+        // Both closed-set values deserialise (and the whole config validates),
+        // proving the switch selects a model rather than rejecting a mode.
+        for (mode, expected) in [
+            ("naive", ExecutionMode::Naive),
+            ("realistic", ExecutionMode::Realistic),
+        ] {
+            let json = format!(
+                r#"{{
+                    "data_source": {{"kind": "parquet", "path": "p.parquet", "sha256": ""}},
+                    "mode": "{mode}",
+                    "seed": 1,
+                    "initial_capital": 1000,
+                    "fees": {{"per_contract_cents": 0, "per_order_cents": 0}},
+                    "slippage": {{"model": "none"}},
+                    "output_dir": "out"
+                }}"#
+            );
+            let parsed: Result<BacktestConfig, _> = serde_json::from_str(&json);
+            assert!(
+                matches!(parsed, Ok(ref c) if c.mode == expected && c.validate().is_ok()),
+                "mode {mode:?} must deserialise to {expected:?} and validate"
+            );
+        }
     }
 
     #[test]
