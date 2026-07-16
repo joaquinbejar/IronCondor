@@ -13,9 +13,13 @@ use optionstratlib::{ExpirationDate, OptionStyle, Side};
 use proptest::prelude::*;
 use rust_decimal::Decimal;
 
+use ironcondor::analytics::attribution::{
+    RESIDUAL_WARN_FLOOR_CENTS, attribute, residual_is_notable,
+};
 use ironcondor::{
-    BacktestEngine, BacktestRun, ChainContext, CsvFeed, DataFeed, ParquetFeed, ResourceLimits,
-    Strategy,
+    AttributionSubstrate, BacktestEngine, BacktestRun, ChainContext, CsvFeed, DataFeed,
+    LegAttributionSample, ParquetFeed, ResourceLimits, StepAttributionScalars, Strategy,
+    UnitGreeks,
 };
 use rand_chacha::rand_core::RngCore;
 
@@ -1235,5 +1239,395 @@ proptest! {
         };
         let got: Vec<u64> = snap.quotes.keys().map(|k| k.strike.value()).collect();
         prop_assert_eq!(got, strikes);
+    }
+}
+
+// --- P&L attribution by Greek (issue #31) ----------------------------------
+
+/// The condor fixtures' initial capital ([`common::condor_config`]).
+const ATTR_INITIAL_CAPITAL: i64 = 10_000_000;
+/// Nanoseconds in one calendar day of exactly 86_400 s — the `Δt_days` base.
+const ATTR_NANOS_PER_DAY: i64 = 86_400_000_000_000;
+/// Dollars → cents: theta/vega are dollar-denominated, so their cents term
+/// carries this factor (delta is a ratio and does NOT — see docs/05 §3).
+const DOLLARS_TO_CENTS: i128 = 100;
+/// Decimal IV → percentage points: a 0.01 decimal move is 1 pp.
+const IV_DECIMAL_TO_PP: i128 = 100;
+
+/// A `UnitGreeks` with the given per-contract unit sensitivities.
+fn attr_greeks(delta: Decimal, theta: Decimal, vega: Decimal, iv: Decimal) -> UnitGreeks {
+    UnitGreeks {
+        delta,
+        gamma: Decimal::ZERO,
+        theta,
+        vega,
+        implied_volatility: iv,
+    }
+}
+
+/// A one-step, single-leg substrate — the focused unit-of-analysis for the
+/// mis-scaling guards. `prior_ts`/`prior_underlying` are the previous endpoints;
+/// pass them equal to `ts`/`underlying` to zero a market delta.
+#[allow(clippy::too_many_arguments)]
+fn attr_single_leg(
+    prior: Option<UnitGreeks>,
+    current_iv: Decimal,
+    quantity: u32,
+    multiplier: u32,
+    side: Side,
+    ts: i64,
+    prior_ts: i64,
+    underlying: u64,
+    prior_underlying: u64,
+    spread_capture: i64,
+    fees: i64,
+    step_pnl: i64,
+) -> AttributionSubstrate {
+    let leg = LegAttributionSample {
+        prior_greeks: prior,
+        current_iv,
+        quantity,
+        contract_multiplier: multiplier,
+        side,
+    };
+    let scalars = StepAttributionScalars {
+        step: 0,
+        ts_ns: ts,
+        prior_ts_ns: prior_ts,
+        underlying_cents: underlying,
+        prior_underlying_cents: prior_underlying,
+        spread_capture_cents: spread_capture,
+        fees_cents: fees,
+        step_pnl_cents: step_pnl,
+        leg_count: 1,
+    };
+    AttributionSubstrate {
+        steps: vec![scalars],
+        legs: vec![leg],
+    }
+}
+
+/// Banker's-rounded `value` to whole integer cents — the same policy the
+/// production pass applies once per term (ADR-0003). The independent oracle.
+fn attr_round_cents(value: Decimal) -> i64 {
+    use rust_decimal::prelude::ToPrimitive;
+    value
+        .round_dp_with_strategy(0, rust_decimal::RoundingStrategy::MidpointNearestEven)
+        .to_i64()
+        .unwrap_or(i64::MAX)
+}
+
+/// `side_sign` as an `i128` (`+1` long, `−1` short).
+fn attr_side_sign(side: Side) -> i128 {
+    match side {
+        Side::Long => 1,
+        Side::Short => -1,
+    }
+}
+
+/// The full reconciliation identity for one row, in `i128` cents.
+fn attr_identity_lhs(row: &ironcondor::GreeksAttributionRow) -> i128 {
+    i128::from(row.theta_pnl_cents)
+        + i128::from(row.delta_pnl_cents)
+        + i128::from(row.vega_pnl_cents)
+        + i128::from(row.spread_capture_cents)
+        - i128::from(row.fees_cents)
+        + i128::from(row.residual_cents)
+}
+
+/// Run the canonical condor over a freshly-written fixture and return its
+/// attribution rows plus the equity curve, so the identity can be checked
+/// against the INDEPENDENT `equity_n − equity_{n-1}`.
+fn attr_run_condor(
+    steps: u32,
+    seed: u64,
+) -> Option<(
+    Vec<ironcondor::GreeksAttributionRow>,
+    Vec<ironcondor::EquityPoint>,
+)> {
+    let dir = tempfile::tempdir().ok()?;
+    let path = dir.path().join("condor.parquet");
+    let rows = common::condor_rows(steps, None);
+    common::write_parquet(&path, &rows).ok()?;
+    let run = common::run_condor(&path, seed).ok()?;
+    let attribution = attribute(&run.attribution_substrate).ok()?;
+    Some((attribution, run.equity_curve))
+}
+
+proptest! {
+    /// The golden reconciliation invariant: for EVERY step, the attribution
+    /// terms sum **exactly** in integer cents to the ledger's mark-to-market
+    /// `step_pnl = equity_n − equity_{n-1}` (step 0: `equity_0 − initial`).
+    /// Checked against the INDEPENDENT equity curve, so it proves the whole
+    /// engine-substrate → analytics chain reconciles, not just the residual's
+    /// self-consistency.
+    #[test]
+    fn pnl_attribution_sums_to_step_pnl(steps in 2u32..=8, seed in any::<u64>()) {
+        let Some((rows, curve)) = attr_run_condor(steps, seed) else {
+            return Err(TestCaseError::fail("the condor run + attribution must succeed"));
+        };
+        prop_assert_eq!(rows.len(), curve.len());
+        prop_assert_eq!(rows.len(), steps as usize);
+        let mut prev_equity = ATTR_INITIAL_CAPITAL;
+        for (row, point) in rows.iter().zip(curve.iter()) {
+            // Independent step_pnl straight off the equity curve.
+            let expected = i128::from(point.equity_cents) - i128::from(prev_equity);
+            prev_equity = point.equity_cents;
+            prop_assert_eq!(
+                attr_identity_lhs(row),
+                expected,
+                "attribution must reconcile to equity delta at step {}",
+                row.step
+            );
+        }
+    }
+
+    /// Step 0 reconciles the initial-capital baseline: all Greek terms are `0`
+    /// (no `S_{-1}`), and the residual closes `step_pnl_0 = equity_0 − initial`
+    /// exactly.
+    #[test]
+    fn step_zero_attribution_reconciles(steps in 1u32..=6, seed in any::<u64>()) {
+        let Some((rows, curve)) = attr_run_condor(steps, seed) else {
+            return Err(TestCaseError::fail("the condor run + attribution must succeed"));
+        };
+        let (Some(row0), Some(point0)) = (rows.first(), curve.first()) else {
+            return Err(TestCaseError::fail("step 0 must exist"));
+        };
+        prop_assert_eq!(row0.step, 0);
+        prop_assert_eq!(row0.theta_pnl_cents, 0, "no S_-1 ⇒ theta term 0 at step 0");
+        prop_assert_eq!(row0.delta_pnl_cents, 0, "no S_-1 ⇒ delta term 0 at step 0");
+        prop_assert_eq!(row0.vega_pnl_cents, 0, "no S_-1 ⇒ vega term 0 at step 0");
+        // residual closes the initial-capital baseline.
+        let expected = i128::from(point0.equity_cents) - i128::from(ATTR_INITIAL_CAPITAL);
+        prop_assert_eq!(attr_identity_lhs(row0), expected);
+        // The residual is exactly step_pnl minus the (spread_capture − fees).
+        let expected_residual =
+            expected - (i128::from(row0.spread_capture_cents) - i128::from(row0.fees_cents));
+        prop_assert_eq!(i128::from(row0.residual_cents), expected_residual);
+    }
+
+    /// The theta term uses the **daily** greek against a **day** delta. The
+    /// production term equals the daily oracle exactly; a ~365× annual mis-scale
+    /// (theta annual, or Δt in years) would produce a DIFFERENT value, so this
+    /// test discriminates it.
+    #[test]
+    fn theta_term_uses_daily_greek_and_day_delta(
+        theta_milli in -500i64..=-1, // negative daily theta, in 1/1000 dollars
+        day_count in 1i64..=30,
+        quantity in 1u32..=10,
+        is_long in any::<bool>(),
+    ) {
+        let theta = Decimal::new(theta_milli, 3);
+        let side = if is_long { Side::Long } else { Side::Short };
+        let mult = 100u32;
+        let ts = TS0 + day_count * ATTR_NANOS_PER_DAY;
+        let substrate = attr_single_leg(
+            Some(attr_greeks(Decimal::ZERO, theta, Decimal::ZERO, Decimal::new(20, 2))),
+            Decimal::new(20, 2), // iv unchanged ⇒ vega term 0
+            quantity, mult, side,
+            ts, TS0, 500_000, 500_000, // ΔS = 0
+            0, 0, 0,
+        );
+        let Ok(rows) = attribute(&substrate) else {
+            return Err(TestCaseError::fail("attribution must succeed"));
+        };
+        let Some(row) = rows.first() else {
+            return Err(TestCaseError::fail("one row"));
+        };
+        let weight = i128::from(quantity) * i128::from(mult) * attr_side_sign(side);
+        // Correct DAILY oracle: theta · Δt_days · 100 · weight.
+        let dt_days = Decimal::from(day_count);
+        let correct = attr_round_cents(
+            theta * dt_days * Decimal::from(DOLLARS_TO_CENTS as i64)
+                * Decimal::from(i64::try_from(weight).unwrap_or(i64::MAX)),
+        );
+        prop_assert_eq!(row.theta_pnl_cents, correct, "theta term uses the daily base");
+        // ANNUAL mis-scale: Δt in years = day_count / 365 ⇒ ≈ 365× smaller.
+        let dt_years = dt_days / Decimal::from(365);
+        let mis = attr_round_cents(
+            theta * dt_years * Decimal::from(DOLLARS_TO_CENTS as i64)
+                * Decimal::from(i64::try_from(weight).unwrap_or(i64::MAX)),
+        );
+        // The daily and annual scalings must differ (proves the guard bites);
+        // the daily term is large enough here that ÷365 always changes it.
+        prop_assert_ne!(correct, mis, "a ~365× annual mis-scale would change the term");
+    }
+
+    /// The vega term uses the **per-percentage-point** greek against a **pp** IV
+    /// delta. Production equals the pp oracle; a 100× decimal-IV mis-scale
+    /// (using the raw 0.01 decimal move as ΔIV) would differ.
+    #[test]
+    fn vega_term_uses_per_point_greek_and_pp_delta(
+        vega_milli in 1i64..=500,      // dollars/pp, in 1/1000
+        iv_move_bp in 1i64..=500,      // IV move in 1/10000 (basis points of σ)
+        quantity in 1u32..=10,
+        is_long in any::<bool>(),
+    ) {
+        let vega = Decimal::new(vega_milli, 3);
+        let prior_iv = Decimal::new(2000, 4); // 0.2000
+        let current_iv = prior_iv + Decimal::new(iv_move_bp, 4);
+        let side = if is_long { Side::Long } else { Side::Short };
+        let mult = 100u32;
+        let substrate = attr_single_leg(
+            Some(attr_greeks(Decimal::ZERO, Decimal::ZERO, vega, prior_iv)),
+            current_iv,
+            quantity, mult, side,
+            TS0, TS0, 500_000, 500_000, // Δt = 0, ΔS = 0
+            0, 0, 0,
+        );
+        let Ok(rows) = attribute(&substrate) else {
+            return Err(TestCaseError::fail("attribution must succeed"));
+        };
+        let Some(row) = rows.first() else {
+            return Err(TestCaseError::fail("one row"));
+        };
+        let weight = i128::from(quantity) * i128::from(mult) * attr_side_sign(side);
+        let weight_dec = Decimal::from(i64::try_from(weight).unwrap_or(i64::MAX));
+        let iv_move_decimal = current_iv - prior_iv;
+        // Correct: vega · (Δiv × 100 pp) · 100 (dollars→cents) · weight.
+        let delta_iv_pp = iv_move_decimal * Decimal::from(IV_DECIMAL_TO_PP as i64);
+        let correct = attr_round_cents(
+            vega * delta_iv_pp * Decimal::from(DOLLARS_TO_CENTS as i64) * weight_dec,
+        );
+        prop_assert_eq!(row.vega_pnl_cents, correct, "vega term uses the per-pp base");
+        // 100× decimal mis-scale: use the raw decimal move (no ×100 to pp).
+        let mis = attr_round_cents(
+            vega * iv_move_decimal * Decimal::from(DOLLARS_TO_CENTS as i64) * weight_dec,
+        );
+        prop_assert_ne!(correct, mis, "a 100× decimal-IV mis-scale would change the term");
+    }
+
+    /// Each greek term weights `quantity × multiplier × side_sign` **exactly
+    /// once**. Production equals the once-weighted oracle; an `N²`
+    /// double-quantity (weighting a value that already folded in quantity) would
+    /// differ for any quantity > 1.
+    #[test]
+    fn greek_terms_weight_quantity_once(
+        delta_milli in -1000i64..=1000,
+        ds_cents in -500i64..=500,
+        quantity in 2u32..=10, // > 1 so N² is distinguishable
+        is_long in any::<bool>(),
+    ) {
+        let delta = Decimal::new(delta_milli, 3);
+        let side = if is_long { Side::Long } else { Side::Short };
+        let mult = 100u32;
+        let underlying = 500_000u64;
+        let prior_underlying = i64::try_from(underlying)
+            .ok()
+            .and_then(|u| u.checked_sub(ds_cents))
+            .and_then(|v| u64::try_from(v).ok());
+        let Some(prior_underlying) = prior_underlying else {
+            return Ok(());
+        };
+        let substrate = attr_single_leg(
+            Some(attr_greeks(delta, Decimal::ZERO, Decimal::ZERO, Decimal::new(20, 2))),
+            Decimal::new(20, 2),
+            quantity, mult, side,
+            TS0, TS0, underlying, prior_underlying, // Δt = 0
+            0, 0, 0,
+        );
+        let Ok(rows) = attribute(&substrate) else {
+            return Err(TestCaseError::fail("attribution must succeed"));
+        };
+        let Some(row) = rows.first() else {
+            return Err(TestCaseError::fail("one row"));
+        };
+        let ds = i128::from(underlying) - i128::from(prior_underlying);
+        let weight_once = i128::from(quantity) * i128::from(mult) * attr_side_sign(side);
+        // delta · ΔS_cents · (weight once). Delta is a ratio ⇒ no ×100.
+        let correct = attr_round_cents(
+            delta
+                * Decimal::from(i64::try_from(ds).unwrap_or(0))
+                * Decimal::from(i64::try_from(weight_once).unwrap_or(i64::MAX)),
+        );
+        prop_assert_eq!(row.delta_pnl_cents, correct, "quantity weighted once");
+        // N² mis-scale: weight = quantity² × mult × side_sign.
+        let weight_squared =
+            i128::from(quantity) * i128::from(quantity) * i128::from(mult) * attr_side_sign(side);
+        let mis = attr_round_cents(
+            delta
+                * Decimal::from(i64::try_from(ds).unwrap_or(0))
+                * Decimal::from(i64::try_from(weight_squared).unwrap_or(i64::MAX)),
+        );
+        // For a non-zero term, once-weighted and squared-weighted differ.
+        if correct != 0 {
+            prop_assert_ne!(correct, mis, "an N² double-quantity would change the term");
+        }
+    }
+
+    /// Sign reconciliation at the attribution boundary: `spread_capture` is the
+    /// single negation of the slippage sum, `fees ≥ 0` and subtracted, and the
+    /// identity closes exactly for any generated frictions and target.
+    #[test]
+    fn fill_and_step_sign_reconciliation(
+        slippage_sum in -100_000i64..=100_000,
+        fees in 0i64..=100_000,
+        step_pnl in -1_000_000i64..=1_000_000,
+    ) {
+        // spread_capture = −Σ slippage (the single sign flip).
+        let spread_capture = slippage_sum.checked_neg();
+        let Some(spread_capture) = spread_capture else { return Ok(()); };
+        // A step with no Greek drivers isolates the frictions.
+        let substrate = attr_single_leg(
+            None, Decimal::new(20, 2), 1, 100, Side::Short,
+            TS0, TS0, 500_000, 500_000, // all market deltas 0
+            spread_capture, fees, step_pnl,
+        );
+        let Ok(rows) = attribute(&substrate) else {
+            return Err(TestCaseError::fail("attribution must succeed"));
+        };
+        let Some(row) = rows.first() else {
+            return Err(TestCaseError::fail("one row"));
+        };
+        prop_assert_eq!(row.spread_capture_cents, spread_capture, "single sign flip");
+        prop_assert!(row.fees_cents >= 0, "fees are a non-negative magnitude");
+        prop_assert_eq!(row.fees_cents, fees);
+        // Greek terms 0 (no S_-1) ⇒ residual = step_pnl − (spread_capture − fees).
+        prop_assert_eq!(row.theta_pnl_cents, 0);
+        prop_assert_eq!(row.delta_pnl_cents, 0);
+        prop_assert_eq!(row.vega_pnl_cents, 0);
+        prop_assert_eq!(attr_identity_lhs(row), i128::from(step_pnl), "identity closes exactly");
+    }
+
+    /// The residual bound is **advisory**: whatever the residual's magnitude,
+    /// `attribute` returns `Ok`, the row is present, and the identity still
+    /// closes exactly. A residual above the floor and above `|step_pnl|` is
+    /// flagged `notable` (an advisory warn) — but never fails the run.
+    #[test]
+    fn attribution_residual_is_bounded(
+        delta_milli in -5000i64..=5000,
+        ds_cents in -1000i64..=1000,
+        step_pnl in -10_000_000i64..=10_000_000,
+    ) {
+        let delta = Decimal::new(delta_milli, 3);
+        let underlying = 500_000u64;
+        let prior_underlying = i64::try_from(underlying)
+            .ok()
+            .and_then(|u| u.checked_sub(ds_cents))
+            .and_then(|v| u64::try_from(v).ok());
+        let Some(prior_underlying) = prior_underlying else { return Ok(()); };
+        let substrate = attr_single_leg(
+            Some(attr_greeks(delta, Decimal::ZERO, Decimal::ZERO, Decimal::new(20, 2))),
+            Decimal::new(20, 2),
+            1, 100, Side::Long,
+            TS0, TS0, underlying, prior_underlying,
+            0, 0, step_pnl,
+        );
+        // Never errors, regardless of how large the residual grows.
+        let Ok(rows) = attribute(&substrate) else {
+            return Err(TestCaseError::fail("a large residual must never fail the pass"));
+        };
+        let Some(row) = rows.first() else {
+            return Err(TestCaseError::fail("one row"));
+        };
+        // The identity always closes exactly in integer cents.
+        prop_assert_eq!(attr_identity_lhs(row), i128::from(step_pnl));
+        // The advisory predicate agrees with its definition — and it is only a
+        // warning trigger, asserted here to be consistent, never a gate.
+        let notable = residual_is_notable(row.residual_cents, step_pnl);
+        let r = row.residual_cents.unsigned_abs();
+        let expected_notable =
+            r > RESIDUAL_WARN_FLOOR_CENTS.unsigned_abs() && r > step_pnl.unsigned_abs();
+        prop_assert_eq!(notable, expected_notable);
     }
 }

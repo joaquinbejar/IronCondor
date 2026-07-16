@@ -7,8 +7,9 @@
 //! [`ChainSnapshot`]), execution records ([`OrderIntent`], [`OrderCommand`],
 //! [`Fill`], [`OpenPosition`], [`PendingOrder`], the lifecycle ids, and the
 //! [`execution::sign_convention`] truth-table helpers), the run's
-//! [`StrategySpec`] (strategy kind + parameters), and the result-bundle record
-//! [`EquityPoint`] the replay loop's ledger emits.
+//! [`StrategySpec`] (strategy kind + parameters), and the result-bundle records
+//! [`EquityPoint`] (the replay loop's ledger emits) and [`GreeksAttributionRow`]
+//! (the analytics layer's per-step P&L decomposition).
 
 pub mod contract;
 pub mod execution;
@@ -25,6 +26,6 @@ pub use execution::{
 };
 pub use market::{ChainSnapshot, InstrumentSpec, QuoteView};
 pub use money::{Cents, PriceCents, Quantity, Ticks};
-pub use result::EquityPoint;
+pub use result::{EquityPoint, GreeksAttributionRow};
 pub use strategy_spec::{IronCondorSpec, ShortStrangleSpec, StrategySpec};
 pub use time::{SimTime, StepIndex};

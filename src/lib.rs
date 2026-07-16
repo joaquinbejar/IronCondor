@@ -93,15 +93,15 @@ pub use data::{
     feed_catalogue, raw_quotes_to_snapshot, snapshot_to_option_chain,
 };
 pub use domain::{
-    Cents, ChainSnapshot, ContractKey, EquityPoint, ExecutionMode, Fill, InstrumentSpec,
-    IronCondorSpec, OpenPosition, OrderCommand, OrderId, OrderIntent, PendingOrder, PositionAction,
-    PositionId, PriceCents, Quantity, QuoteView, ShortStrangleSpec, SimTime, StepIndex,
-    StrategySpec, Ticks, TimeInForce, TradeId, Underlying,
+    Cents, ChainSnapshot, ContractKey, EquityPoint, ExecutionMode, Fill, GreeksAttributionRow,
+    InstrumentSpec, IronCondorSpec, OpenPosition, OrderCommand, OrderId, OrderIntent, PendingOrder,
+    PositionAction, PositionId, PriceCents, Quantity, QuoteView, ShortStrangleSpec, SimTime,
+    StepIndex, StrategySpec, Ticks, TimeInForce, TradeId, Underlying,
 };
 pub use engine::{
-    BacktestEngine, BacktestRun, ChainContext, ConfigOverride, Event, Ledger, OptStratAdapter,
-    PositionMark, PositionableStrategy, ScenarioParams, ScenarioType, SimClock, Strategy,
-    UnitGreeks,
+    AttributionSubstrate, BacktestEngine, BacktestRun, ChainContext, ConfigOverride, Event, Ledger,
+    LegAttributionSample, OptStratAdapter, PositionMark, PositionableStrategy, ScenarioParams,
+    ScenarioType, SimClock, StepAttributionScalars, Strategy, UnitGreeks,
 };
 pub use error::BacktestError;
 #[cfg(feature = "orderbook")]

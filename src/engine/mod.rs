@@ -19,9 +19,11 @@ pub mod clock;
 pub mod ledger;
 pub mod scenario;
 pub mod strategy;
+pub mod substrate;
 
 pub use backtest::{BacktestEngine, BacktestRun};
 pub use clock::{Event, SimClock};
 pub use ledger::{Ledger, PositionMark, UnitGreeks};
 pub use scenario::{ConfigOverride, ScenarioParams, ScenarioType};
 pub use strategy::{ChainContext, OptStratAdapter, PositionableStrategy, Strategy};
+pub use substrate::{AttributionSubstrate, LegAttributionSample, StepAttributionScalars};
