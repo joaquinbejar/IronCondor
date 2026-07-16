@@ -207,3 +207,18 @@ required-features = ["orderbook"]
 [[bench]]
 name = "bundle_write"
 harness = false
+
+# The PyO3 boundary marshalling bench (#43, PB-6): the Rust-side per-call
+# marshalling cost of the binding with the engine elided — the config builder
+# chain (marshal-in path) + a single-crossing floor — driven through the real
+# registered `#[pymodule]` in an embedded interpreter. `required-features =
+# ["python"]` so it compiles ONLY with the PyO3 binding (and links libpython, so
+# build/run it with `PYO3_PYTHON=python3.12`); the default build never sees it.
+# `harness = false` for the same reason as the other benches. The companion
+# Python-side per-call-vs-batch amortisation measurement is the manual script
+# `python/benches/pyo3_overhead.py` (documented in BENCH.md §H5, kept out of the
+# pytest gates).
+[[bench]]
+name = "pyo3_marshal"
+harness = false
+required-features = ["python"]
