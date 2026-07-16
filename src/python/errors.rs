@@ -336,6 +336,17 @@ mod tests {
     use pyo3::prelude::*;
     use pyo3::types::PyType;
 
+    /// Initialise the embedded interpreter, then attach.
+    ///
+    /// A plain `cargo test --all-features` binary embeds Python without the
+    /// pyo3 `auto-initialize` feature, so `Python::attach` panics unless the
+    /// interpreter was started first. `Python::initialize()` is idempotent —
+    /// safe to call from every test regardless of execution order.
+    fn with_py<F: for<'py> FnOnce(Python<'py>)>(f: F) {
+        Python::initialize();
+        Python::attach(f);
+    }
+
     /// One instance of **every** `BacktestError` variant paired with the
     /// exception class name it must map to. Mirrors the exhaustive `to_pyerr`
     /// match; if a variant is added, `to_pyerr` fails to compile (no wildcard).
@@ -406,7 +417,7 @@ mod tests {
 
     #[test]
     fn test_every_variant_maps_to_expected_exception_class() {
-        Python::attach(|py| {
+        with_py(|py| {
             for (err, expected) in every_variant() {
                 let py_err = to_pyerr(py, err);
                 assert_eq!(
@@ -420,7 +431,7 @@ mod tests {
 
     #[test]
     fn test_every_variant_is_an_ironcondor_error() {
-        Python::attach(|py| {
+        with_py(|py| {
             for (err, _) in every_variant() {
                 let py_err = to_pyerr(py, err);
                 assert!(
@@ -433,7 +444,7 @@ mod tests {
 
     #[test]
     fn test_config_kinds_are_value_errors() {
-        Python::attach(|py| {
+        with_py(|py| {
             let cfg_kinds = [
                 BacktestError::InvalidQuantity(0),
                 BacktestError::CrossedQuote { bid: 2, ask: 1 },
@@ -450,7 +461,7 @@ mod tests {
 
     #[test]
     fn test_data_and_bundle_kinds_are_os_errors() {
-        Python::attach(|py| {
+        with_py(|py| {
             let os_kinds = [
                 BacktestError::Data("x".into()),
                 BacktestError::Conversion("x".into()),
@@ -477,7 +488,7 @@ mod tests {
 
     #[test]
     fn test_single_base_kinds_are_not_value_or_os_errors() {
-        Python::attach(|py| {
+        with_py(|py| {
             let kinds = [
                 BacktestError::Execution("x".into()),
                 BacktestError::Strategy("x".into()),
@@ -494,7 +505,7 @@ mod tests {
 
     #[test]
     fn test_message_is_preserved() {
-        Python::attach(|py| {
+        with_py(|py| {
             let py_err = to_pyerr(py, BacktestError::CrossedQuote { bid: 105, ask: 100 });
             let message = py_err.value(py).to_string();
             assert!(
@@ -506,7 +517,7 @@ mod tests {
 
     #[test]
     fn test_config_error_subclass_relationships() {
-        Python::attach(|py| {
+        with_py(|py| {
             let ty: Bound<'_, PyType> = config_error_type(py).expect("config error type builds");
             assert!(ty.is_subclass_of::<IronCondorError>().unwrap());
             assert!(ty.is_subclass_of::<PyValueError>().unwrap());
@@ -516,7 +527,7 @@ mod tests {
 
     #[test]
     fn test_data_error_subclass_relationships() {
-        Python::attach(|py| {
+        with_py(|py| {
             let ty: Bound<'_, PyType> = data_error_type(py).expect("data error type builds");
             assert!(ty.is_subclass_of::<IronCondorError>().unwrap());
             assert!(ty.is_subclass_of::<PyOSError>().unwrap());
@@ -525,7 +536,7 @@ mod tests {
 
     #[test]
     fn test_bundle_error_subclass_relationships() {
-        Python::attach(|py| {
+        with_py(|py| {
             let ty: Bound<'_, PyType> = bundle_error_type(py).expect("bundle error type builds");
             assert!(ty.is_subclass_of::<IronCondorError>().unwrap());
             assert!(ty.is_subclass_of::<PyOSError>().unwrap());
@@ -534,7 +545,7 @@ mod tests {
 
     #[test]
     fn test_single_base_types_subclass_the_base() {
-        Python::attach(|py| {
+        with_py(|py| {
             assert!(
                 py.get_type::<ExecutionError>()
                     .is_subclass_of::<IronCondorError>()
@@ -555,7 +566,7 @@ mod tests {
 
     #[test]
     fn test_guard_boundary_converts_panic_to_engine_error() {
-        Python::attach(|py| {
+        with_py(|py| {
             let result: PyResult<()> = guard_boundary(|| -> PyResult<()> {
                 panic!("boom from rust");
             });
