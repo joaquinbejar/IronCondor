@@ -333,7 +333,15 @@ mod short_strangle {
         let Ok(initial) = i64::try_from(config.initial_capital) else {
             panic!("initial capital must fit i64 cents");
         };
-        if metrics::populate(&mut run.result, &run.equity_curve, initial).is_err() {
+        if metrics::populate(
+            &mut run.result,
+            &run.equity_curve,
+            initial,
+            &run.trade_log,
+            &run.open_at_end,
+        )
+        .is_err()
+        {
             panic!("the minimal metrics must populate the short strangle result");
         }
         let Ok(metrics) = MetricsSummary::from_result(&run.result) else {
@@ -504,7 +512,15 @@ mod realistic {
         let Ok(initial) = i64::try_from(config.initial_capital) else {
             panic!("initial capital must fit i64 cents");
         };
-        if metrics::populate(&mut run.result, &run.equity_curve, initial).is_err() {
+        if metrics::populate(
+            &mut run.result,
+            &run.equity_curve,
+            initial,
+            &run.trade_log,
+            &run.open_at_end,
+        )
+        .is_err()
+        {
             panic!("the minimal metrics must populate the realistic result");
         }
         let Ok(metrics) = MetricsSummary::from_result(&run.result) else {

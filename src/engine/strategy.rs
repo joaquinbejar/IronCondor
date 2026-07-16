@@ -36,6 +36,7 @@ use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 
 use optionstratlib::Side;
+use optionstratlib::backtesting::ExitReason;
 use optionstratlib::prelude::Positive;
 use optionstratlib::simulation::{ExitPolicy, check_exit_policy};
 use optionstratlib::strategies::base::{Optimizable, Positionable};
@@ -171,6 +172,19 @@ pub trait Strategy {
         ctx: &mut ChainContext,
         out: &mut Vec<OrderCommand>,
     ) -> Result<(), BacktestError>;
+
+    /// The [`ExitReason`] to record on the trade log for closes this strategy
+    /// emitted from its **[`Self::exits`] (exit-policy)** phase — the reason the
+    /// applied [`ExitPolicy`] gives ([docs/05 §4](../../../docs/05-analytics-and-reporting.md#4-summary-metrics)).
+    ///
+    /// The loop consults this **only** when the exits phase produced closes (a
+    /// real policy trigger), never on a warm step, so it is off the PB-1 step
+    /// path. The default is a generic policy close; [`OptStratAdapter`] overrides
+    /// it to map its configured [`ExitPolicy`] to a specific reason.
+    #[must_use]
+    fn exit_reason(&self) -> ExitReason {
+        ExitReason::Other("exit_policy".to_string())
+    }
 }
 
 /// Number of nanoseconds in one 86 400 s calendar day — the fixed divisor for
@@ -647,6 +661,35 @@ impl<S: PositionableStrategy> Strategy for OptStratAdapter<S> {
         // Closing commands only — the loop rejects a Submit(Open) from on_end.
         Self::close_all(ctx.open, ctx.snapshot, out);
         Ok(())
+    }
+
+    fn exit_reason(&self) -> ExitReason {
+        exit_policy_to_reason(&self.exit)
+    }
+}
+
+/// Map an applied [`ExitPolicy`] to the [`ExitReason`] recorded on a
+/// policy-triggered leg close ([docs/05 §4](../../../docs/05-analytics-and-reporting.md#4-summary-metrics)).
+///
+/// Profit-side policies map to [`ExitReason::TargetReached`], loss-side to
+/// [`ExitReason::StopLoss`], expiration/time to [`ExitReason::Expiration`]; an
+/// ambiguous or composite policy (whose specific triggering leaf the engine
+/// cannot disambiguate) maps to a descriptive [`ExitReason::Other`] rather than
+/// a fabricated specific reason. The mapping is a **pure** function of the
+/// policy — no wall clock, no RNG — so it is deterministic.
+#[must_use]
+fn exit_policy_to_reason(policy: &ExitPolicy) -> ExitReason {
+    match policy {
+        ExitPolicy::ProfitPercent(_) => ExitReason::TargetReached,
+        ExitPolicy::LossPercent(_) => ExitReason::StopLoss,
+        ExitPolicy::Expiration | ExitPolicy::TimeSteps(_) | ExitPolicy::DaysToExpiration(_) => {
+            ExitReason::Expiration
+        }
+        ExitPolicy::MinPrice(_) => ExitReason::StopLoss,
+        ExitPolicy::MaxPrice(_) | ExitPolicy::FixedPrice(_) => ExitReason::TargetReached,
+        // A composite (or any variant whose triggering leaf is not
+        // disambiguable) records a descriptive Other rather than guessing one.
+        other => ExitReason::Other(other.to_string()),
     }
 }
 
@@ -1746,6 +1789,38 @@ mod tests {
             pos(dec!(30)),
             pos(dec!(5000)),
             false,
+        ));
+    }
+
+    #[test]
+    fn test_exit_reason_maps_the_applied_policy_to_an_upstream_reason() {
+        use optionstratlib::backtesting::ExitReason;
+
+        // The trade log's ExitReason is taken from the applied ExitPolicy: a
+        // profit target maps to TargetReached, a loss cap to StopLoss, and a
+        // time/expiration policy to Expiration.
+        assert_eq!(
+            adapter(ExitPolicy::ProfitPercent(dec!(50))).exit_reason(),
+            ExitReason::TargetReached
+        );
+        assert_eq!(
+            adapter(ExitPolicy::LossPercent(dec!(100))).exit_reason(),
+            ExitReason::StopLoss
+        );
+        assert_eq!(
+            adapter(ExitPolicy::TimeSteps(5)).exit_reason(),
+            ExitReason::Expiration
+        );
+        assert_eq!(
+            adapter(ExitPolicy::Expiration).exit_reason(),
+            ExitReason::Expiration
+        );
+        // A composite the engine cannot disambiguate records a descriptive
+        // Other rather than a fabricated specific reason.
+        let composite = ExitPolicy::And(vec![ExitPolicy::Expiration]);
+        assert!(matches!(
+            adapter(composite).exit_reason(),
+            ExitReason::Other(_)
         ));
     }
 }

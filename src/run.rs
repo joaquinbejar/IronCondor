@@ -150,7 +150,13 @@ pub fn run_backtest(
     let initial_capital_cents = i64::try_from(config.initial_capital).map_err(|_| {
         BacktestError::Config("initial capital exceeds the i64 cents range".to_string())
     })?;
-    metrics::populate(&mut run.result, &run.equity_curve, initial_capital_cents)?;
+    metrics::populate(
+        &mut run.result,
+        &run.equity_curve,
+        initial_capital_cents,
+        &run.trade_log,
+        &run.open_at_end,
+    )?;
 
     // …and the per-step P&L attribution by Greek, decomposed from the engine's
     // owned attribution substrate ([`crate::engine::substrate`]) into one

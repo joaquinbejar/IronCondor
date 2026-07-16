@@ -20,4 +20,4 @@ pub mod attribution;
 pub mod metrics;
 
 pub use attribution::attribute;
-pub use metrics::populate;
+pub use metrics::{Metrics, populate};

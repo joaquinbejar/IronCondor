@@ -38,7 +38,10 @@
 use std::fmt;
 
 use ironcondor::EquityPoint;
-use ironcondor::analytics::metrics::{MAX_DRAWDOWN_CENTS_KEY, MAX_DRAWDOWN_RATIO_KEY};
+use ironcondor::analytics::metrics::{
+    LONG_LEGS_REALIZED_CENTS_KEY, MAX_DRAWDOWN_CENTS_KEY, MAX_DRAWDOWN_RATIO_KEY,
+    NET_PREMIUM_CENTS_KEY, REALIZED_PNL_CENTS_KEY, SHORT_LEGS_REALIZED_CENTS_KEY,
+};
 use optionstratlib::backtesting::BacktestResult;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
@@ -51,19 +54,20 @@ pub const ABS_TOLERANCE: f64 = 1e-9;
 /// The relative arm of the tolerance (see [`ABS_TOLERANCE`]).
 pub const REL_TOLERANCE: f64 = 1e-6;
 
-/// The minimal v0.1 metrics summary the golden freezes — the six values
-/// derivable from the equity series
-/// ([docs/05 §4](../../docs/05-analytics-and-reporting.md#4-summary-metrics)),
-/// extracted from the upstream [`BacktestResult`] via [`Self::from_result`].
+/// The metrics summary the golden freezes — the equity-derived ratios plus the
+/// #32 trade-log slice (win/loss counts, Sortino, per-leg realised split), all
+/// extracted from the upstream [`BacktestResult`] via [`Self::from_result`]
+/// ([docs/05 §4](../../docs/05-analytics-and-reporting.md#4-summary-metrics)).
 ///
-/// `max_drawdown_cents` is an **integer-cents** money value (compared exactly);
-/// every other field is an analytic ratio (compared within the tolerance).
-/// `sharpe_ratio` / `volatility` are `Option` — `None` when the curve cannot
-/// define them (fewer than two points, or a flat curve).
+/// The `*_cents` fields are **integer-cents** money values (compared exactly);
+/// every ratio field is an analytic float (compared within the tolerance).
+/// `Option` ratios are `None` when the curve/log cannot define them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MetricsSummary {
     /// Per-step Sharpe ratio, or `None` for a flat / too-short curve.
     pub sharpe_ratio: Option<Decimal>,
+    /// Per-step Sortino ratio, or `None` when downside deviation is zero.
+    pub sortino_ratio: Option<Decimal>,
     /// Per-step return volatility, or `None` for a too-short curve.
     pub volatility: Option<Decimal>,
     /// `(final − initial) / initial`, a ratio.
@@ -74,33 +78,42 @@ pub struct MetricsSummary {
     pub max_drawdown_ratio: Decimal,
     /// Worst peak-to-trough decline in **integer cents** (exact).
     pub max_drawdown_cents: i64,
+    /// Number of realised leg closes.
+    pub number_of_trades: usize,
+    /// Realised leg closes that made a profit.
+    pub winners: usize,
+    /// Realised leg closes that took a loss.
+    pub losers: usize,
+    /// Win rate `winners / number_of_trades`, or `None` with no trades.
+    pub win_rate: Option<Decimal>,
+    /// Total realised P&L across all closes in **integer cents** (exact).
+    pub realized_pnl_cents: i64,
+    /// Realised P&L of the short legs (short strikes) in **integer cents**.
+    pub short_legs_realized_cents: i64,
+    /// Realised P&L of the long legs (long wings) in **integer cents**.
+    pub long_legs_realized_cents: i64,
+    /// Net entry premium (received − paid) in **integer cents** (exact).
+    pub net_premium_cents: i64,
 }
 
 impl MetricsSummary {
-    /// Extract the minimal v0.1 metrics from the upstream [`BacktestResult`]
-    /// that [`ironcondor::analytics::metrics::populate`] filled.
+    /// Extract the metrics summary from the upstream [`BacktestResult`] that
+    /// [`ironcondor::analytics::metrics::populate`] filled.
     ///
     /// # Errors
     ///
     /// Returns a message string if a required `custom_metrics` key is missing or
-    /// the cents magnitude is not an integer — either indicates the metrics pass
-    /// did not run or a schema drift, both of which must fail the golden loudly.
+    /// a cents value is not an integer — either indicates the metrics pass did
+    /// not run or a schema drift, both of which must fail the golden loudly.
     pub fn from_result(result: &BacktestResult) -> Result<Self, String> {
         let ratio = result
             .custom_metrics
             .get(MAX_DRAWDOWN_RATIO_KEY)
             .copied()
             .ok_or_else(|| format!("missing custom metric {MAX_DRAWDOWN_RATIO_KEY}"))?;
-        let cents_dec = result
-            .custom_metrics
-            .get(MAX_DRAWDOWN_CENTS_KEY)
-            .copied()
-            .ok_or_else(|| format!("missing custom metric {MAX_DRAWDOWN_CENTS_KEY}"))?;
-        let max_drawdown_cents = cents_dec
-            .to_i64()
-            .ok_or_else(|| format!("{MAX_DRAWDOWN_CENTS_KEY} is not an integer: {cents_dec}"))?;
         Ok(Self {
             sharpe_ratio: result.general_performance.sharpe_ratio,
+            sortino_ratio: result.general_performance.sortino_ratio,
             volatility: result
                 .general_performance
                 .volatility
@@ -109,9 +122,30 @@ impl MetricsSummary {
             total_return: result.general_performance.total_return,
             max_drawdown: result.drawdown_analysis.max_drawdown,
             max_drawdown_ratio: ratio,
-            max_drawdown_cents,
+            max_drawdown_cents: cents_metric(result, MAX_DRAWDOWN_CENTS_KEY)?,
+            number_of_trades: result.trade_statistics.number_of_trades,
+            winners: result.trade_statistics.winners,
+            losers: result.trade_statistics.losers,
+            win_rate: result.general_performance.win_rate,
+            realized_pnl_cents: cents_metric(result, REALIZED_PNL_CENTS_KEY)?,
+            short_legs_realized_cents: cents_metric(result, SHORT_LEGS_REALIZED_CENTS_KEY)?,
+            long_legs_realized_cents: cents_metric(result, LONG_LEGS_REALIZED_CENTS_KEY)?,
+            net_premium_cents: cents_metric(result, NET_PREMIUM_CENTS_KEY)?,
         })
     }
+}
+
+/// Read an integer-cents `custom_metrics` value, failing loudly if it is missing
+/// or not an exact integer.
+fn cents_metric(result: &BacktestResult, key: &str) -> Result<i64, String> {
+    let value = result
+        .custom_metrics
+        .get(key)
+        .copied()
+        .ok_or_else(|| format!("missing custom metric {key}"))?;
+    value
+        .to_i64()
+        .ok_or_else(|| format!("{key} is not an integer: {value}"))
 }
 
 /// A single located divergence: which artifact, which step (if a table row),
@@ -267,6 +301,7 @@ pub fn compare_metrics(
     produced: &MetricsSummary,
     expected: &MetricsSummary,
 ) -> Result<(), OracleDiff> {
+    // Integer-cents money and integer counts compared exactly.
     cmp_int(
         "metrics",
         None,
@@ -274,6 +309,42 @@ pub fn compare_metrics(
         produced.max_drawdown_cents,
         expected.max_drawdown_cents,
     )?;
+    cmp_int(
+        "metrics",
+        None,
+        "realized_pnl_cents",
+        produced.realized_pnl_cents,
+        expected.realized_pnl_cents,
+    )?;
+    cmp_int(
+        "metrics",
+        None,
+        "short_legs_realized_cents",
+        produced.short_legs_realized_cents,
+        expected.short_legs_realized_cents,
+    )?;
+    cmp_int(
+        "metrics",
+        None,
+        "long_legs_realized_cents",
+        produced.long_legs_realized_cents,
+        expected.long_legs_realized_cents,
+    )?;
+    cmp_int(
+        "metrics",
+        None,
+        "net_premium_cents",
+        produced.net_premium_cents,
+        expected.net_premium_cents,
+    )?;
+    cmp_usize(
+        "number_of_trades",
+        produced.number_of_trades,
+        expected.number_of_trades,
+    )?;
+    cmp_usize("winners", produced.winners, expected.winners)?;
+    cmp_usize("losers", produced.losers, expected.losers)?;
+    // Analytic ratios compared within the tolerance.
     cmp_dec_tol("total_return", produced.total_return, expected.total_return)?;
     cmp_dec_tol("max_drawdown", produced.max_drawdown, expected.max_drawdown)?;
     cmp_dec_tol(
@@ -282,8 +353,29 @@ pub fn compare_metrics(
         expected.max_drawdown_ratio,
     )?;
     cmp_opt_dec_tol("sharpe_ratio", produced.sharpe_ratio, expected.sharpe_ratio)?;
+    cmp_opt_dec_tol(
+        "sortino_ratio",
+        produced.sortino_ratio,
+        expected.sortino_ratio,
+    )?;
     cmp_opt_dec_tol("volatility", produced.volatility, expected.volatility)?;
+    cmp_opt_dec_tol("win_rate", produced.win_rate, expected.win_rate)?;
     Ok(())
+}
+
+/// Compare two `usize` counts exactly, naming the field on a mismatch.
+fn cmp_usize(field: &'static str, a: usize, b: usize) -> Result<(), OracleDiff> {
+    if a == b {
+        Ok(())
+    } else {
+        Err(OracleDiff::new(
+            "metrics",
+            None,
+            field,
+            a.to_string(),
+            b.to_string(),
+        ))
+    }
 }
 
 fn cmp_int(
@@ -366,11 +458,20 @@ mod tests {
     fn metrics(total_return: Decimal, max_drawdown_cents: i64) -> MetricsSummary {
         MetricsSummary {
             sharpe_ratio: None,
+            sortino_ratio: None,
             volatility: Some(Decimal::ZERO),
             total_return,
             max_drawdown: Decimal::ZERO,
             max_drawdown_ratio: Decimal::ZERO,
             max_drawdown_cents,
+            number_of_trades: 0,
+            winners: 0,
+            losers: 0,
+            win_rate: None,
+            realized_pnl_cents: 0,
+            short_legs_realized_cents: 0,
+            long_legs_realized_cents: 0,
+            net_premium_cents: 0,
         }
     }
 
