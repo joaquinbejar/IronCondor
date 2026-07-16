@@ -161,3 +161,13 @@ harness = false
 name = "realistic_overhead"
 harness = false
 required-features = ["orderbook"]
+
+# The bundle-writer scaling bench (#37, PB-5): `write_bundle` timed over
+# `BacktestRun`s of growing length (positions table 1k/8k/32k/128k rows,
+# straddling the 8192-row Parquet batch), proving O(rows) single-pass linear
+# time. The writer is in the default build (naive), so NO `required-features`;
+# `harness = false` for the same reason as above. The companion peak-memory
+# measurement + PB-5 assertions live in `tests/bundle_write_pb5.rs`.
+[[bench]]
+name = "bundle_write"
+harness = false
