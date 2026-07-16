@@ -43,12 +43,11 @@ use crate::config::{LiquidityProfile, TouchSize};
 use crate::domain::{ChainSnapshot, ContractKey, PriceCents, Quantity, QuoteView};
 use crate::error::BacktestError;
 
-use super::realistic::RealisticFill;
-
 /// One planned seed order: a resting maker limit on `contract`'s book.
 ///
-/// Purely the *plan* — [`plan_seed`] computes the whole deterministic ladder as
-/// a `Vec<SeedOrder>` in fixed submission order, and [`seed_book`] submits it.
+/// Purely the *plan* — [`plan_seed_into`] computes the whole deterministic
+/// ladder into a reusable `Vec<SeedOrder>` in fixed submission order, and the
+/// `RealisticFill` refresh submits it (#025).
 /// Keeping planning separate from submission makes the ladder unit-testable
 /// without a live book and pins determinism at the plan level.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,23 +105,25 @@ fn decayed_size(touch: u32, factor: Decimal) -> Result<u32, BacktestError> {
     Ok(size)
 }
 
-/// Plan the full deterministic seed ladder for a snapshot, in fixed submission
-/// order — ascending [`ContractKey`], bid side before ask side, touch before
-/// deeper levels.
+/// Plan the full deterministic seed ladder for a snapshot **into a caller-owned
+/// buffer**, in fixed submission order — ascending [`ContractKey`], bid side
+/// before ask side, touch before deeper levels.
 ///
 /// A pure function of `(snap, profile)`: same inputs ⇒ byte-identical plan. The
-/// returned `Vec` is the one-time initial-seed plan (#023); the per-step refresh
-/// that reuses buffers is #025.
+/// buffer is **cleared in place** first, so the between-snapshot refresh (#025)
+/// reuses one scratch `Vec` across every step rather than allocating a fresh
+/// plan per snapshot ([docs/07 §4](../../../docs/07-performance-and-security.md)).
 ///
 /// # Errors
 ///
 /// Returns [`BacktestError::ArithmeticOverflow`] on cents/size overflow while
-/// building a ladder.
-#[must_use = "the seed plan must be submitted to have any effect"]
-pub(crate) fn plan_seed(
+/// building a ladder, and [`BacktestError::Execution`] when the tick is zero.
+pub(crate) fn plan_seed_into(
     snap: &ChainSnapshot,
     profile: &LiquidityProfile,
-) -> Result<Vec<SeedOrder>, BacktestError> {
+    plan: &mut Vec<SeedOrder>,
+) -> Result<(), BacktestError> {
+    plan.clear();
     let tick_cents = snap.spec.tick_size_cents.value();
     if tick_cents == 0 {
         // Defence in depth: `InstrumentSpec` validates `tick > 0` at ingest.
@@ -130,12 +131,11 @@ pub(crate) fn plan_seed(
             "instrument tick_size_cents is zero at the book seeder".to_string(),
         ));
     }
-    let mut plan: Vec<SeedOrder> = Vec::new();
     // `snap.quotes` is a `BTreeMap`, so iteration is ascending `ContractKey`
     // (stable, deterministic) — the fixed submission order.
     for (contract, quote) in &snap.quotes {
         push_side_ladder(
-            &mut plan,
+            plan,
             contract,
             false,
             quote.bid.value(),
@@ -144,7 +144,7 @@ pub(crate) fn plan_seed(
             quote,
         )?;
         push_side_ladder(
-            &mut plan,
+            plan,
             contract,
             true,
             quote.ask.value(),
@@ -153,6 +153,24 @@ pub(crate) fn plan_seed(
             quote,
         )?;
     }
+    Ok(())
+}
+
+/// Plan the full deterministic seed ladder for a snapshot as a fresh `Vec` — the
+/// allocation-owning convenience over [`plan_seed_into`], kept for the ladder
+/// unit tests that assert a whole plan without threading a scratch buffer.
+///
+/// # Errors
+///
+/// Propagates every [`plan_seed_into`] error.
+#[cfg(test)]
+#[must_use = "the seed plan must be submitted to have any effect"]
+pub(crate) fn plan_seed(
+    snap: &ChainSnapshot,
+    profile: &LiquidityProfile,
+) -> Result<Vec<SeedOrder>, BacktestError> {
+    let mut plan: Vec<SeedOrder> = Vec::new();
+    plan_seed_into(snap, profile, &mut plan)?;
     Ok(plan)
 }
 
@@ -205,37 +223,6 @@ fn push_side_ladder(
         factor = factor
             .checked_mul(profile.decay)
             .ok_or(BacktestError::ArithmeticOverflow)?;
-    }
-    Ok(())
-}
-
-/// Seed every strike's leaf book in `model` from `snap`'s quotes per `profile`.
-///
-/// Builds the deterministic [`plan_seed`] ladder and submits each level through
-/// [`RealisticFill::seed_maker_limit`], which draws a seeded-maker `OrderId`
-/// (disjoint from strategy ids), scales cents → ticks, and rests the order.
-/// Submission follows the plan's fixed order, so the seeded book is
-/// byte-identical across runs.
-///
-/// This is the **one-time initial seed** (#023): the between-snapshot refresh
-/// that cancels stale seed and reseeds each step is #025.
-///
-/// # Errors
-///
-/// Propagates [`plan_seed`] errors and every [`RealisticFill::seed_maker_limit`]
-/// error ([`BacktestError::PriceNotTickAligned`] for a mis-aligned quote,
-/// [`BacktestError::Conversion`] for an unresolved expiration,
-/// [`BacktestError::OrderBook`] when the book rejects an order,
-/// [`BacktestError::Execution`] when the maker id range is exhausted).
-pub(crate) fn seed_book(
-    model: &mut RealisticFill,
-    snap: &ChainSnapshot,
-    profile: &LiquidityProfile,
-) -> Result<(), BacktestError> {
-    let tick = snap.spec.tick_size_cents;
-    let plan = plan_seed(snap, profile)?;
-    for order in &plan {
-        model.seed_maker_limit(&order.contract, order.is_ask, order.price, order.size, tick)?;
     }
     Ok(())
 }
