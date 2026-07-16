@@ -196,6 +196,12 @@ impl Default for ResourceLimits {
     }
 }
 
+/// The default realistic-mode marketable price cap in ticks
+/// ([docs/04 §5.2](../docs/04-execution-models.md), default `10`).
+const fn default_marketable_cap_ticks() -> u32 {
+    10
+}
+
 /// The full configuration of one backtest run.
 ///
 /// Everything downstream reads this config; [`Self::validate`] is the single
@@ -217,6 +223,15 @@ pub struct BacktestConfig {
     pub fees: FeeSchedule,
     /// The naive-mode slippage model (ignored by realistic mode).
     pub slippage: SlippageModel,
+    /// Realistic-mode marketable price cap, in ticks off the touch
+    /// ([docs/04 §5.2](../docs/04-execution-models.md)). A marketable intent
+    /// (`OrderIntent.limit = None`) becomes a tick-aligned aggressive limit
+    /// `k` ticks through the touch (`ask + k·tick` for a buy, `bid − k·tick`
+    /// for a sell); the order walks book levels only within `k` ticks and any
+    /// remainder beyond the cap is cancelled, not chased. Must be `> 0`.
+    /// Ignored by naive mode. Defaults to `10`.
+    #[serde(default = "default_marketable_cap_ticks")]
+    pub marketable_cap_ticks: u32,
     /// Resource ceilings for every untrusted input surface.
     #[serde(default)]
     pub limits: ResourceLimits,
@@ -247,6 +262,11 @@ impl BacktestConfig {
         if self.initial_capital == 0 {
             return Err(BacktestError::Config(
                 "initial capital must be positive, got 0".to_string(),
+            ));
+        }
+        if self.marketable_cap_ticks == 0 {
+            return Err(BacktestError::Config(
+                "marketable_cap_ticks must be positive, got 0".to_string(),
             ));
         }
         self.limits.validate()?;
@@ -301,6 +321,7 @@ mod tests {
             slippage: SlippageModel::SpreadFraction {
                 fraction: dec!(0.5),
             },
+            marketable_cap_ticks: 10,
             limits: ResourceLimits::default(),
             output_dir: "runs/out".into(),
             overwrite: false,
@@ -377,6 +398,30 @@ mod tests {
         let mut cfg = valid_config();
         cfg.output_dir = std::path::PathBuf::new();
         assert_config_error(cfg.validate(), "output dir");
+    }
+
+    #[test]
+    fn test_config_rejects_zero_marketable_cap_ticks_config_error() {
+        let mut cfg = valid_config();
+        cfg.marketable_cap_ticks = 0;
+        assert_config_error(cfg.validate(), "marketable_cap_ticks");
+    }
+
+    #[test]
+    fn test_config_marketable_cap_ticks_defaults_to_ten_when_absent() {
+        // A config JSON omitting the field deserialises with the documented
+        // default of 10 (serde default), so old configs stay valid.
+        let json = r#"{
+            "data_source": {"kind": "parquet", "path": "p.parquet", "sha256": ""},
+            "mode": "naive",
+            "seed": 1,
+            "initial_capital": 1000,
+            "fees": {"per_contract_cents": 0, "per_order_cents": 0},
+            "slippage": {"model": "none"},
+            "output_dir": "out"
+        }"#;
+        let parsed: Result<BacktestConfig, _> = serde_json::from_str(json);
+        assert!(matches!(parsed, Ok(ref c) if c.marketable_cap_ticks == 10));
     }
 
     #[test]

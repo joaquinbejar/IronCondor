@@ -101,6 +101,8 @@ pub use engine::{
     PositionMark, PositionableStrategy, ScenarioParams, ScenarioType, SimClock, Strategy,
 };
 pub use error::BacktestError;
+#[cfg(feature = "orderbook")]
+pub use execution::RealisticFill;
 pub use execution::{ExecutionModel, NaiveFill};
 pub use run::run_backtest;
 

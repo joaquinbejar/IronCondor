@@ -22,8 +22,10 @@ crate-type = ["rlib", "cdylib"]
 [features]
 # default — engine + naive execution + historical feeds.
 default = []
-# orderbook — realistic execution via option-chain-orderbook.
-orderbook = []
+# orderbook — realistic execution via option-chain-orderbook (v0.2, #22).
+# Pulls the matching engine + the optionstratlib 0.17 boundary shim (see the
+# `[dependencies]` audit notes). Absent from the default build.
+orderbook = ["dep:option-chain-orderbook", "dep:optionstratlib_ob"]
 # simulator — synthetic chain sessions via OptionChain-Simulator over HTTP.
 # Pulls the async transport (reqwest) + a minimal tokio runtime + serde_json
 # for the wire DTOs; NONE of these compile in the default build.
@@ -65,6 +67,28 @@ tokio = { version = "1", default-features = false, features = [
 ], optional = true }
 # serde_json: the tagged `method`/`parameters` wire fields carry raw JSON.
 serde_json = { version = "1", optional = true }
+# realistic-fill matching engine — feature `orderbook` only, absent from the
+# default build (#22, ADR-0002). `default-features = false` disables its `nats`
+# (async-nats/tokio) and `sequencer` (tokio/journal) optional stacks, so nothing
+# async is pulled and the book is driven in-process/synchronously. Transitive:
+# orderbook-rs ~0.11 (special_orders), pricelevel ~0.8, dashmap 6, uuid,
+# crossbeam-skiplist — all MIT/Apache-2.0. Audit note: what — the option-chain
+# matching leaf the realistic fill routes through; why — order-book-level fills
+# are the crate differentiator; licence — MIT. `cargo audit` / `cargo deny`
+# stay green (allow-list extended for any new transitive licence).
+option-chain-orderbook = { version = "0.9", default-features = false, optional = true }
+# optionstratlib 0.17 boundary shim — feature `orderbook` only. UNAVOIDABLE
+# version bridge: published `option-chain-orderbook` (0.9.1) pins optionstratlib
+# `^0.17`, while this crate is on optionstratlib 0.18, so the resolver keeps two
+# semver-incompatible optionstratlib copies. `OptionOrderBook::new(symbol,
+# OptionStyle)` takes an `optionstratlib::OptionStyle` **by value** and the crate
+# does not re-export it, so the leaf constructor must be handed the 0.17 type.
+# This renamed dep names that one enum (a trivial `Call`/`Put`) at the seam in
+# `src/execution/realistic.rs` and nowhere else; the whole crate otherwise uses
+# optionstratlib 0.18. Licence: MIT. DEVIATION for architect review — remove
+# this shim once `option-chain-orderbook` republishes on optionstratlib 0.18 (or
+# re-exports `OptionStyle`); see the module docs in `realistic.rs`.
+optionstratlib_ob = { package = "optionstratlib", version = "0.17", default-features = false, optional = true }
 
 [dev-dependencies]
 positive = "0.5"

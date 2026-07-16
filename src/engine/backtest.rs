@@ -703,6 +703,7 @@ mod tests {
                 per_order_cents: 0,
             },
             slippage: SlippageModel::None,
+            marketable_cap_ticks: 10,
             limits: crate::config::ResourceLimits::default(),
             output_dir: "runs/out".into(),
             overwrite: false,
