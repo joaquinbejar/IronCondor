@@ -126,7 +126,18 @@ hdrhistogram = "7"
 # The naive-mode throughput baseline (#18): full `run_backtest` over a canonical
 # Parquet iron-condor chain, single strategy, single core. `harness = false` so
 # criterion's own `main` runs (this bench provides `criterion_main!`), not the
-# libtest harness.
+# libtest harness. Shares its fixed scenario with `realistic_overhead` via
+# `benches/common/mod.rs`.
 [[bench]]
 name = "naive_throughput"
 harness = false
+
+# The realistic-vs-naive overhead A/B (#29, PB-3): the SAME fixed condor scenario
+# as `naive_throughput`, run through `run_backtest` in both modes, reporting the
+# dimensionless realistic/naive overhead ratio. `required-features = ["orderbook"]`
+# so it compiles ONLY with the matching engine (the default build never sees it);
+# `harness = false` for the same reason as above.
+[[bench]]
+name = "realistic_overhead"
+harness = false
+required-features = ["orderbook"]
