@@ -35,11 +35,10 @@ use std::path::PathBuf;
 use chrono::DateTime;
 use optionstratlib::ExpirationDate;
 use optionstratlib::simulation::ExitPolicy;
-use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use rust_decimal::Decimal;
 
-use super::errors::to_pyerr;
+use super::errors::{guard_boundary, to_pyerr};
 use crate::BacktestConfig as RustBacktestConfig;
 use crate::config::{FeeSchedule, LiquidityProfile, ResourceLimits, SlippageModel};
 use crate::data::DataSourceSpec;
@@ -152,8 +151,9 @@ impl PyBacktestConfig {
     ///
     /// # Errors
     ///
-    /// Raises `ValueError` if the underlying ticker violates its grammar, the
-    /// quantity is zero, or a vol/rate field is not a representable decimal.
+    /// Raises `ic.DataError` if the underlying ticker violates its grammar (an
+    /// upstream conversion check), and `ic.ConfigError` (⊂ `ValueError`) if the
+    /// quantity is zero or a vol/rate field is not a representable decimal.
     #[pyo3(signature = (
         underlying,
         underlying_price_cents,
@@ -197,29 +197,35 @@ impl PyBacktestConfig {
         open_fee_cents: u64,
         close_fee_cents: u64,
     ) -> PyResult<PyRefMut<'py, Self>> {
-        let underlying = Underlying::new(underlying).map_err(to_pyerr)?;
-        let quantity = Quantity::new(quantity).map_err(to_pyerr)?;
-        let spec = IronCondorSpec {
-            underlying,
-            underlying_price: PriceCents::new(underlying_price_cents),
-            short_call_strike: PriceCents::new(short_call_strike_cents),
-            short_put_strike: PriceCents::new(short_put_strike_cents),
-            long_call_strike: PriceCents::new(long_call_strike_cents),
-            long_put_strike: PriceCents::new(long_put_strike_cents),
-            expiration: ExpirationDate::DateTime(DateTime::from_timestamp_nanos(expiration_ns)),
-            implied_volatility: decimal_from_f64(implied_volatility, "implied_volatility")?,
-            risk_free_rate: decimal_from_f64(risk_free_rate, "risk_free_rate")?,
-            dividend_yield: decimal_from_f64(dividend_yield, "dividend_yield")?,
-            quantity,
-            premium_short_call: PriceCents::new(premium_short_call_cents),
-            premium_short_put: PriceCents::new(premium_short_put_cents),
-            premium_long_call: PriceCents::new(premium_long_call_cents),
-            premium_long_put: PriceCents::new(premium_long_put_cents),
-            open_fee: PriceCents::new(open_fee_cents),
-            close_fee: PriceCents::new(close_fee_cents),
-        };
-        slf.strategy = Some(StrategySpec::IronCondor(spec));
-        Ok(slf)
+        let py = slf.py();
+        guard_boundary(move || {
+            let underlying = Underlying::new(underlying).map_err(|e| to_pyerr(py, e))?;
+            let quantity = Quantity::new(quantity).map_err(|e| to_pyerr(py, e))?;
+            let spec = IronCondorSpec {
+                underlying,
+                underlying_price: PriceCents::new(underlying_price_cents),
+                short_call_strike: PriceCents::new(short_call_strike_cents),
+                short_put_strike: PriceCents::new(short_put_strike_cents),
+                long_call_strike: PriceCents::new(long_call_strike_cents),
+                long_put_strike: PriceCents::new(long_put_strike_cents),
+                expiration: ExpirationDate::DateTime(DateTime::from_timestamp_nanos(expiration_ns)),
+                implied_volatility: decimal_from_f64(implied_volatility, "implied_volatility")
+                    .map_err(|e| to_pyerr(py, e))?,
+                risk_free_rate: decimal_from_f64(risk_free_rate, "risk_free_rate")
+                    .map_err(|e| to_pyerr(py, e))?,
+                dividend_yield: decimal_from_f64(dividend_yield, "dividend_yield")
+                    .map_err(|e| to_pyerr(py, e))?,
+                quantity,
+                premium_short_call: PriceCents::new(premium_short_call_cents),
+                premium_short_put: PriceCents::new(premium_short_put_cents),
+                premium_long_call: PriceCents::new(premium_long_call_cents),
+                premium_long_put: PriceCents::new(premium_long_put_cents),
+                open_fee: PriceCents::new(open_fee_cents),
+                close_fee: PriceCents::new(close_fee_cents),
+            };
+            slf.strategy = Some(StrategySpec::IronCondor(spec));
+            Ok(slf)
+        })
     }
 
     /// Select naive execution (mid/spread) with an optional flat adverse
@@ -265,13 +271,18 @@ impl PyBacktestConfig {
     ///
     /// # Errors
     ///
-    /// Raises `ValueError` if `percent` is not a representable decimal.
+    /// Raises `ic.ConfigError` (⊂ `ValueError`) if `percent` is not a
+    /// representable decimal.
     fn exit_profit_percent<'py>(
         mut slf: PyRefMut<'py, Self>,
         percent: f64,
     ) -> PyResult<PyRefMut<'py, Self>> {
-        slf.exit = ExitPolicy::ProfitPercent(decimal_from_f64(percent, "profit percent")?);
-        Ok(slf)
+        let py = slf.py();
+        guard_boundary(move || {
+            let value = decimal_from_f64(percent, "profit percent").map_err(|e| to_pyerr(py, e))?;
+            slf.exit = ExitPolicy::ProfitPercent(value);
+            Ok(slf)
+        })
     }
 
     /// Exit when loss reaches `percent` of the initial premium
@@ -279,13 +290,18 @@ impl PyBacktestConfig {
     ///
     /// # Errors
     ///
-    /// Raises `ValueError` if `percent` is not a representable decimal.
+    /// Raises `ic.ConfigError` (⊂ `ValueError`) if `percent` is not a
+    /// representable decimal.
     fn exit_loss_percent<'py>(
         mut slf: PyRefMut<'py, Self>,
         percent: f64,
     ) -> PyResult<PyRefMut<'py, Self>> {
-        slf.exit = ExitPolicy::LossPercent(decimal_from_f64(percent, "loss percent")?);
-        Ok(slf)
+        let py = slf.py();
+        guard_boundary(move || {
+            let value = decimal_from_f64(percent, "loss percent").map_err(|e| to_pyerr(py, e))?;
+            slf.exit = ExitPolicy::LossPercent(value);
+            Ok(slf)
+        })
     }
 
     /// Exit after `steps` time steps (`optionstratlib::ExitPolicy::TimeSteps`).
@@ -376,13 +392,18 @@ impl PyBacktestConfig {
 /// Convert an analytic `f64` (vol / rate / percent) to `Decimal` at the
 /// boundary — the documented exception to integer-cents money.
 ///
+/// Returns a [`BacktestError::Config`] (mapped to `ic.ConfigError` ⊂
+/// `ValueError` by [`to_pyerr`]) so a bad analytic field flows through the
+/// single error seam like every other input error, instead of a bare
+/// `ValueError` that `except ic.IronCondorError` would miss.
+///
 /// # Errors
 ///
-/// Raises `ValueError` if `value` is `NaN` / `±∞` or otherwise not a
-/// representable decimal.
-fn decimal_from_f64(value: f64, field: &str) -> PyResult<Decimal> {
+/// Returns [`BacktestError::Config`] if `value` is `NaN` / `±∞` or otherwise
+/// not a representable decimal.
+fn decimal_from_f64(value: f64, field: &str) -> Result<Decimal, BacktestError> {
     Decimal::try_from(value).map_err(|_| {
-        PyValueError::new_err(format!("{field} {value} is not a representable decimal"))
+        BacktestError::Config(format!("{field} {value} is not a representable decimal"))
     })
 }
 
