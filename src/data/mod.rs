@@ -19,7 +19,7 @@ pub mod simulator;
 pub use convert::chain_response_to_snapshot;
 pub use convert::{RawQuote, SnapshotMeta, raw_quotes_to_snapshot, snapshot_to_option_chain};
 pub use feed::{DataFeed, FeedKind, TapeMeta, feed_catalogue};
-pub use historical::ParquetFeed;
+pub use historical::{CsvFeed, ParquetFeed};
 
 use serde::{Deserialize, Serialize};
 

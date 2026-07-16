@@ -1,4 +1,5 @@
-//! The historical **Parquet** feed — the v0.1 release feed.
+//! The historical **file feeds** — [`ParquetFeed`] (the v0.1 release feed) and
+//! [`CsvFeed`] (the v0.2 breadth feed).
 //!
 //! [`ParquetFeed`] reads one columnar file (one row per quote across every
 //! step), groups the rows into [`ChainSnapshot`]s by ascending `step`, and
@@ -42,10 +43,61 @@
 //! map to [`BacktestError::TapeTooLarge`]. The split keeps the error message
 //! honest ("your file is corrupt" vs "your data is semantically wrong") and
 //! is what the PyO3 boundary later maps to distinct Python exceptions.
+//!
+//! # The CSV feed (v0.2 breadth)
+//!
+//! [`CsvFeed`] reads a **directory of per-step chain files**, one full chain
+//! snapshot per file, replayed in **name-sorted order** — the byte-wise
+//! [`OsStr`](std::ffi::OsStr) order of the file names **is** the replay order,
+//! the single ordering source ([docs/03 §9](../../../docs/03-data-layer.md#9-determinism-in-the-feed)).
+//! Each file carries the **same integer-cents schema** as the Parquet feed
+//! ([docs/03 §4](../../../docs/03-data-layer.md#4-historical-csv-schema)): money
+//! columns are integer cents on disk, so a dollar-denominated float in a money
+//! column is rejected with [`BacktestError::Conversion`], never silently
+//! truncated. Every file funnels through the **one** conversion boundary
+//! ([`raw_quotes_to_snapshot`]) — there is no second validation path.
+//!
+//! ## Why a direct integer-cents parse, not `OptionChain::load_from_csv`
+//!
+//! [docs/03 §4](../../../docs/03-data-layer.md#4-historical-csv-schema) suggests
+//! deferring to `optionstratlib::chains::OptionChain::load_from_csv` "where it
+//! fits". It does **not** fit: that loader parses a positional, **dollar /
+//! `Decimal`-denominated** chain (`strike, call_bid, call_ask, put_bid, put_ask,
+//! iv, delta_call, delta_put, gamma, volume, open_interest`) into a single
+//! one-expiry `OptionChain`, carrying none of the per-step fields this schema
+//! needs — no `ts`, `tick_size`, `contract_multiplier`, `bid_size` / `ask_size`,
+//! per-row `expiration`, `style`, `theta` / `vega` — and its money is float
+//! dollars, exactly the shape [ADR-0003](../../../docs/adr/0003-money-as-integer-cents.md)
+//! forbids at this boundary. Deferring would mean an f64-dollar → cents
+//! round-trip *outside* `convert.rs`: a second conversion path. So the CSV feed
+//! parses the integer-cents schema **directly** (via the `csv` crate) into
+//! [`RawQuote`] / [`SnapshotMeta`] and goes through the single
+//! [`raw_quotes_to_snapshot`] boundary — `f64` dies in exactly one place.
+//!
+//! ## Directory data identity (the re-read verifier)
+//!
+//! The tape's `sha256` is a **deterministic directory hash**: one [`Sha256`] is
+//! folded, in name-sorted order, over each file's name, a NUL separator, and
+//! that file's own streaming content `sha256` (hex). Any change to a file's
+//! bytes, name, count, or ordering changes the digest, so
+//! [`DataSourceSpec::Csv`]'s `sha256` verifies the re-read bytes; a mismatch
+//! fails the re-run with a typed error ([`CsvFeed::open_verified`]), never a
+//! silent divergent run.
+//!
+//! ## Ceilings
+//!
+//! The same [`ResourceLimits`] contract the Parquet feed enforces:
+//! `max_file_bytes` per file (filesystem metadata, before any read),
+//! `max_decompressed_bytes` as the cumulative raw input across the directory
+//! (CSV is uncompressed, so raw == decompressed), and `max_steps` /
+//! `max_contracts_per_snapshot` / `max_total_bytes` during materialisation —
+//! the first crossed ceiling aborts with [`BacktestError::TapeTooLarge`] before
+//! any unbounded read or allocation.
 
+use std::ffi::OsString;
 use std::fs::File;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use arrow::array::{Array, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Schema};
@@ -295,6 +347,524 @@ impl DataFeed for ParquetFeed {
 }
 
 // ---------------------------------------------------------------------------
+// The historical CSV feed (v0.2 breadth)
+// ---------------------------------------------------------------------------
+
+/// The historical CSV [`DataFeed`] — a materialised, validated, immutable tape
+/// over a **directory of per-step chain files** replayed in name-sorted order.
+///
+/// Construct with [`CsvFeed::open`] (or [`CsvFeed::open_verified`] to also check
+/// the directory hash against a recorded identity); all I/O happens there.
+/// [`DataFeed::next`] is a pure in-memory read that never blocks or `.await`s.
+#[derive(Debug)]
+#[must_use = "a CsvFeed does nothing unless its snapshots are consumed via DataFeed::next"]
+pub struct CsvFeed {
+    /// The validated, strictly `ts`-ordered snapshots (the replay tape).
+    tape: Vec<ChainSnapshot>,
+    /// The next index [`DataFeed::next`] yields.
+    cursor: usize,
+    /// The pinned tape metadata (identity, non-empty, first ts, final step).
+    meta: TapeMeta,
+    /// The source directory path, recorded verbatim in the manifest provenance.
+    path: String,
+    /// The directory `sha256` (hex) — the tape's data identity.
+    sha256: String,
+}
+
+impl CsvFeed {
+    /// Open a directory of per-step CSV chain files, materialising and
+    /// validating the whole tape.
+    ///
+    /// The directory's regular files are collected and **sorted by file name**
+    /// in byte-wise [`OsStr`](std::ffi::OsStr) order — that sort **is** the
+    /// replay order ([docs/03 §9](../../../docs/03-data-layer.md#9-determinism-in-the-feed)).
+    /// A non-file entry (a sub-directory or a symlink, which could escape the
+    /// tree) is rejected. Each file is parsed as one full chain snapshot through
+    /// the single conversion boundary ([`raw_quotes_to_snapshot`]).
+    ///
+    /// Enforces: `max_steps` (directory file count, while collecting, and again
+    /// during materialisation), `max_file_bytes` (filesystem metadata, before
+    /// any read), `max_decompressed_bytes` (cumulative raw input; CSV is
+    /// uncompressed), `max_contracts_per_snapshot` (during row accumulation),
+    /// and `max_total_bytes` (during materialisation). The tape is finally
+    /// checked non-empty and strictly `ts`-increasing via [`TapeMeta::from_tape`].
+    ///
+    /// The tape's `data_identity` (and the `sha256` in [`DataFeed::meta`]) is a
+    /// deterministic directory hash: one [`Sha256`] folded, in name-sorted
+    /// order, over each file's name, a NUL separator, and that file's own
+    /// content `sha256` (hex).
+    ///
+    /// # Errors
+    ///
+    /// - [`BacktestError::DataIo`] — the directory or a file cannot be stat-ed,
+    ///   opened, or read.
+    /// - [`BacktestError::Conversion`] — the path is not a directory, a non-file
+    ///   entry is present, a required column or value is missing, a money column
+    ///   carries a dollar float, a zero tick / multiplier, a non-positive
+    ///   strike, a NaN / infinite analytic, or an empty tape.
+    /// - [`BacktestError::Data`] — a file is not decodable as CSV (bad UTF-8 or
+    ///   an inconsistent record shape).
+    /// - [`BacktestError::PriceNotTickAligned`] / [`BacktestError::CrossedQuote`]
+    ///   / [`BacktestError::InvalidQuantity`] / [`BacktestError::ArithmeticOverflow`]
+    ///   — raised by the conversion core on a bad quote.
+    /// - [`BacktestError::TapeTooLarge`] — a `max_file_bytes` /
+    ///   `max_decompressed_bytes` / `max_steps` / `max_contracts_per_snapshot`
+    ///   / `max_total_bytes` ceiling is crossed (`limit` names the field).
+    /// - [`BacktestError::DataOutOfOrder`] — a duplicate or reversed `ts` across
+    ///   files.
+    pub fn open(path: impl AsRef<Path>, limits: &ResourceLimits) -> Result<Self, BacktestError> {
+        let dir_ref = path.as_ref();
+        let path_str = dir_ref.to_string_lossy().into_owned();
+
+        // (1) The path must be a directory of per-step files.
+        let dir_meta = std::fs::metadata(dir_ref)?;
+        if !dir_meta.is_dir() {
+            return Err(BacktestError::Conversion(format!(
+                "csv feed path is not a directory: {path_str}"
+            )));
+        }
+
+        // (2) Collect the directory's regular files, rejecting any non-file
+        //     entry (a sub-directory or a symlink — the latter could escape the
+        //     tree). Bounded by `max_steps` while collecting, so a directory
+        //     with more files than the tape ceiling never builds an unbounded
+        //     Vec of paths.
+        let mut files: Vec<(OsString, PathBuf)> = Vec::new();
+        for entry in std::fs::read_dir(dir_ref)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            if !file_type.is_file() {
+                return Err(BacktestError::Conversion(format!(
+                    "csv feed directory contains a non-file entry {:?}; every entry must be a \
+                     regular per-step chain file",
+                    entry.file_name()
+                )));
+            }
+            files.push((entry.file_name(), entry.path()));
+            let count =
+                u64::try_from(files.len()).map_err(|_| BacktestError::ArithmeticOverflow)?;
+            if count > limits.max_steps {
+                return Err(BacktestError::TapeTooLarge {
+                    limit: "max_steps",
+                    value: count,
+                    cap: limits.max_steps,
+                });
+            }
+        }
+
+        // (3) Name-sort — the byte-wise OsStr order IS the replay order.
+        files.sort_by(|a, b| a.0.cmp(&b.0));
+
+        // (4) Materialise the tape, one snapshot per file, in name-sorted order.
+        let mut tape: Vec<ChainSnapshot> = Vec::new();
+        let mut anchor_ts: Option<SimTime> = None;
+        let mut total_bytes: u64 = 0;
+        let mut decoded_bytes: u64 = 0;
+        let mut dir_hasher = Sha256::new();
+
+        for (index, (name, file_path)) in files.iter().enumerate() {
+            let step = StepIndex::new(
+                u32::try_from(index).map_err(|_| BacktestError::ArithmeticOverflow)?,
+            );
+
+            // (4a) Per-file size ceiling, from filesystem metadata, before any
+            //      read.
+            let file_len = std::fs::metadata(file_path)?.len();
+            if file_len > limits.max_file_bytes {
+                return Err(BacktestError::TapeTooLarge {
+                    limit: "max_file_bytes",
+                    value: file_len,
+                    cap: limits.max_file_bytes,
+                });
+            }
+
+            // (4b) Cumulative raw-input ceiling (CSV is uncompressed, so the raw
+            //      bytes ARE the decompressed bytes).
+            decoded_bytes = decoded_bytes
+                .checked_add(file_len)
+                .ok_or(BacktestError::ArithmeticOverflow)?;
+            if decoded_bytes > limits.max_decompressed_bytes {
+                return Err(BacktestError::TapeTooLarge {
+                    limit: "max_decompressed_bytes",
+                    value: decoded_bytes,
+                    cap: limits.max_decompressed_bytes,
+                });
+            }
+
+            // (4c) Fold this file's identity into the directory hash, in
+            //      name-sorted order: name, NUL, then the file's own content
+            //      sha256 (streaming, bounded by the size ceiling above).
+            let file_hex = file_sha256(file_path)?;
+            dir_hasher.update(name.as_encoded_bytes());
+            dir_hasher.update([0u8]);
+            dir_hasher.update(file_hex.as_bytes());
+
+            // (4d) Parse the file into one snapshot's raw quotes + snapshot-level
+            //      meta, then convert once through the single boundary.
+            let parsed = parse_csv_snapshot(file_path, step, limits)?;
+            // The first file (first in replay order) sets ts_0 for the tape.
+            let anchor = match anchor_ts {
+                Some(existing) => existing,
+                None => {
+                    anchor_ts = Some(parsed.ts);
+                    parsed.ts
+                }
+            };
+            let meta = SnapshotMeta {
+                ts: parsed.ts,
+                step,
+                anchor_ts: anchor,
+                underlying: parsed.underlying,
+                underlying_price: parsed.underlying_price,
+                tick_size_cents: parsed.tick_size_cents,
+                contract_multiplier: parsed.contract_multiplier,
+            };
+            let snapshot = raw_quotes_to_snapshot(&meta, &parsed.quotes)?;
+            push_checked(&mut tape, snapshot, &mut total_bytes, limits)?;
+        }
+
+        // (5) Pin the directory identity, then check non-empty + strictly
+        //     increasing `ts` via the shared tape core (an empty directory is
+        //     an empty tape, rejected here).
+        let sha256 = to_hex(&dir_hasher.finalize());
+        let meta = TapeMeta::from_tape(sha256.clone(), &tape)?;
+
+        Ok(Self {
+            tape,
+            cursor: 0,
+            meta,
+            path: path_str,
+            sha256,
+        })
+    }
+
+    /// Open a CSV directory and verify it hashes to `expected_sha256` — the
+    /// re-read verifier for a recorded [`DataSourceSpec::Csv`] identity.
+    ///
+    /// An empty `expected_sha256` (a not-yet-pinned config value) skips the
+    /// check and simply pins the computed hash. A non-empty value that does not
+    /// match the recomputed directory hash fails with
+    /// [`BacktestError::Conversion`] — a re-read divergence is never a silent
+    /// divergent run.
+    ///
+    /// # Errors
+    ///
+    /// Every error [`Self::open`] can raise, plus [`BacktestError::Conversion`]
+    /// when `expected_sha256` is non-empty and does not equal the recomputed
+    /// directory hash.
+    pub fn open_verified(
+        path: impl AsRef<Path>,
+        expected_sha256: &str,
+        limits: &ResourceLimits,
+    ) -> Result<Self, BacktestError> {
+        let feed = Self::open(path, limits)?;
+        if !expected_sha256.is_empty() && feed.sha256 != expected_sha256 {
+            return Err(BacktestError::Conversion(format!(
+                "csv directory sha256 mismatch: recorded {expected_sha256}, recomputed {}",
+                feed.sha256
+            )));
+        }
+        Ok(feed)
+    }
+}
+
+impl DataFeed for CsvFeed {
+    fn next(&mut self) -> Result<Option<ChainSnapshot>, BacktestError> {
+        match self.tape.get(self.cursor) {
+            Some(snapshot) => {
+                // `get` matched, so `cursor < tape.len() <= isize::MAX` — the
+                // increment cannot overflow; plain `+= 1` keeps the codebase's
+                // no-saturating/wrapping convention.
+                self.cursor += 1;
+                Ok(Some(snapshot.clone()))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn meta(&self) -> DataSourceSpec {
+        DataSourceSpec::Csv {
+            path: self.path.clone(),
+            sha256: self.sha256.clone(),
+        }
+    }
+
+    fn tape_meta(&self) -> &TapeMeta {
+        &self.meta
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CSV parsing (one file → one snapshot's raw quotes, bounded and no-panic)
+// ---------------------------------------------------------------------------
+
+/// One CSV file's parsed content: the snapshot-level fields (constant across the
+/// file's rows) plus the per-contract raw quotes, ready for the single
+/// conversion core.
+struct ParsedCsvSnapshot {
+    ts: SimTime,
+    underlying: Underlying,
+    underlying_price: PriceCents,
+    tick_size_cents: PriceCents,
+    contract_multiplier: u32,
+    quotes: Vec<RawQuote>,
+}
+
+/// The header-derived column indices for the CSV schema
+/// ([docs/03 §4](../../../docs/03-data-layer.md#4-historical-csv-schema)). The
+/// four Greek columns are optional; every other column is required. Unknown
+/// extra columns are tolerated and ignored.
+struct CsvColumns {
+    ts: usize,
+    underlying: usize,
+    underlying_price: usize,
+    tick_size: usize,
+    contract_multiplier: usize,
+    expiration: usize,
+    strike: usize,
+    style: usize,
+    bid: usize,
+    ask: usize,
+    bid_size: usize,
+    ask_size: usize,
+    implied_volatility: usize,
+    delta: Option<usize>,
+    gamma: Option<usize>,
+    theta: Option<usize>,
+    vega: Option<usize>,
+}
+
+impl CsvColumns {
+    /// Resolve the required and optional columns from the header record,
+    /// rejecting a missing required column with [`BacktestError::Conversion`].
+    fn from_header(header: &csv::StringRecord) -> Result<Self, BacktestError> {
+        let find = |name: &str| header.iter().position(|h| h == name);
+        let req = |name: &str| {
+            find(name).ok_or_else(|| {
+                BacktestError::Conversion(format!("csv header is missing required column {name}"))
+            })
+        };
+        Ok(Self {
+            ts: req("ts")?,
+            underlying: req("underlying")?,
+            underlying_price: req("underlying_price")?,
+            tick_size: req("tick_size")?,
+            contract_multiplier: req("contract_multiplier")?,
+            expiration: req("expiration")?,
+            strike: req("strike")?,
+            style: req("style")?,
+            bid: req("bid")?,
+            ask: req("ask")?,
+            bid_size: req("bid_size")?,
+            ask_size: req("ask_size")?,
+            implied_volatility: req("implied_volatility")?,
+            delta: find("delta"),
+            gamma: find("gamma"),
+            theta: find("theta"),
+            vega: find("vega"),
+        })
+    }
+}
+
+/// Parse one CSV chain file into a [`ParsedCsvSnapshot`], enforcing a bounded
+/// read (`max_file_bytes`) and `max_contracts_per_snapshot`.
+///
+/// The read is bounded by `max_file_bytes` even under a race that grows the file
+/// after its metadata was checked ([`std::io::Read::take`]); a truncation then
+/// surfaces as a typed CSV decode error, never an unbounded read.
+fn parse_csv_snapshot(
+    path: &Path,
+    step: StepIndex,
+    limits: &ResourceLimits,
+) -> Result<ParsedCsvSnapshot, BacktestError> {
+    let file = File::open(path)?;
+    let mut reader = csv::ReaderBuilder::new()
+        .has_headers(true)
+        .flexible(false)
+        .trim(csv::Trim::All)
+        .from_reader(file.take(limits.max_file_bytes));
+
+    let cols = CsvColumns::from_header(
+        reader
+            .headers()
+            .map_err(|e| csv_decode_err("csv header", &e))?,
+    )?;
+
+    let cap = u64::from(limits.max_contracts_per_snapshot);
+    let mut record = csv::StringRecord::new();
+    // The snapshot-level fields, captured from the first row and required
+    // constant across the file's rows.
+    let mut header_fields: Option<(SimTime, Underlying, PriceCents, PriceCents, u32)> = None;
+    let mut quotes: Vec<RawQuote> = Vec::new();
+
+    while reader
+        .read_record(&mut record)
+        .map_err(|e| csv_decode_err("csv record", &e))?
+    {
+        let ts = SimTime::new(parse_i64(req_cell(&record, cols.ts, "ts")?, "ts")?);
+        let underlying = Underlying::new(req_cell(&record, cols.underlying, "underlying")?)?;
+        let underlying_price = parse_cents(
+            req_cell(&record, cols.underlying_price, "underlying_price")?,
+            "underlying_price",
+        )?;
+        let tick = parse_cents(req_cell(&record, cols.tick_size, "tick_size")?, "tick_size")?;
+        let multiplier = parse_u32(
+            req_cell(&record, cols.contract_multiplier, "contract_multiplier")?,
+            "contract_multiplier",
+        )?;
+        if let Some((ts0, u0, up0, t0, m0)) = &header_fields {
+            ensure_const("ts", step.value(), ts.value(), ts0.value())?;
+            ensure_const("underlying", step.value(), underlying.as_str(), u0.as_str())?;
+            ensure_const(
+                "underlying_price",
+                step.value(),
+                underlying_price.value(),
+                up0.value(),
+            )?;
+            ensure_const("tick_size", step.value(), tick.value(), t0.value())?;
+            ensure_const("contract_multiplier", step.value(), multiplier, *m0)?;
+        } else {
+            header_fields = Some((ts, underlying.clone(), underlying_price, tick, multiplier));
+        }
+
+        // Contracts-per-snapshot ceiling, BEFORE the quote is built or pushed.
+        let next_count = u64::try_from(quotes.len())
+            .map_err(|_| BacktestError::ArithmeticOverflow)?
+            .checked_add(1)
+            .ok_or(BacktestError::ArithmeticOverflow)?;
+        if next_count > cap {
+            return Err(BacktestError::TapeTooLarge {
+                limit: "max_contracts_per_snapshot",
+                value: next_count,
+                cap,
+            });
+        }
+
+        // Disk expiries are absolute i64 ns → a DateTime pass-through in the
+        // conversion core (relative anchoring is a no-op here).
+        let expiration_ns = parse_i64(
+            req_cell(&record, cols.expiration, "expiration")?,
+            "expiration",
+        )?;
+        let quote = RawQuote {
+            expiration: ExpirationDate::DateTime(DateTime::from_timestamp_nanos(expiration_ns)),
+            strike: parse_cents(req_cell(&record, cols.strike, "strike")?, "strike")?,
+            style: parse_style(req_cell(&record, cols.style, "style")?)?,
+            bid: parse_cents(req_cell(&record, cols.bid, "bid")?, "bid")?,
+            ask: parse_cents(req_cell(&record, cols.ask, "ask")?, "ask")?,
+            bid_size: Quantity::new(parse_u32(
+                req_cell(&record, cols.bid_size, "bid_size")?,
+                "bid_size",
+            )?)?,
+            ask_size: Quantity::new(parse_u32(
+                req_cell(&record, cols.ask_size, "ask_size")?,
+                "ask_size",
+            )?)?,
+            implied_volatility: parse_f64(
+                req_cell(&record, cols.implied_volatility, "implied_volatility")?,
+                "implied_volatility",
+            )?,
+            delta: opt_greek(&record, cols.delta, "delta")?,
+            gamma: opt_greek(&record, cols.gamma, "gamma")?,
+            theta: opt_greek(&record, cols.theta, "theta")?,
+            vega: opt_greek(&record, cols.vega, "vega")?,
+        };
+        quotes.push(quote);
+    }
+
+    let (ts, underlying, underlying_price, tick_size_cents, contract_multiplier) = header_fields
+        .ok_or_else(|| {
+            BacktestError::Conversion(format!(
+                "csv file {} has no data rows; every file is one chain snapshot",
+                path.display()
+            ))
+        })?;
+    Ok(ParsedCsvSnapshot {
+        ts,
+        underlying,
+        underlying_price,
+        tick_size_cents,
+        contract_multiplier,
+        quotes,
+    })
+}
+
+/// Read one required cell by column index; a short row (a missing cell) is a
+/// typed [`BacktestError::Conversion`], never an unchecked index.
+fn req_cell<'r>(
+    record: &'r csv::StringRecord,
+    index: usize,
+    column: &str,
+) -> Result<&'r str, BacktestError> {
+    record.get(index).ok_or_else(|| {
+        BacktestError::Conversion(format!("csv row is missing a value for column {column}"))
+    })
+}
+
+/// Read an optional Greek cell: an absent column or an empty cell is the
+/// documented `0` placeholder; otherwise the value is parsed as an analytic
+/// (the NaN / infinite check happens once in the conversion core).
+fn opt_greek(
+    record: &csv::StringRecord,
+    index: Option<usize>,
+    column: &str,
+) -> Result<f64, BacktestError> {
+    match index.and_then(|i| record.get(i)) {
+        None | Some("") => Ok(0.0),
+        Some(cell) => parse_f64(cell, column),
+    }
+}
+
+/// Parse a required `i64` cell (`ts` / `expiration`).
+fn parse_i64(cell: &str, column: &str) -> Result<i64, BacktestError> {
+    cell.parse::<i64>().map_err(|_| {
+        BacktestError::Conversion(format!("column {column} value {cell:?} is not a valid i64"))
+    })
+}
+
+/// Parse a required `u32` count cell (`contract_multiplier` / `bid_size` /
+/// `ask_size`).
+fn parse_u32(cell: &str, column: &str) -> Result<u32, BacktestError> {
+    cell.parse::<u32>().map_err(|_| {
+        BacktestError::Conversion(format!(
+            "column {column} value {cell:?} is not a valid non-negative count"
+        ))
+    })
+}
+
+/// Parse a required integer-cents money cell into [`PriceCents`]. Money is a
+/// non-negative **integer** on disk, so a dollar-denominated float (a `.` in the
+/// cell) or a negative value fails with [`BacktestError::Conversion`] — never a
+/// silent truncation.
+fn parse_cents(cell: &str, column: &str) -> Result<PriceCents, BacktestError> {
+    let cents = cell.parse::<u64>().map_err(|_| {
+        BacktestError::Conversion(format!(
+            "column {column} value {cell:?} is not integer cents; money is a non-negative integer \
+             cent value (dollar floats are rejected)"
+        ))
+    })?;
+    Ok(PriceCents::new(cents))
+}
+
+/// Parse a required analytic cell (`implied_volatility`, or a present Greek) as
+/// `f64`. The NaN / infinite rejection is deferred to the conversion core, the
+/// single place a non-finite analytic dies.
+fn parse_f64(cell: &str, column: &str) -> Result<f64, BacktestError> {
+    cell.parse::<f64>().map_err(|_| {
+        BacktestError::Conversion(format!(
+            "column {column} value {cell:?} is not a valid number"
+        ))
+    })
+}
+
+/// Map a `csv` decode error (bad UTF-8 or an inconsistent record shape) into a
+/// typed [`BacktestError::Data`] — the undecodable-bytes kind, distinct from a
+/// semantic [`BacktestError::Conversion`] on data that decoded cleanly.
+fn csv_decode_err<E: std::fmt::Display>(context: &str, error: &E) -> BacktestError {
+    BacktestError::Data(format!("{context}: {error}"))
+}
+
+// ---------------------------------------------------------------------------
 // Snapshot grouping
 // ---------------------------------------------------------------------------
 
@@ -442,8 +1012,8 @@ impl GroupBuilder {
     }
 }
 
-/// Finalise a group, thread the tape anchor `ts_0`, enforce `max_steps` and
-/// `max_total_bytes`, and push the resulting snapshot.
+/// Finalise a group, thread the tape anchor `ts_0`, and push the resulting
+/// snapshot under the shared `max_steps` / `max_total_bytes` ceilings.
 fn push_snapshot(
     tape: &mut Vec<ChainSnapshot>,
     group: GroupBuilder,
@@ -460,7 +1030,18 @@ fn push_snapshot(
         }
     };
     let snapshot = group.finish(anchor)?;
+    push_checked(tape, snapshot, total_bytes, limits)
+}
 
+/// Enforce `max_steps` and `max_total_bytes` for one finished snapshot, then
+/// push it onto the tape. Shared by both file feeds so the ceiling accounting
+/// is byte-for-byte identical regardless of the on-disk format.
+fn push_checked(
+    tape: &mut Vec<ChainSnapshot>,
+    snapshot: ChainSnapshot,
+    total_bytes: &mut u64,
+    limits: &ResourceLimits,
+) -> Result<(), BacktestError> {
     let next_len = u64::try_from(tape.len())
         .map_err(|_| BacktestError::ArithmeticOverflow)?
         .checked_add(1)
@@ -764,10 +1345,12 @@ fn parse_style(style: &str) -> Result<OptionStyle, BacktestError> {
     }
 }
 
-/// Reject a snapshot-level field that varies within a step group.
-fn ensure_const<T: PartialEq + std::fmt::Display>(
+/// Reject a snapshot-level field that varies within a step group. The `step`
+/// is used only in the message, so it is generic over its display type (the
+/// Parquet feed passes an `i32`, the CSV feed a `u32`).
+fn ensure_const<S: std::fmt::Display, T: PartialEq + std::fmt::Display>(
     field: &str,
-    step: i32,
+    step: S,
     got: T,
     want: T,
 ) -> Result<(), BacktestError> {
@@ -1329,6 +1912,510 @@ mod tests {
         };
         let Ok(mut feed) = ParquetFeed::open(&path, &ResourceLimits::default()) else {
             panic!("null Greeks must be accepted as the 0 placeholder");
+        };
+        match feed.next() {
+            Ok(Some(snap)) => match snap.quotes.values().next() {
+                Some(view) => assert!(view.theta.is_zero()),
+                None => panic!("one quote must be present"),
+            },
+            other => panic!("expected one snapshot, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod csv_tests {
+    use std::path::PathBuf;
+
+    use tempfile::TempDir;
+
+    use super::CsvFeed;
+    use crate::config::ResourceLimits;
+    use crate::data::DataSourceSpec;
+    use crate::data::feed::DataFeed;
+    use crate::error::BacktestError;
+
+    const HEADER: &str = "ts,underlying,underlying_price,tick_size,contract_multiplier,\
+        expiration,strike,style,bid,ask,bid_size,ask_size,implied_volatility,delta,gamma,theta,vega";
+    const TS0: i64 = 1_750_291_200_000_000_000;
+    const NANOS_PER_DAY: i64 = 86_400_000_000_000;
+    const EXPIRY: i64 = TS0 + 30 * NANOS_PER_DAY;
+
+    /// One canonical quote row (SPX / 5c tick / 100x / absolute 30-day expiry).
+    fn row(ts: i64, strike: i64, style: &str, bid: i64, ask: i64) -> String {
+        format!(
+            "{ts},SPX,500000,5,100,{EXPIRY},{strike},{style},{bid},{ask},50,50,0.2,0.3,0.01,-0.05,0.1"
+        )
+    }
+
+    /// A well-formed four-contract condor slice (two strikes × call/put) at `ts`.
+    fn condor_file(ts: i64) -> String {
+        let mut out = String::from(HEADER);
+        for line in [
+            row(ts, 500_000, "call", 200, 210),
+            row(ts, 500_000, "put", 180, 190),
+            row(ts, 520_000, "call", 90, 100),
+            row(ts, 520_000, "put", 140, 150),
+        ] {
+            out.push('\n');
+            out.push_str(&line);
+        }
+        out
+    }
+
+    /// Write `(name, content)` files into a fresh tempdir; return dir + its path.
+    fn write_dir(files: &[(&str, String)]) -> Result<(TempDir, PathBuf), BacktestError> {
+        let dir = tempfile::tempdir()?;
+        for (name, content) in files {
+            std::fs::write(dir.path().join(name), content)?;
+        }
+        let path = dir.path().to_path_buf();
+        Ok((dir, path))
+    }
+
+    /// A single-file directory carrying `content` as `step_000.csv`.
+    fn single(content: String) -> Result<(TempDir, PathBuf), BacktestError> {
+        write_dir(&[("step_000.csv", content)])
+    }
+
+    /// One header + one canonical row file (valid base for a perturbation).
+    fn one_row(strike: i64, style: &str, bid: i64, ask: i64) -> String {
+        format!("{HEADER}\n{}", row(TS0, strike, style, bid, ask))
+    }
+
+    #[test]
+    fn test_csv_open_reads_name_sorted_tape_and_yields_to_exhaustion() {
+        // Files WRITTEN out of name order; the name sort (not fs order) is the
+        // replay order, and the ascending ts must follow that name order.
+        let Ok((_dir, path)) = write_dir(&[
+            ("step_002.csv", condor_file(TS0 + 2 * NANOS_PER_DAY)),
+            ("step_000.csv", condor_file(TS0)),
+            ("step_001.csv", condor_file(TS0 + NANOS_PER_DAY)),
+        ]) else {
+            panic!("the canonical fixture must write");
+        };
+        let Ok(mut feed) = CsvFeed::open(&path, &ResourceLimits::default()) else {
+            panic!("the canonical fixture must open");
+        };
+        let meta = feed.tape_meta();
+        assert!(meta.non_empty);
+        assert_eq!(meta.first_ts.value(), TS0);
+        assert_eq!(meta.final_step.value(), 2);
+        assert_eq!(meta.data_identity.len(), 64, "sha256 hex is 64 chars");
+
+        for (expected_step, expected_ts) in [
+            (0u32, TS0),
+            (1, TS0 + NANOS_PER_DAY),
+            (2, TS0 + 2 * NANOS_PER_DAY),
+        ] {
+            match feed.next() {
+                Ok(Some(snap)) => {
+                    assert_eq!(snap.step.value(), expected_step);
+                    assert_eq!(snap.ts.value(), expected_ts);
+                    assert_eq!(snap.quotes.len(), 4);
+                }
+                other => panic!("expected snapshot at step {expected_step}, got {other:?}"),
+            }
+        }
+        assert!(matches!(feed.next(), Ok(None)));
+        assert!(matches!(feed.next(), Ok(None)));
+    }
+
+    #[test]
+    fn test_csv_open_rejects_dollar_float_money_conversion() {
+        // A bid written as dollars (`19.95`) is not integer cents.
+        let content = format!(
+            "{HEADER}\n{TS0},SPX,500000,5,100,{EXPIRY},510000,call,19.95,20.05,50,50,0.2,0.3,0.01,-0.05,0.1"
+        );
+        let Ok((_dir, path)) = single(content) else {
+            panic!("fixture must write");
+        };
+        assert!(matches!(
+            CsvFeed::open(&path, &ResourceLimits::default()),
+            Err(BacktestError::Conversion(_))
+        ));
+    }
+
+    #[test]
+    fn test_csv_open_rejects_missing_required_column_conversion() {
+        // Header without `tick_size`.
+        let header = "ts,underlying,underlying_price,contract_multiplier,expiration,strike,style,\
+            bid,ask,bid_size,ask_size,implied_volatility";
+        let content =
+            format!("{header}\n{TS0},SPX,500000,100,{EXPIRY},510000,call,1995,2005,50,50,0.2");
+        let Ok((_dir, path)) = single(content) else {
+            panic!("fixture must write");
+        };
+        assert!(matches!(
+            CsvFeed::open(&path, &ResourceLimits::default()),
+            Err(BacktestError::Conversion(_))
+        ));
+    }
+
+    #[test]
+    fn test_csv_open_rejects_zero_tick_conversion() {
+        let content = format!(
+            "{HEADER}\n{TS0},SPX,500000,0,100,{EXPIRY},510000,call,1995,2005,50,50,0.2,0.3,0.01,-0.05,0.1"
+        );
+        let Ok((_dir, path)) = single(content) else {
+            panic!("fixture must write");
+        };
+        assert!(matches!(
+            CsvFeed::open(&path, &ResourceLimits::default()),
+            Err(BacktestError::Conversion(_))
+        ));
+    }
+
+    #[test]
+    fn test_csv_open_rejects_zero_multiplier_conversion() {
+        let content = format!(
+            "{HEADER}\n{TS0},SPX,500000,5,0,{EXPIRY},510000,call,1995,2005,50,50,0.2,0.3,0.01,-0.05,0.1"
+        );
+        let Ok((_dir, path)) = single(content) else {
+            panic!("fixture must write");
+        };
+        assert!(matches!(
+            CsvFeed::open(&path, &ResourceLimits::default()),
+            Err(BacktestError::Conversion(_))
+        ));
+    }
+
+    #[test]
+    fn test_csv_open_rejects_non_tick_aligned_price_price_not_tick_aligned() {
+        // ask 107 is not a multiple of the 5-cent tick.
+        let Ok((_dir, path)) = single(one_row(500_000, "call", 100, 107)) else {
+            panic!("fixture must write");
+        };
+        assert!(matches!(
+            CsvFeed::open(&path, &ResourceLimits::default()),
+            Err(BacktestError::PriceNotTickAligned {
+                price: 107,
+                tick: 5
+            })
+        ));
+    }
+
+    #[test]
+    fn test_csv_open_rejects_crossed_quote() {
+        // bid 2010 > ask 2000 (both tick-aligned) is crossed.
+        let Ok((_dir, path)) = single(one_row(510_000, "call", 2_010, 2_000)) else {
+            panic!("fixture must write");
+        };
+        assert!(matches!(
+            CsvFeed::open(&path, &ResourceLimits::default()),
+            Err(BacktestError::CrossedQuote {
+                bid: 2_010,
+                ask: 2_000
+            })
+        ));
+    }
+
+    #[test]
+    fn test_csv_open_rejects_negative_strike_conversion() {
+        // A negative strike fails the unsigned integer-cents parse.
+        let Ok((_dir, path)) = single(one_row(-510_000, "call", 1_995, 2_005)) else {
+            panic!("fixture must write");
+        };
+        assert!(matches!(
+            CsvFeed::open(&path, &ResourceLimits::default()),
+            Err(BacktestError::Conversion(_))
+        ));
+    }
+
+    #[test]
+    fn test_csv_open_rejects_zero_strike_conversion() {
+        let Ok((_dir, path)) = single(one_row(0, "call", 1_995, 2_005)) else {
+            panic!("fixture must write");
+        };
+        assert!(matches!(
+            CsvFeed::open(&path, &ResourceLimits::default()),
+            Err(BacktestError::Conversion(_))
+        ));
+    }
+
+    #[test]
+    fn test_csv_open_rejects_nan_analytic_conversion() {
+        // IV `nan` parses to a non-finite f64 the conversion core rejects.
+        let content = format!(
+            "{HEADER}\n{TS0},SPX,500000,5,100,{EXPIRY},510000,call,1995,2005,50,50,nan,0.3,0.01,-0.05,0.1"
+        );
+        let Ok((_dir, path)) = single(content) else {
+            panic!("fixture must write");
+        };
+        assert!(matches!(
+            CsvFeed::open(&path, &ResourceLimits::default()),
+            Err(BacktestError::Conversion(_))
+        ));
+    }
+
+    #[test]
+    fn test_csv_open_rejects_out_of_order_ts_data_out_of_order() {
+        // Name-sorted step_000 then step_001, but ts descending.
+        let Ok((_dir, path)) = write_dir(&[
+            ("step_000.csv", condor_file(TS0 + NANOS_PER_DAY)),
+            ("step_001.csv", condor_file(TS0)),
+        ]) else {
+            panic!("fixture must write");
+        };
+        assert!(matches!(
+            CsvFeed::open(&path, &ResourceLimits::default()),
+            Err(BacktestError::DataOutOfOrder {
+                step: 1,
+                ts,
+                prev
+            }) if ts == TS0 && prev == TS0 + NANOS_PER_DAY
+        ));
+    }
+
+    #[test]
+    fn test_csv_open_rejects_empty_directory_conversion() {
+        let Ok(dir) = tempfile::tempdir() else {
+            panic!("tempdir must create");
+        };
+        assert!(matches!(
+            CsvFeed::open(dir.path(), &ResourceLimits::default()),
+            Err(BacktestError::Conversion(_))
+        ));
+    }
+
+    #[test]
+    fn test_csv_open_rejects_file_with_no_data_rows_conversion() {
+        let Ok((_dir, path)) = single(HEADER.to_string()) else {
+            panic!("fixture must write");
+        };
+        assert!(matches!(
+            CsvFeed::open(&path, &ResourceLimits::default()),
+            Err(BacktestError::Conversion(_))
+        ));
+    }
+
+    #[test]
+    fn test_csv_open_rejects_non_directory_path_conversion() {
+        // Pointing the feed at a regular file (not a directory) is rejected.
+        let Ok((_dir, path)) = single(condor_file(TS0)) else {
+            panic!("fixture must write");
+        };
+        let file_path = path.join("step_000.csv");
+        assert!(matches!(
+            CsvFeed::open(&file_path, &ResourceLimits::default()),
+            Err(BacktestError::Conversion(_))
+        ));
+    }
+
+    #[test]
+    fn test_csv_open_rejects_non_file_entry_conversion() {
+        // A directory that contains a sub-directory is not a flat set of files.
+        let Ok(dir) = tempfile::tempdir() else {
+            panic!("tempdir must create");
+        };
+        if std::fs::create_dir(dir.path().join("nested")).is_err() {
+            panic!("nested dir must create");
+        }
+        assert!(matches!(
+            CsvFeed::open(dir.path(), &ResourceLimits::default()),
+            Err(BacktestError::Conversion(_))
+        ));
+    }
+
+    #[test]
+    fn test_csv_open_enforces_max_file_bytes_tape_too_large() {
+        let Ok((_dir, path)) = single(condor_file(TS0)) else {
+            panic!("fixture must write");
+        };
+        let limits = ResourceLimits {
+            max_file_bytes: 1,
+            ..ResourceLimits::default()
+        };
+        assert!(matches!(
+            CsvFeed::open(&path, &limits),
+            Err(BacktestError::TapeTooLarge {
+                limit: "max_file_bytes",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_csv_open_enforces_max_decompressed_bytes_tape_too_large() {
+        let Ok((_dir, path)) = single(condor_file(TS0)) else {
+            panic!("fixture must write");
+        };
+        let limits = ResourceLimits {
+            max_decompressed_bytes: 1,
+            ..ResourceLimits::default()
+        };
+        assert!(matches!(
+            CsvFeed::open(&path, &limits),
+            Err(BacktestError::TapeTooLarge {
+                limit: "max_decompressed_bytes",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_csv_open_enforces_max_steps_tape_too_large() {
+        let Ok((_dir, path)) = write_dir(&[
+            ("step_000.csv", condor_file(TS0)),
+            ("step_001.csv", condor_file(TS0 + NANOS_PER_DAY)),
+            ("step_002.csv", condor_file(TS0 + 2 * NANOS_PER_DAY)),
+        ]) else {
+            panic!("fixture must write");
+        };
+        let limits = ResourceLimits {
+            max_steps: 2,
+            ..ResourceLimits::default()
+        };
+        assert!(matches!(
+            CsvFeed::open(&path, &limits),
+            Err(BacktestError::TapeTooLarge {
+                limit: "max_steps",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_csv_open_enforces_max_contracts_per_snapshot_tape_too_large() {
+        // One file with four contracts, ceiling of two.
+        let Ok((_dir, path)) = single(condor_file(TS0)) else {
+            panic!("fixture must write");
+        };
+        let limits = ResourceLimits {
+            max_contracts_per_snapshot: 2,
+            ..ResourceLimits::default()
+        };
+        assert!(matches!(
+            CsvFeed::open(&path, &limits),
+            Err(BacktestError::TapeTooLarge {
+                limit: "max_contracts_per_snapshot",
+                value: 3,
+                cap: 2
+            })
+        ));
+    }
+
+    #[test]
+    fn test_csv_open_enforces_max_total_bytes_tape_too_large() {
+        let Ok((_dir, path)) = single(condor_file(TS0)) else {
+            panic!("fixture must write");
+        };
+        let limits = ResourceLimits {
+            max_total_bytes: 1,
+            ..ResourceLimits::default()
+        };
+        assert!(matches!(
+            CsvFeed::open(&path, &limits),
+            Err(BacktestError::TapeTooLarge {
+                limit: "max_total_bytes",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_csv_open_sha256_stable_across_two_opens() {
+        let Ok((_dir, path)) = single(condor_file(TS0)) else {
+            panic!("fixture must write");
+        };
+        let (Ok(a), Ok(b)) = (
+            CsvFeed::open(&path, &ResourceLimits::default()),
+            CsvFeed::open(&path, &ResourceLimits::default()),
+        ) else {
+            panic!("both opens of the same bytes must succeed");
+        };
+        assert_eq!(a.tape_meta().data_identity, b.tape_meta().data_identity);
+        assert_eq!(a.tape_meta().data_identity.len(), 64);
+        assert!(matches!(
+            (a.meta(), b.meta()),
+            (
+                DataSourceSpec::Csv { sha256: sa, .. },
+                DataSourceSpec::Csv { sha256: sb, .. }
+            ) if sa == sb && sa == a.tape_meta().data_identity
+        ));
+    }
+
+    #[test]
+    fn test_csv_open_sha256_changes_when_a_file_byte_changes() {
+        let Ok((_dir_a, path_a)) = single(condor_file(TS0)) else {
+            panic!("fixture must write");
+        };
+        // Same schema, one different bid → a different content hash.
+        let Ok((_dir_b, path_b)) = single(one_row(510_000, "call", 1_990, 2_005)) else {
+            panic!("fixture must write");
+        };
+        let (Ok(a), Ok(b)) = (
+            CsvFeed::open(&path_a, &ResourceLimits::default()),
+            CsvFeed::open(&path_b, &ResourceLimits::default()),
+        ) else {
+            panic!("both fixtures must open");
+        };
+        assert_ne!(a.tape_meta().data_identity, b.tape_meta().data_identity);
+    }
+
+    #[test]
+    fn test_csv_open_verified_accepts_match_and_rejects_mismatch() {
+        let Ok((_dir, path)) = single(condor_file(TS0)) else {
+            panic!("fixture must write");
+        };
+        let Ok(feed) = CsvFeed::open(&path, &ResourceLimits::default()) else {
+            panic!("fixture must open");
+        };
+        let sha = feed.tape_meta().data_identity.clone();
+        // Empty expected → skip (config not yet pinned).
+        assert!(CsvFeed::open_verified(&path, "", &ResourceLimits::default()).is_ok());
+        // Correct expected → verifies.
+        assert!(CsvFeed::open_verified(&path, &sha, &ResourceLimits::default()).is_ok());
+        // A recorded-but-wrong hash → typed re-read divergence error.
+        assert!(matches!(
+            CsvFeed::open_verified(
+                &path,
+                "0000000000000000000000000000000000000000000000000000000000000000",
+                &ResourceLimits::default()
+            ),
+            Err(BacktestError::Conversion(_))
+        ));
+    }
+
+    #[test]
+    fn test_csv_open_treats_absent_greek_columns_as_zero() {
+        // A header without the four Greek columns → each Greek is the 0
+        // placeholder; IV stays required and present.
+        let header = "ts,underlying,underlying_price,tick_size,contract_multiplier,expiration,\
+            strike,style,bid,ask,bid_size,ask_size,implied_volatility";
+        let content =
+            format!("{header}\n{TS0},SPX,500000,5,100,{EXPIRY},510000,call,1995,2005,50,50,0.2");
+        let Ok((_dir, path)) = single(content) else {
+            panic!("fixture must write");
+        };
+        let Ok(mut feed) = CsvFeed::open(&path, &ResourceLimits::default()) else {
+            panic!("absent Greek columns must be accepted as the 0 placeholder");
+        };
+        match feed.next() {
+            Ok(Some(snap)) => match snap.quotes.values().next() {
+                Some(view) => {
+                    assert!(view.delta.is_zero());
+                    assert!(view.gamma.is_zero());
+                    assert!(view.theta.is_zero());
+                    assert!(view.vega.is_zero());
+                }
+                None => panic!("one quote must be present"),
+            },
+            other => panic!("expected one snapshot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_csv_open_treats_empty_greek_cell_as_zero() {
+        // An empty theta cell (present column, blank value) → 0 placeholder.
+        let content = format!(
+            "{HEADER}\n{TS0},SPX,500000,5,100,{EXPIRY},510000,call,1995,2005,50,50,0.2,0.3,0.01,,0.1"
+        );
+        let Ok((_dir, path)) = single(content) else {
+            panic!("fixture must write");
+        };
+        let Ok(mut feed) = CsvFeed::open(&path, &ResourceLimits::default()) else {
+            panic!("an empty Greek cell must be the 0 placeholder");
         };
         match feed.next() {
             Ok(Some(snap)) => match snap.quotes.values().next() {

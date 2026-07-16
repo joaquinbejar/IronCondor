@@ -14,7 +14,8 @@ use proptest::prelude::*;
 use rust_decimal::Decimal;
 
 use ironcondor::{
-    BacktestEngine, BacktestRun, ChainContext, ParquetFeed, ResourceLimits, Strategy,
+    BacktestEngine, BacktestRun, ChainContext, CsvFeed, DataFeed, ParquetFeed, ResourceLimits,
+    Strategy,
 };
 use rand_chacha::rand_core::RngCore;
 
@@ -1160,4 +1161,53 @@ fn test_same_seed_same_result_realistic_multi_snapshot_refresh() {
         a, b,
         "same (seed, config, data) ⇒ byte-identical refresh fills"
     );
+}
+
+proptest! {
+    /// A non-tick-aligned ask sourced from a CSV file is rejected with
+    /// `PriceNotTickAligned` — the same guarantee, now over the CSV feed path
+    /// (#27). The value carried in the error is the offending cents price.
+    #[test]
+    fn csv_price_rejected_when_not_tick_aligned(offset in 1u64..=4) {
+        let ask_cents = 2_000 + offset;
+        let Ok(ask) = i64::try_from(ask_cents) else { return Ok(()); };
+        let rows: Vec<common::Row> = vec![(0, TS0, 510_000, "call", 1_995, ask)];
+        let Ok(dir) = tempfile::tempdir() else { return Ok(()); };
+        let csv_dir = dir.path().join("csv");
+        prop_assert!(common::write_csv_dir(&csv_dir, &rows).is_ok());
+        match CsvFeed::open(&csv_dir, &ResourceLimits::default()) {
+            Err(BacktestError::PriceNotTickAligned { price, tick }) => {
+                prop_assert_eq!(price, ask_cents);
+                prop_assert_eq!(tick, 5);
+            }
+            other => prop_assert!(false, "expected PriceNotTickAligned, got {:?}", other.is_ok()),
+        }
+    }
+
+    /// Conversion over a CSV file preserves exactly the input strikes, in sorted
+    /// order, regardless of the file's row order (#27).
+    #[test]
+    fn csv_chain_conversion_preserves_strikes(
+        multiples in prop::collection::hash_set(20u64..20_000, 1..24),
+    ) {
+        let mut strikes: Vec<u64> = multiples.iter().map(|m| m * 5).collect();
+        strikes.sort_unstable();
+        // Rows written in reverse strike order to prove the BTreeMap fixes it.
+        let mut rows: Vec<common::Row> = Vec::new();
+        for &strike in strikes.iter().rev() {
+            let Ok(strike_i) = i64::try_from(strike) else { return Ok(()); };
+            rows.push((0, TS0, strike_i, "call", 100, 110));
+        }
+        let Ok(dir) = tempfile::tempdir() else { return Ok(()); };
+        let csv_dir = dir.path().join("csv");
+        prop_assert!(common::write_csv_dir(&csv_dir, &rows).is_ok());
+        let Ok(mut feed) = CsvFeed::open(&csv_dir, &ResourceLimits::default()) else {
+            return Err(TestCaseError::fail("csv feed must open"));
+        };
+        let Ok(Some(snap)) = feed.next() else {
+            return Err(TestCaseError::fail("one snapshot must yield"));
+        };
+        let got: Vec<u64> = snap.quotes.keys().map(|k| k.strike.value()).collect();
+        prop_assert_eq!(got, strikes);
+    }
 }

@@ -1417,6 +1417,7 @@ dependencies = [
  "arrow",
  "chrono",
  "criterion",
+ "csv",
  "hdrhistogram",
  "option-chain-orderbook",
  "optionstratlib 0.17.3",

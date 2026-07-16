@@ -46,6 +46,14 @@ thiserror = "2"
 # ubiquitous Snappy page codec. Licence: Apache-2.0.
 arrow = { version = "59", default-features = false }
 parquet = { version = "59", default-features = false, features = ["arrow", "snap"] }
+# CSV historical feed parser (#27, v0.2 breadth) — a streaming, bounded record
+# reader for the integer-cents per-step chain files. Audit note: what — the CSV
+# parser behind the default-feature `CsvFeed`; why — the CSV feed is v0.2
+# breadth on the v0.1 slice; licence — Unlicense OR MIT (resolves to MIT on the
+# `deny.toml` allow-list). Already present transitively via optionstratlib, so
+# this direct dependency adds nothing new to the lockfile; `cargo audit` /
+# `cargo deny` stay green.
+csv = "1"
 # Streaming file sha256 = the tape data-identity for file feeds. Licence:
 # MIT OR Apache-2.0.
 sha2 = "0.10"
