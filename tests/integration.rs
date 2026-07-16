@@ -516,6 +516,192 @@ fn test_iron_condor_run_is_byte_identical_across_two_runs() {
     assert_eq!(first.result.initial_capital, second.result.initial_capital);
 }
 
+/// The number of rows a Parquet table declares in its footer metadata.
+fn parquet_num_rows(path: &std::path::Path) -> i64 {
+    let Ok(file) = std::fs::File::open(path) else {
+        panic!("bundle table {path:?} must open");
+    };
+    let Ok(builder) = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+    else {
+        panic!("bundle table {path:?} must be a valid parquet file");
+    };
+    builder.metadata().file_metadata().num_rows()
+}
+
+/// The manifest JSON with the provenance-only `created_utc` field removed — the
+/// canonical form the same-environment byte comparison uses.
+fn manifest_without_created_utc(path: &std::path::Path) -> serde_json::Value {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        panic!("manifest.json must be readable at {path:?}");
+    };
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        panic!("manifest.json must be valid JSON");
+    };
+    if let Some(obj) = value.as_object_mut() {
+        obj.remove("created_utc");
+    }
+    value
+}
+
+/// Write the iron-condor bundle for a fresh run over `chain_path` into
+/// `output_dir`, returning the published `<run_id>/` directory and the run.
+fn write_condor_bundle(
+    chain_path: &std::path::Path,
+    output_dir: &std::path::Path,
+    seed: u64,
+    overwrite: bool,
+) -> (std::path::PathBuf, ironcondor::BacktestRun) {
+    use optionstratlib::simulation::ExitPolicy;
+
+    let mut config = common::condor_config(chain_path, seed);
+    config.output_dir = output_dir.to_path_buf();
+    config.overwrite = overwrite;
+    let spec = common::iron_condor_spec();
+    let Ok(run) = ironcondor::run_backtest(&config, &spec, ExitPolicy::TimeSteps(1_000_000)) else {
+        panic!("the condor run must complete");
+    };
+    let Ok(dest) = ironcondor::write_bundle(&run, &config, &spec) else {
+        panic!("the bundle must publish");
+    };
+    (dest, run)
+}
+
+#[test]
+fn test_result_bundle_end_to_end_produces_complete_readable_bundle() {
+    // DataFeed → engine → execution → ledger → analytics → writer, then read the
+    // bundle back (row counts + one column) to confirm it is a valid bundle
+    // (full read-back validation is #35).
+    let Ok(dir) = tempfile::tempdir() else {
+        panic!("tempdir must create");
+    };
+    let path = dir.path().join("condor.parquet");
+    let rows = common::condor_rows(6, None);
+    if let Err(e) = common::write_parquet(&path, &rows) {
+        panic!("the condor fixture must write: {e}");
+    }
+    let output = dir.path().join("bundles");
+    let (dest, run) = write_condor_bundle(&path, &output, 7, false);
+
+    // The published directory holds the manifest plus the four Parquet tables.
+    assert!(dest.join("manifest.json").is_file());
+    for table in [
+        "fills.parquet",
+        "equity_curve.parquet",
+        "positions.parquet",
+        "greeks_attribution.parquet",
+    ] {
+        assert!(dest.join(table).is_file(), "{table} must be present");
+    }
+
+    // The directory name is the run_id, echoed on every fills row.
+    let Some(run_id) = dest.file_name().and_then(|n| n.to_str()) else {
+        panic!("the bundle directory is named by the run_id");
+    };
+    assert_eq!(run_id.len(), 64, "run_id is a sha256 hex string");
+
+    // Read the tables back: the row counts match the in-memory run.
+    assert_eq!(
+        parquet_num_rows(&dest.join("equity_curve.parquet")),
+        i64::try_from(run.equity_curve.len()).unwrap_or(-1),
+        "equity_curve rows match the run"
+    );
+    assert_eq!(
+        parquet_num_rows(&dest.join("greeks_attribution.parquet")),
+        i64::try_from(run.greeks_attribution.len()).unwrap_or(-1),
+        "greeks rows match the run"
+    );
+    assert_eq!(
+        parquet_num_rows(&dest.join("fills.parquet")),
+        i64::try_from(run.fills.len()).unwrap_or(-1),
+        "fills rows match the run"
+    );
+    assert_eq!(
+        parquet_num_rows(&dest.join("positions.parquet")),
+        i64::try_from(run.positions.len()).unwrap_or(-1),
+        "positions rows match the run"
+    );
+
+    // The manifest's row_counts agree with the decoded tables (reader integrity).
+    let manifest = manifest_without_created_utc(&dest.join("manifest.json"));
+    let Some(counts) = manifest.get("row_counts").and_then(|v| v.as_object()) else {
+        panic!("manifest carries a row_counts object");
+    };
+    assert_eq!(
+        counts
+            .get("equity_curve")
+            .and_then(serde_json::Value::as_u64),
+        u64::try_from(run.equity_curve.len()).ok()
+    );
+    assert_eq!(
+        manifest.get("schema").and_then(serde_json::Value::as_str),
+        Some("ironcondor.bundle.v1")
+    );
+}
+
+#[test]
+fn test_result_bundle_run_twice_is_byte_identical_modulo_created_utc() {
+    // Same environment, two IDENTICAL runs (same seed, config — including the
+    // output_dir and overwrite embedded verbatim — and data) ⇒ the four Parquet
+    // tables are byte-identical (equal sha256), and the manifest is byte-identical
+    // after stripping the sole wall-clock field created_utc (docs/05 §11). Both
+    // write to the SAME output_dir with overwrite = true, so the config is
+    // identical; the first bundle's bytes are captured before the second
+    // overwrites the same run_id directory.
+    let Ok(dir) = tempfile::tempdir() else {
+        panic!("tempdir must create");
+    };
+    let path = dir.path().join("condor.parquet");
+    let rows = common::condor_rows(6, None);
+    if let Err(e) = common::write_parquet(&path, &rows) {
+        panic!("the condor fixture must write: {e}");
+    }
+
+    let output = dir.path().join("bundles");
+    const TABLES: [&str; 4] = [
+        "fills.parquet",
+        "equity_curve.parquet",
+        "positions.parquet",
+        "greeks_attribution.parquet",
+    ];
+
+    // First run — capture its table shas + stripped manifest before it is
+    // overwritten.
+    let (dest_a, _run_a) = write_condor_bundle(&path, &output, 7, true);
+    let shas_a: Vec<String> = TABLES
+        .iter()
+        .map(|table| match recompute_sha256(&dest_a.join(table)) {
+            Ok(sha) => sha,
+            Err(e) => panic!("hashing {table} must succeed: {e}"),
+        })
+        .collect();
+    let manifest_a = manifest_without_created_utc(&dest_a.join("manifest.json"));
+
+    // Second run — identical config ⇒ identical run_id ⇒ overwrites the SAME dir.
+    let (dest_b, _run_b) = write_condor_bundle(&path, &output, 7, true);
+    assert_eq!(
+        dest_a, dest_b,
+        "identical runs publish to the same run_id directory"
+    );
+
+    // Each Parquet table is byte-identical (sha256 match).
+    for (table, sha_a) in TABLES.iter().zip(shas_a.iter()) {
+        let Ok(sha_b) = recompute_sha256(&dest_b.join(table)) else {
+            panic!("hashing {table} on the second run must succeed");
+        };
+        assert_eq!(
+            *sha_a, sha_b,
+            "{table} must be byte-identical across two runs"
+        );
+    }
+
+    // The manifest is byte-identical once created_utc is stripped.
+    assert_eq!(
+        manifest_a,
+        manifest_without_created_utc(&dest_b.join("manifest.json")),
+        "the manifest must match after stripping created_utc"
+    );
+}
+
 /// Realistic-mode adapter (feature `orderbook`, #22): submit → capture → `Fill`
 /// round-trip against a **hand-seeded leaf book**. Seeds a two-level ask ladder
 /// through the public [`ironcondor::RealisticFill::seed_maker_limit`] primitive,

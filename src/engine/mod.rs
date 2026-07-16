@@ -15,6 +15,7 @@
 //! batch orchestration (#46) remains a placeholder.
 
 pub mod backtest;
+pub mod bundle_collector;
 pub mod clock;
 pub mod ledger;
 pub mod scenario;
@@ -23,6 +24,7 @@ pub mod substrate;
 pub mod tradelog;
 
 pub use backtest::{BacktestEngine, BacktestRun};
+pub use bundle_collector::{FillRecord, PositionSnapshot};
 pub use clock::{Event, SimClock};
 pub use ledger::{Ledger, PositionMark, UnitGreeks};
 pub use scenario::{ConfigOverride, ScenarioParams, ScenarioType};

@@ -56,11 +56,12 @@ use rust_decimal::Decimal;
 use optionstratlib::backtesting::{BacktestResult, ExitReason};
 
 use crate::config::BacktestConfig;
-use crate::data::DataFeed;
+use crate::data::{DataFeed, DataSourceSpec};
 use crate::domain::{
     Cents, ChainSnapshot, EquityPoint, Fill, GreeksAttributionRow, OpenPosition, OrderCommand,
     OrderId, OrderIntent, PositionAction, PositionId, Quantity, TradeId,
 };
+use crate::engine::bundle_collector::{BundleCollector, FillRecord, PositionSnapshot};
 use crate::engine::clock::SimClock;
 use crate::engine::ledger::Ledger;
 use crate::engine::strategy::{ChainContext, Strategy};
@@ -174,6 +175,21 @@ pub struct BacktestRun {
     /// [`Self::attribution_substrate`] (the composition root does this via
     /// [`crate::analytics::attribution::attribute`]).
     pub greeks_attribution: Vec<GreeksAttributionRow>,
+    /// The full fill stream — one [`FillRecord`] per executed fill, with its
+    /// correlated `trade_id` / `position_id` / `order_id` / `fill_seq`. The
+    /// source of `fills.parquet` (#34); the writer stamps `strategy_run_id` and
+    /// derives `contract_id`.
+    pub fills: Vec<FillRecord>,
+    /// The per-step position snapshots — one [`PositionSnapshot`] per open leg
+    /// per step, plus one terminal row per leg at close. The source of
+    /// `positions.parquet` (#34).
+    pub positions: Vec<PositionSnapshot>,
+    /// The run's data-source provenance ([`DataFeed::meta`]), embedded verbatim
+    /// in the bundle manifest.
+    pub data_source: DataSourceSpec,
+    /// The pinned materialised-tape identity ([`crate::data::TapeMeta::data_identity`])
+    /// — the `run_id` data-identity input the bundle writer hashes.
+    pub data_identity: String,
 }
 
 /// The deterministic replay engine — the facade over [`BacktestEngine::run`].
@@ -233,6 +249,10 @@ impl BacktestEngine {
         }
         let final_step = tape_meta.final_step;
         let first_ts = tape_meta.first_ts;
+        // The bundle-manifest provenance + the run_id data-identity input,
+        // captured before the loop consumes the feed.
+        let data_source = feed.meta();
+        let data_identity = tape_meta.data_identity.clone();
         let steps =
             usize::try_from(final_step.value()).map_err(|_| BacktestError::ArithmeticOverflow)?;
         let capacity = steps
@@ -252,6 +272,7 @@ impl BacktestEngine {
             equity_curve: Vec::with_capacity(capacity),
             attribution: AttributionCollector::with_capacity(capacity),
             trade_log: TradeLogCollector::with_capacity(16),
+            bundle: BundleCollector::with_capacity(16),
         };
 
         // Peek S0: the feed has no `peek`, so pull it and hold it as the
@@ -279,6 +300,11 @@ impl BacktestEngine {
         // close an amortised push (a run that opens more later grows amortised at
         // that transient, never on a warm step). PB-1-safe.
         state.trade_log.reserve(state.inventory.len());
+        // The bundle fill stream (opens + closes) and per-leg-per-step position
+        // snapshots are reserved from the same opening leg count + step count, so
+        // the warm-step position push never reallocates (PB-1); the fill stream
+        // is untouched on a warm step (no fills).
+        state.bundle.reserve(state.inventory.len(), capacity);
 
         // --- Per-step loop (§3.2) + termination (§3.3) ----------------------
         // `last_ts` is assigned exactly once, at the terminal-step break — the
@@ -318,8 +344,10 @@ impl BacktestEngine {
             inventory,
             attribution,
             trade_log,
+            bundle,
             ..
         } = state;
+        let (fills, positions) = bundle.into_parts();
         Ok(BacktestRun {
             result,
             equity_curve,
@@ -328,6 +356,10 @@ impl BacktestEngine {
             attribution_substrate: attribution.into_substrate(),
             // Empty by design — analytics fills it post-run (see the type docs).
             greeks_attribution: Vec::new(),
+            fills,
+            positions,
+            data_source,
+            data_identity,
         })
     }
 }
@@ -355,6 +387,11 @@ struct RunState<S: Strategy, X: ExecutionModel> {
     /// pass consumes (#32). Reserved at `on_start`; a close is an amortised push
     /// and a warm step touches it not at all — PB-1-safe.
     trade_log: TradeLogCollector,
+    /// Collects the bundle's fill stream ([`FillRecord`]) and per-step position
+    /// snapshots ([`PositionSnapshot`]) the writer serialises (#34). Reserved at
+    /// `on_start`; a fill is a sparse push and each open leg contributes one
+    /// alloc-free snapshot per step against the reserved buffer — PB-1-safe.
+    bundle: BundleCollector,
 }
 
 impl<S: Strategy, X: ExecutionModel> RunState<S, X> {
@@ -372,6 +409,7 @@ impl<S: Strategy, X: ExecutionModel> RunState<S, X> {
             cmds,
             fills,
             trade_log,
+            bundle,
             ..
         } = self;
         cmds.clear();
@@ -402,6 +440,7 @@ impl<S: Strategy, X: ExecutionModel> RunState<S, X> {
             ids,
             ledger,
             trade_log,
+            bundle,
             &reasons,
         )?;
         Ok(())
@@ -423,6 +462,7 @@ impl<S: Strategy, X: ExecutionModel> RunState<S, X> {
             equity_curve,
             attribution,
             trade_log,
+            bundle,
         } = self;
 
         // a. advance the clock (rejects a non-increasing ts as DataOutOfOrder).
@@ -501,23 +541,28 @@ impl<S: Strategy, X: ExecutionModel> RunState<S, X> {
             ids,
             ledger,
             trade_log,
+            bundle,
             &reasons,
         )?;
 
         // f. the ONE ledger mutation for the step ⇒ the step's single point.
         let point = ledger.settle(snapshot.step, snapshot.ts, inventory.as_slice(), snapshot)?;
-        // g. record: the ordered equity curve (#14) AND the per-step attribution
-        // substrate (#31). Both are amortised pushes into buffers sized at
-        // startup — no per-step allocation on a constant-leg run (PB-1). The
-        // ledger's per-leg hand-off (`position_marks`) plus its `spread_capture`
-        // / `fees` / `step_pnl` are live right here, before the next `settle`
-        // overwrites them; the collector copies out what the post-run pass needs.
+        // g. record: the ordered equity curve (#14), the per-step attribution
+        // substrate (#31), AND one bundle position snapshot per surviving open
+        // leg (#34). All are amortised pushes into buffers sized at startup — no
+        // per-step allocation on a constant-leg run (PB-1). The ledger's per-leg
+        // hand-off (`position_marks`) plus its `spread_capture` / `fees` /
+        // `step_pnl` are live right here, before the next `settle` overwrites
+        // them; the collectors copy out what the post-run passes need.
         equity_curve.push(point);
         let marks = ledger.position_marks();
         let spread_capture = ledger.spread_capture();
         let fees = ledger.fees();
         let step_pnl = ledger.step_pnl();
         attribution.collect(snapshot, marks, spread_capture, fees, step_pnl);
+        // `is_last` legs surviving to the final settle are exactly the legs open
+        // at feed exhaustion, so their open rows carry `open_at_end = true`.
+        bundle.collect_step(snapshot.step.value(), snapshot.ts.value(), marks, is_last)?;
         Ok(())
     }
 }
@@ -592,21 +637,23 @@ impl CloseReasons {
 /// validating the quantity, and records a realised [`ClosedTrade`] with the
 /// phase's [`ExitReason`]. Cash moves through the ledger for every fill.
 ///
-/// The `OrderId` is minted (advancing the seeded counter deterministically) but
-/// not surfaced by #14: the bundle row that carries it (`FillRow`) lands at
-/// v0.3, so the id is computed in the correct pattern now and becomes a stable
-/// output then.
+/// Each `Submit` mints one `OrderId`; the fill it correlates to is captured
+/// together with its `trade_id` / `position_id` / `order_id` into the bundle fill
+/// stream (`FillRecord`, #34) — the `Fill` alone carries no ids. A full close
+/// also pushes the leg's terminal `positions.parquet` row (the beginning-of-step
+/// mark, the closing step's snapshot mid).
 ///
 /// # Errors
 ///
 /// - [`BacktestError::Execution`] if a `Close` names an unknown leg or an
 ///   oversized quantity, or if the fill count does not match the submit count
 ///   (multi-level / refresh fills are a v0.2 realistic-mode concern).
-/// - [`BacktestError::ArithmeticOverflow`] from id minting, the ledger, or the
-///   trade log's realised-P&L arithmetic.
+/// - [`BacktestError::ArithmeticOverflow`] from id minting, the ledger, the
+///   trade log's realised-P&L arithmetic, or the bundle collector's unrealised
+///   arithmetic.
 #[allow(
     clippy::too_many_arguments,
-    reason = "the correlation step threads the loop's per-step buffers, id counters, ledger, trade log, and close-phase ranges; splitting it would fragment the single fill-correlation pass"
+    reason = "the correlation step threads the loop's per-step buffers, id counters, ledger, trade log, bundle collector, and close-phase ranges; splitting it would fragment the single fill-correlation pass"
 )]
 fn apply_step_fills(
     cmds: &[OrderCommand],
@@ -616,6 +663,7 @@ fn apply_step_fills(
     ids: &mut IdCounters,
     ledger: &mut Ledger,
     trade_log: &mut TradeLogCollector,
+    bundle: &mut BundleCollector,
     reasons: &CloseReasons,
 ) -> Result<(), BacktestError> {
     let multiplier = snapshot.spec.contract_multiplier;
@@ -626,7 +674,7 @@ fn apply_step_fills(
     for (idx, cmd) in cmds.iter().enumerate() {
         match cmd {
             OrderCommand::Submit(intent) => {
-                let _order_id = ids.mint_order()?; // v0.3 FillRow.order_id
+                let order_id = ids.mint_order()?;
                 let fill = fills_iter.next().ok_or_else(|| {
                     BacktestError::Execution(
                         "execution produced fewer fills than submitted orders (naive mode fills each submit single-shot)"
@@ -664,9 +712,11 @@ fn apply_step_fills(
                             fill.price,
                             ts_ns,
                         );
+                        bundle.record_open_fill(fill, order_id.value(), trade_id, position_id);
                     }
                     PositionAction::Close(position_id) => {
-                        reduce_leg(inventory, position_id, fill.quantity)?;
+                        let full_close = reduce_leg(inventory, position_id, fill.quantity)?;
+                        let reason = reasons.reason_for(idx);
                         trade_log.record_close(
                             position_id,
                             fill.price,
@@ -675,7 +725,21 @@ fn apply_step_fills(
                             ts_ns,
                             fill.quantity,
                             multiplier,
-                            reasons.reason_for(idx),
+                            reason.clone(),
+                        )?;
+                        // The terminal-row mark is the closing step's snapshot mid
+                        // (a fill exists, so the contract is normally quoted); an
+                        // absent quote carries forward in the collector.
+                        let snapshot_mark =
+                            snapshot.quotes.get(&fill.contract).map(|quote| quote.mid);
+                        bundle.record_close_fill(
+                            fill,
+                            order_id.value(),
+                            position_id,
+                            full_close,
+                            snapshot_mark,
+                            multiplier,
+                            reason,
                         )?;
                     }
                 }
@@ -697,7 +761,9 @@ fn apply_step_fills(
 }
 
 /// Validate and apply a `Close` against the live inventory: a partial close
-/// reduces the leg and leaves it open; a full close removes it.
+/// reduces the leg and leaves it open; a full close removes it. Returns `true` on
+/// a **full** close (the leg is gone), `false` on a partial one — the flag the
+/// bundle collector uses to decide whether to write a terminal `PositionRow`.
 ///
 /// # Errors
 ///
@@ -708,7 +774,7 @@ fn reduce_leg(
     inventory: &mut Vec<OpenPosition>,
     position_id: PositionId,
     close_qty: Quantity,
-) -> Result<(), BacktestError> {
+) -> Result<bool, BacktestError> {
     let idx = inventory
         .iter()
         .position(|leg| leg.position_id == position_id)
@@ -732,6 +798,7 @@ fn reduce_leg(
     }
     if requested == open_qty {
         inventory.remove(idx); // full close
+        Ok(true)
     } else {
         // requested < open_qty, so the subtraction is a positive remainder.
         let remaining = open_qty - requested;
@@ -739,8 +806,8 @@ fn reduce_leg(
             BacktestError::Execution("open leg vanished from inventory".to_string())
         })?;
         leg.quantity = Quantity::new(remaining)?;
+        Ok(false)
     }
-    Ok(())
 }
 
 /// Convert integer cents to a `Decimal` dollar amount for the upstream
