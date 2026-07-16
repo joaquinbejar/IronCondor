@@ -84,8 +84,8 @@ use optionstratlib_ob::OptionStyle as ObOptionStyle;
 
 use crate::config::{FeeSchedule, LiquidityProfile};
 use crate::domain::{
-    ChainSnapshot, ContractKey, ExecutionMode, Fill, OrderCommand, OrderIntent, PositionAction,
-    PriceCents, Quantity, QuoteView, TimeInForce,
+    ChainSnapshot, ContractKey, ExecutionMode, Fill, OrderCommand, OrderIntent, PriceCents,
+    Quantity, QuoteView, TimeInForce,
 };
 use crate::error::BacktestError;
 
@@ -355,7 +355,7 @@ impl RealisticFill {
                 "instrument tick_size_cents is zero at the realistic seam".to_string(),
             ));
         }
-        let ob_side = ob_side(&intent.action, intent.side);
+        let ob_side = ob_side(intent.side);
         let qty = u64::from(intent.quantity.value());
 
         // Marketable (`limit = None`) → tick-aligned aggressive limit off the
@@ -370,13 +370,7 @@ impl RealisticFill {
                         snap.step.value()
                     ))
                 })?;
-                marketable_limit_cents(
-                    &intent.action,
-                    intent.side,
-                    quote,
-                    tick,
-                    self.marketable_cap_ticks,
-                )?
+                marketable_limit_cents(intent.side, quote, tick, self.marketable_cap_ticks)?
             }
         };
         let price_ticks = cents_to_ticks(limit_cents, tick)?;
@@ -484,22 +478,31 @@ impl ExecutionModel for RealisticFill {
     }
 }
 
-/// Map the strategy's `(action, side)` to the book's [`ObSide`] — the **only**
-/// place this composition lives. `Side` alone is not enough: a buy opens a long
-/// **and** closes a short.
+/// Map an intent's **trade-direction** [`Side`] to the book's [`ObSide`] — the
+/// **only** place this mapping lives.
 ///
-/// | action  | side  | book side |
-/// |---------|-------|-----------|
-/// | `Open`  | Long  | `Buy`     |
-/// | `Open`  | Short | `Sell`    |
-/// | `Close` | Long  | `Sell`    |
-/// | `Close` | Short | `Buy`     |
+/// `OrderIntent.side` is the **trade side**, not the position side: `Long` means
+/// *buy*, `Short` means *sell*, for **both** opens and closes. The strategy's
+/// `close_command` ([`crate::engine`], `strategy.rs`) already flips a leg's
+/// position side to the trade side that flattens it — a long leg is closed by a
+/// `Short` (sell) intent, a short leg by a `Long` (buy) intent — and the naive
+/// model (the committed reference) interprets `intent.side` exactly this way
+/// (`Long` fills up toward the ask, debits cash). So the book side follows
+/// `side` alone; the intent's `action` must **not** re-flip it here. Re-flipping
+/// on `Close` would **double-flip** a close and cross the wrong side of the book
+/// (a buy-to-close crossing the bid), making the realised close price — and its
+/// `Fill.slippage` sign ([01 §7.1](../../../docs/01-domain-model.md#71-sign-conventions-truth-table))
+/// — dishonest.
+///
+/// | side (trade) | book side |
+/// |--------------|-----------|
+/// | `Long`  (buy)  | `Buy`   |
+/// | `Short` (sell) | `Sell`  |
 #[must_use]
-fn ob_side(action: &PositionAction, side: Side) -> ObSide {
-    let closing = matches!(action, PositionAction::Close(_));
-    match (side, closing) {
-        (Side::Long, false) | (Side::Short, true) => ObSide::Buy,
-        (Side::Short, false) | (Side::Long, true) => ObSide::Sell,
+const fn ob_side(side: Side) -> ObSide {
+    match side {
+        Side::Long => ObSide::Buy,
+        Side::Short => ObSide::Sell,
     }
 }
 
@@ -569,7 +572,6 @@ fn ticks_to_cents(ticks: u128, tick: u64) -> Result<PriceCents, BacktestError> {
 /// price exceeds the `u64` cents range.
 #[must_use = "the marketable limit price must be submitted"]
 fn marketable_limit_cents(
-    action: &PositionAction,
     side: Side,
     quote: &QuoteView,
     tick: u64,
@@ -578,7 +580,7 @@ fn marketable_limit_cents(
     let cap_offset = tick
         .checked_mul(u64::from(cap))
         .ok_or(BacktestError::ArithmeticOverflow)?;
-    match ob_side(action, side) {
+    match ob_side(side) {
         ObSide::Buy => {
             let price = quote
                 .ask
@@ -712,28 +714,23 @@ mod tests {
         })
     }
 
-    // --- side + action → Buy/Sell (all four combos) --------------------------
+    // --- trade-side → Buy/Sell (both directions) -----------------------------
+    //
+    // `intent.side` is the TRADE side (Long = buy, Short = sell) for BOTH opens
+    // and closes: the strategy's `close_command` flips a leg's position side to
+    // the flattening trade side, so the book side follows `side` alone and
+    // `action` never re-flips it (a double flip would cross the wrong side).
 
     #[test]
-    fn test_ob_side_open_long_is_buy() {
-        assert_eq!(ob_side(&PositionAction::Open, Side::Long), ObSide::Buy);
+    fn test_ob_side_long_is_buy() {
+        // A buy — open-long OR close-short (both arrive as Side::Long).
+        assert_eq!(ob_side(Side::Long), ObSide::Buy);
     }
 
     #[test]
-    fn test_ob_side_open_short_is_sell() {
-        assert_eq!(ob_side(&PositionAction::Open, Side::Short), ObSide::Sell);
-    }
-
-    #[test]
-    fn test_ob_side_close_long_is_sell() {
-        let close = PositionAction::Close(PositionId::new(7));
-        assert_eq!(ob_side(&close, Side::Long), ObSide::Sell);
-    }
-
-    #[test]
-    fn test_ob_side_close_short_is_buy() {
-        let close = PositionAction::Close(PositionId::new(7));
-        assert_eq!(ob_side(&close, Side::Short), ObSide::Buy);
+    fn test_ob_side_short_is_sell() {
+        // A sell — open-short OR close-long (both arrive as Side::Short).
+        assert_eq!(ob_side(Side::Short), ObSide::Sell);
     }
 
     // --- cents ↔ tick scaling ------------------------------------------------
@@ -807,34 +804,21 @@ mod tests {
     #[test]
     fn test_marketable_limit_buy_is_ask_plus_cap_ticks() {
         // ask 500, cap 10, tick 5 → 500 + 50 = 550.
-        let px = marketable_limit_cents(
-            &PositionAction::Open,
-            Side::Long,
-            &quote(490, 500),
-            TICK,
-            10,
-        );
+        let px = marketable_limit_cents(Side::Long, &quote(490, 500), TICK, 10);
         assert!(matches!(px, Ok(p) if p.value() == 550));
     }
 
     #[test]
     fn test_marketable_limit_sell_is_bid_minus_cap_ticks() {
         // bid 490, cap 10, tick 5 → 490 − 50 = 440.
-        let px = marketable_limit_cents(
-            &PositionAction::Open,
-            Side::Short,
-            &quote(490, 500),
-            TICK,
-            10,
-        );
+        let px = marketable_limit_cents(Side::Short, &quote(490, 500), TICK, 10);
         assert!(matches!(px, Ok(p) if p.value() == 440));
     }
 
     #[test]
     fn test_marketable_limit_sell_floors_at_zero() {
         // bid 30, cap 10, tick 5 → 30 − 50 floors at 0 (premium ≥ 0).
-        let px =
-            marketable_limit_cents(&PositionAction::Open, Side::Short, &quote(30, 40), TICK, 10);
+        let px = marketable_limit_cents(Side::Short, &quote(30, 40), TICK, 10);
         assert!(matches!(px, Ok(p) if p.value() == 0));
     }
 
@@ -907,6 +891,277 @@ mod tests {
         assert!(matches!(result, Ok(())));
         assert_eq!(out.len(), 2, "only two levels within the cap fill");
         assert!(out.iter().all(|f| f.price.value() <= 505));
+    }
+
+    // --- #024 honest close routing (trade side, no double flip) --------------
+
+    /// A marketable **close of a short** (trade side `Long` = buy-to-close)
+    /// crosses the **ask**, not the bid — the honest side. Under the old
+    /// `action`-based double flip it would cross the bid and fill favourably
+    /// (dishonest); crossing the ask makes the buy-back adverse, as it must be.
+    #[test]
+    fn test_close_of_short_crosses_ask_not_bid() {
+        let mut model = RealisticFill::new(fees(), 10, 3);
+        // asymmetric depth: bid @ 490, ask @ 510 (distinguishable by price).
+        let bid = model.seed_maker_limit(
+            &contract(),
+            false,
+            PriceCents::new(490),
+            qty(5),
+            PriceCents::new(TICK),
+        );
+        let ask = model.seed_maker_limit(
+            &contract(),
+            true,
+            PriceCents::new(510),
+            qty(5),
+            PriceCents::new(TICK),
+        );
+        assert!(matches!((bid, ask), (Ok(()), Ok(()))));
+        // Close a short: action = Close, trade side = Long (buy-to-close),
+        // marketable, decision_mid = mid 500.
+        let close = OrderCommand::Submit(OrderIntent {
+            contract: contract(),
+            action: PositionAction::Close(PositionId::new(1)),
+            side: Side::Long,
+            quantity: qty(1),
+            limit: None,
+            tif: TimeInForce::Ioc,
+            decision_mid: PriceCents::new(500),
+        });
+        let mut out: Vec<Fill> = Vec::new();
+        let result = model.fill(&[close], &snapshot(490, 510), &mut out);
+        assert!(matches!(result, Ok(())));
+        let Some(fill) = out.first() else {
+            panic!("the buy-to-close must fill against the ask");
+        };
+        // Crossed the ask (510), never the bid (490).
+        assert_eq!(fill.price.value(), 510);
+        assert_eq!(fill.side, Side::Long);
+        // Buying back above mid is adverse: positive slippage.
+        assert_eq!(fill.slippage.value(), 10);
+    }
+
+    /// A marketable **close of a long** (trade side `Short` = sell-to-close)
+    /// crosses the **bid**, not the ask — selling below mid is adverse.
+    #[test]
+    fn test_close_of_long_crosses_bid_not_ask() {
+        let mut model = RealisticFill::new(fees(), 10, 3);
+        let bid = model.seed_maker_limit(
+            &contract(),
+            false,
+            PriceCents::new(490),
+            qty(5),
+            PriceCents::new(TICK),
+        );
+        let ask = model.seed_maker_limit(
+            &contract(),
+            true,
+            PriceCents::new(510),
+            qty(5),
+            PriceCents::new(TICK),
+        );
+        assert!(matches!((bid, ask), (Ok(()), Ok(()))));
+        let close = OrderCommand::Submit(OrderIntent {
+            contract: contract(),
+            action: PositionAction::Close(PositionId::new(1)),
+            side: Side::Short,
+            quantity: qty(1),
+            limit: None,
+            tif: TimeInForce::Ioc,
+            decision_mid: PriceCents::new(500),
+        });
+        let mut out: Vec<Fill> = Vec::new();
+        let result = model.fill(&[close], &snapshot(490, 510), &mut out);
+        assert!(matches!(result, Ok(())));
+        let Some(fill) = out.first() else {
+            panic!("the sell-to-close must fill against the bid");
+        };
+        assert_eq!(fill.price.value(), 490);
+        assert_eq!(fill.side, Side::Short);
+        // Selling below mid is adverse: positive slippage.
+        assert_eq!(fill.slippage.value(), 10);
+    }
+
+    // --- #024 queue position (strategy limit behind seeded depth) ------------
+
+    /// A resting strategy limit at a **seeded price level** fills only after the
+    /// depth ahead of it (added first) is consumed — same-price time priority,
+    /// straight from the leaf book. Seed 3 @ 500 (ahead), rest a strategy sell
+    /// of 2 @ 500 behind it, then a marketable buy for 5 walks the queue: the
+    /// per-maker trades come back **seeded-3 first, strategy-2 second**, proving
+    /// the strategy order queued behind the seeded depth at its level.
+    #[test]
+    fn test_queue_position_strategy_limit_fills_behind_seeded_depth() {
+        let mut model = RealisticFill::new(fees(), 10, 5);
+        // Seeded ask of 3 @ 500 — added first, so it is ahead in the queue.
+        let seeded = model.seed_maker_limit(
+            &contract(),
+            true,
+            PriceCents::new(500),
+            qty(3),
+            PriceCents::new(TICK),
+        );
+        assert!(matches!(seeded, Ok(())));
+        // A strategy sell limit of 2 @ 500 rests BEHIND the seeded ask (same
+        // price, later time), then a marketable buy for 5 consumes both.
+        let rest_then_walk = [
+            OrderCommand::Submit(OrderIntent {
+                contract: contract(),
+                action: PositionAction::Open,
+                side: Side::Short, // sell → rests on the ask at 500, no cross
+                quantity: qty(2),
+                limit: Some(PriceCents::new(500)),
+                tif: TimeInForce::Gtc,
+                decision_mid: PriceCents::new(500),
+            }),
+            marketable(Side::Long, PositionAction::Open, 5, 500),
+        ];
+        let mut out: Vec<Fill> = Vec::new();
+        let result = model.fill(&rest_then_walk, &snapshot(490, 500), &mut out);
+        assert!(matches!(result, Ok(())));
+        // The resting sell produced no fill; the buy produced two per-maker
+        // trades at 500: the seeded 3 first, the strategy 2 second.
+        let levels: Vec<(u64, u32)> = out
+            .iter()
+            .map(|f| (f.price.value(), f.quantity.value()))
+            .collect();
+        assert_eq!(
+            levels,
+            vec![(500, 3), (500, 2)],
+            "seeded depth (3) fills before the strategy limit (2) at the same price"
+        );
+    }
+
+    // --- #024 partial / empty / deep fills -----------------------------------
+
+    /// A thin strike fills **less than the intent**: a marketable buy for 5 into
+    /// a book with only 2 seeded contracts fills 2 and the remainder is
+    /// discarded (IOC) — realistic mode fills partially, unlike naive.
+    #[test]
+    fn test_thin_strike_partial_fill_matched_less_than_intent() {
+        let mut model = RealisticFill::new(fees(), 10, 5);
+        let seeded = model.seed_maker_limit(
+            &contract(),
+            true,
+            PriceCents::new(500),
+            qty(2),
+            PriceCents::new(TICK),
+        );
+        assert!(matches!(seeded, Ok(())));
+        let mut out: Vec<Fill> = Vec::new();
+        let result = model.fill(
+            &[marketable(Side::Long, PositionAction::Open, 5, 500)],
+            &snapshot(490, 500),
+            &mut out,
+        );
+        assert!(matches!(result, Ok(())));
+        assert_eq!(out.len(), 1, "only the seeded depth fills");
+        let matched: u32 = out.iter().map(|f| f.quantity.value()).sum();
+        assert_eq!(matched, 2, "partial: 2 of 5 filled, 3 discarded (IOC)");
+    }
+
+    /// An empty (unseeded) strike leaves a **zero** fill: nothing crosses, so no
+    /// `Fill` is appended — realistic mode can decline to fill entirely.
+    #[test]
+    fn test_empty_strike_yields_zero_fills() {
+        let mut model = RealisticFill::new(fees(), 10, 5);
+        let mut out: Vec<Fill> = Vec::new();
+        let result = model.fill(
+            &[marketable(Side::Long, PositionAction::Open, 5, 500)],
+            &snapshot(490, 500),
+            &mut out,
+        );
+        assert!(matches!(result, Ok(())));
+        assert!(out.is_empty(), "no seeded depth ⇒ zero fills");
+    }
+
+    /// A deep strike fills the **full intent** in a single level: a marketable
+    /// buy for 5 into 100 seeded contracts fills 5 at the touch, one fill.
+    #[test]
+    fn test_deep_strike_fills_full_intent_single_level() {
+        let mut model = RealisticFill::new(fees(), 10, 5);
+        let seeded = model.seed_maker_limit(
+            &contract(),
+            true,
+            PriceCents::new(500),
+            qty(100),
+            PriceCents::new(TICK),
+        );
+        assert!(matches!(seeded, Ok(())));
+        let mut out: Vec<Fill> = Vec::new();
+        let result = model.fill(
+            &[marketable(Side::Long, PositionAction::Open, 5, 500)],
+            &snapshot(490, 500),
+            &mut out,
+        );
+        assert!(matches!(result, Ok(())));
+        assert_eq!(out.len(), 1, "deep touch fills the whole intent at once");
+        let Some(fill) = out.first() else {
+            panic!("one fill expected");
+        };
+        assert_eq!((fill.price.value(), fill.quantity.value()), (500, 5));
+    }
+
+    // --- #024 slippage sign + fee parity -------------------------------------
+
+    /// A marketable buy that walks the ladder records **progressively more
+    /// adverse** (larger positive) per-level slippage against the fixed
+    /// decision-time mid — the emergent market-impact signal, sign per §7.1.
+    #[test]
+    fn test_realistic_per_level_slippage_is_progressively_adverse() {
+        let mut model = RealisticFill::new(fees(), 10, 5);
+        for (price, size) in [(500u64, 2u32), (505, 2), (510, 2)] {
+            let seeded = model.seed_maker_limit(
+                &contract(),
+                true,
+                PriceCents::new(price),
+                qty(size),
+                PriceCents::new(TICK),
+            );
+            assert!(matches!(seeded, Ok(())));
+        }
+        // decision_mid fixed at 500 (never re-read post-impact); buy 6 walks all.
+        let mut out: Vec<Fill> = Vec::new();
+        let result = model.fill(
+            &[marketable(Side::Long, PositionAction::Open, 6, 500)],
+            &snapshot(490, 500),
+            &mut out,
+        );
+        assert!(matches!(result, Ok(())));
+        let slippage: Vec<i64> = out.iter().map(|f| f.slippage.value()).collect();
+        // (500−500)·2 = 0, (505−500)·2 = +10, (510−500)·2 = +20 — non-decreasing,
+        // adverse (≥ 0) as each deeper level fills worse than the decision mid.
+        assert_eq!(slippage, vec![0, 10, 20]);
+        assert!(slippage.windows(2).all(|w| w[1] >= w[0]));
+    }
+
+    /// Fees are charged identically to naive for the same filled contracts:
+    /// `per_contract` on the fill plus `per_order` once on the first fill.
+    #[test]
+    fn test_realistic_fees_match_naive_for_same_filled_contracts() {
+        let mut model = RealisticFill::new(fees(), 10, 5);
+        let seeded = model.seed_maker_limit(
+            &contract(),
+            true,
+            PriceCents::new(500),
+            qty(10),
+            PriceCents::new(TICK),
+        );
+        assert!(matches!(seeded, Ok(())));
+        let mut out: Vec<Fill> = Vec::new();
+        let result = model.fill(
+            &[marketable(Side::Long, PositionAction::Open, 4, 500)],
+            &snapshot(490, 500),
+            &mut out,
+        );
+        assert!(matches!(result, Ok(())));
+        let Some(fill) = out.first() else {
+            panic!("one fill of 4 contracts expected");
+        };
+        // Same rule as naive: 4 × per_contract(65) + per_order(100) = 360.
+        assert_eq!(fill.quantity.value(), 4);
+        assert_eq!(fill.fees.value(), 4 * 65 + 100);
     }
 
     // --- #023 auto-seeding wiring --------------------------------------------

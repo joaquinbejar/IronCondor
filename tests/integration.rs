@@ -539,3 +539,148 @@ fn test_realistic_seeding_is_byte_identical_across_two_models() {
     // The seed does not perturb the (deterministic) ladder, either.
     assert_eq!(walk(7), walk(99));
 }
+
+/// #024 market impact: the **same order** into a **thin** strike vs a **deep**
+/// strike produces different fill quality — the thin strike partial-fills at a
+/// worse average price (the order walks up the ladder), the deep strike fills
+/// the full intent at the touch. Fill quality is a property of the seeded depth,
+/// not a configured knob.
+#[cfg(feature = "orderbook")]
+#[test]
+fn test_realistic_thin_vs_deep_strike_fill_quality_differs_with_depth() {
+    use ironcondor::{
+        ExecutionModel, FeeSchedule, Fill, OrderCommand, OrderIntent, PositionAction, PriceCents,
+        Quantity, RealisticFill, TimeInForce,
+    };
+    use optionstratlib::Side;
+
+    let fees = FeeSchedule {
+        per_contract_cents: 65,
+        per_order_cents: 100,
+    };
+    // The SAME marketable buy for 5, routed into two books of different depth.
+    let route = |ask_size: u32| -> Vec<(u64, u32)> {
+        // canonical profile (QuotedSize, L=3, r=0.5): the ask ladder is sized
+        // from `ask_size` and decays geometrically away from the touch (500).
+        let snap = liquidity_fixture::snapshot(490, 500, ask_size, ask_size);
+        let mut model = RealisticFill::with_liquidity_profile(
+            fees,
+            10,
+            7,
+            liquidity_fixture::canonical_profile(),
+        );
+        let qty = match Quantity::new(5) {
+            Ok(q) => q,
+            Err(e) => panic!("5 is a valid quantity: {e}"),
+        };
+        let buy = OrderCommand::Submit(OrderIntent {
+            contract: liquidity_fixture::contract(),
+            action: PositionAction::Open,
+            side: Side::Long,
+            quantity: qty,
+            limit: None,
+            tif: TimeInForce::Ioc,
+            decision_mid: PriceCents::new(500),
+        });
+        let mut out: Vec<Fill> = Vec::new();
+        match model.fill(&[buy], &snap, &mut out) {
+            Ok(()) => {}
+            Err(e) => panic!("the marketable buy must route: {e}"),
+        }
+        out.iter()
+            .map(|f| (f.price.value(), f.quantity.value()))
+            .collect()
+    };
+
+    // Thin: ask_size 2 → ladder 2@500, 1@505 (round(2·0.25)=0 stops). A buy for
+    // 5 fills only 3 (partial), walking up to 505.
+    let thin = route(2);
+    // Deep: ask_size 64 → touch 64@500 alone swallows the whole order at 500.
+    let deep = route(64);
+
+    let matched = |fills: &[(u64, u32)]| -> u32 { fills.iter().map(|f| f.1).sum() };
+    let worst_price =
+        |fills: &[(u64, u32)]| -> u64 { fills.iter().map(|f| f.0).max().unwrap_or(0) };
+
+    // The deep strike fills MORE of the intent than the thin one.
+    assert!(
+        matched(&deep) > matched(&thin),
+        "deep filled {} vs thin {}",
+        matched(&deep),
+        matched(&thin)
+    );
+    // The thin strike is a PARTIAL fill (< 5); the deep strike is FULL (= 5).
+    assert_eq!(matched(&thin), 3, "thin strike partial-fills 3 of 5");
+    assert_eq!(matched(&deep), 5, "deep strike fills the full intent");
+    // The deep strike's worst executed price is no worse than the thin's — the
+    // deep book never walks past the touch, the thin one does (impact).
+    assert!(
+        worst_price(&deep) < worst_price(&thin),
+        "deep worst price {} must beat thin worst price {} (market impact)",
+        worst_price(&deep),
+        worst_price(&thin)
+    );
+    // The deep strike is a single-level fill; the thin one walks two levels.
+    assert_eq!(deep.len(), 1, "deep fills at the touch in one level");
+    assert_eq!(thin.len(), 2, "thin walks two levels");
+}
+
+/// #024 `SlippageModel` has **no effect** in realistic mode: two runs whose
+/// configs differ **only** in `slippage` produce byte-identical fills, because
+/// `RealisticFill` never reads `config.slippage` (its slippage is emergent from
+/// the book). Assembled via `BacktestEngine::run` over the full iron condor.
+#[cfg(feature = "orderbook")]
+#[test]
+fn test_realistic_ignores_slippage_model_config() {
+    use ironcondor::{BacktestConfig, BacktestEngine, BacktestRun, RealisticFill, SlippageModel};
+    use optionstratlib::simulation::ExitPolicy;
+    use optionstratlib::strategies::IronCondor;
+
+    let Ok(dir) = tempfile::tempdir() else {
+        panic!("tempdir must create");
+    };
+    let path = dir.path().join("condor.parquet");
+    let rows = common::condor_rows(6, None);
+    if let Err(e) = common::write_parquet(&path, &rows) {
+        panic!("the condor fixture must write: {e}");
+    }
+
+    // Build a realistic run whose config carries `slippage`, and construct the
+    // RealisticFill exactly as the config-driven engine path does — from fees,
+    // cap, seed, and profile ONLY. `config.slippage` is never consulted.
+    let run_with_slippage = |slippage: SlippageModel| -> BacktestRun {
+        let mut config: BacktestConfig = common::condor_config(&path, 7);
+        config.mode = ironcondor::ExecutionMode::Realistic;
+        config.slippage = slippage; // the field under test — must be ignored
+        let Ok(feed) = ironcondor::ParquetFeed::open(&path, &ironcondor::ResourceLimits::default())
+        else {
+            panic!("the fixture opens");
+        };
+        let Ok(adapter) = ironcondor::OptStratAdapter::<IronCondor>::from_spec(
+            &common::iron_condor_spec(),
+            ExitPolicy::TimeSteps(1_000_000),
+        ) else {
+            panic!("the adapter builds");
+        };
+        let execution = RealisticFill::with_liquidity_profile(
+            config.fees,
+            config.marketable_cap_ticks,
+            config.seed,
+            config.liquidity_profile,
+        );
+        let Ok(run) = BacktestEngine::run(&config, feed, execution, adapter, "iron_condor") else {
+            panic!("the realistic run succeeds");
+        };
+        run
+    };
+
+    // No slippage vs a large fixed slippage — realistic mode must ignore both.
+    let none = run_with_slippage(SlippageModel::None);
+    let fixed = run_with_slippage(SlippageModel::FixedCents { cents: 500 });
+
+    assert_eq!(
+        none.equity_curve, fixed.equity_curve,
+        "realistic fills must be identical regardless of config.slippage"
+    );
+    assert_eq!(none.open_at_end, fixed.open_at_end);
+}

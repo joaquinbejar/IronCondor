@@ -1,0 +1,37 @@
+{
+  "data_source": {
+    "kind": "parquet",
+    "path": "chain/iron_condor.parquet",
+    "sha256": ""
+  },
+  "mode": "realistic",
+  "seed": 42,
+  "initial_capital": 10000000,
+  "fees": {
+    "per_contract_cents": 65,
+    "per_order_cents": 100
+  },
+  "slippage": {
+    "model": "none"
+  },
+  "marketable_cap_ticks": 10,
+  "liquidity_profile": {
+    "touch_size": {
+      "kind": "quoted_size"
+    },
+    "depth_levels": 5,
+    "decay": "0.5"
+  },
+  "limits": {
+    "max_steps": 100000,
+    "max_contracts_per_snapshot": 50000,
+    "max_total_bytes": 2147483648,
+    "max_file_bytes": 4294967296,
+    "max_decompressed_bytes": 8589934592,
+    "max_manifest_bytes": 16777216,
+    "max_string_len": 65536,
+    "max_rows_per_table": 100000000
+  },
+  "output_dir": "runs/out",
+  "overwrite": false
+}

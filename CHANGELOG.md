@@ -10,6 +10,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Queue position and market impact in realistic mode (`src/execution/realistic.rs`,
+  feature `orderbook`) — both **emergent** from routing through the seeded book,
+  not configured knobs. A marketable order larger than the touch walks the
+  seeded ladder, producing one `Fill` per level at progressively worse prices
+  (the realised price feeds `Fill.price`, the gap vs the fixed `decision_mid`
+  is `Fill.slippage`, positive = adverse); a resting strategy limit fills only
+  behind the seeded depth (price-time priority), so a thinly seeded strike
+  leaves a partial or zero fill — realistic mode can fill less than the full
+  intent. `SlippageModel` has no effect in realistic mode (tested); fees match
+  naive exactly. The `iron_condor_realistic` golden is committed alongside the
+  naive golden (equity curve + minimal metrics, same comparison oracle,
+  same-seed byte-identical), and is honestly worse than the naive golden by the
+  spread crossed on entry and exit (#24).
+
+### Fixed
+
+- Realistic-mode close routing: `ob_side` no longer double-flips the book side
+  on a `Close`. The strategy's `close_command` already flips a leg to its trade
+  side, so a buy-to-close of a short leg was being routed to the bid (a
+  favourable fill with a dishonest slippage sign). It now crosses the ask
+  (adverse), matching the naive interpretation of `intent.side` and the
+  sign-convention truth table — closes cross the spread adversely like opens
+  (#24).
+
 - Per-strike book seeding for realistic mode (`src/execution/liquidity.rs`,
   feature `orderbook`): each snapshot seeds every leaf book with a multi-level
   ladder — a touch level at the quoted bid/ask sized from the configured

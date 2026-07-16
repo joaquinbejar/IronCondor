@@ -1,0 +1,66 @@
+[
+  {
+    "step": 0,
+    "ts_ns": 1750291200000000000,
+    "cash_cents": 10227340,
+    "position_value_cents": -230000,
+    "equity_cents": 9997340,
+    "drawdown": -0.000266
+  },
+  {
+    "step": 1,
+    "ts_ns": 1750377600000000000,
+    "cash_cents": 10227340,
+    "position_value_cents": -230000,
+    "equity_cents": 9997340,
+    "drawdown": -0.000266
+  },
+  {
+    "step": 2,
+    "ts_ns": 1750464000000000000,
+    "cash_cents": 10227340,
+    "position_value_cents": -230000,
+    "equity_cents": 9997340,
+    "drawdown": -0.000266
+  },
+  {
+    "step": 3,
+    "ts_ns": 1750550400000000000,
+    "cash_cents": 10227340,
+    "position_value_cents": -230000,
+    "equity_cents": 9997340,
+    "drawdown": -0.000266
+  },
+  {
+    "step": 4,
+    "ts_ns": 1750636800000000000,
+    "cash_cents": 10227340,
+    "position_value_cents": -230000,
+    "equity_cents": 9997340,
+    "drawdown": -0.000266
+  },
+  {
+    "step": 5,
+    "ts_ns": 1750723200000000000,
+    "cash_cents": 10227340,
+    "position_value_cents": -230000,
+    "equity_cents": 9997340,
+    "drawdown": -0.000266
+  },
+  {
+    "step": 6,
+    "ts_ns": 1750809600000000000,
+    "cash_cents": 10227340,
+    "position_value_cents": -230000,
+    "equity_cents": 9997340,
+    "drawdown": -0.000266
+  },
+  {
+    "step": 7,
+    "ts_ns": 1750896000000000000,
+    "cash_cents": 9994680,
+    "position_value_cents": 0,
+    "equity_cents": 9994680,
+    "drawdown": -0.000532
+  }
+]
