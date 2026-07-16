@@ -82,14 +82,14 @@ use option_chain_orderbook::{OptionOrderBook, OrderId as ObOrderId, Side as ObSi
 use optionstratlib::{OptionStyle, Side};
 use optionstratlib_ob::OptionStyle as ObOptionStyle;
 
-use crate::config::FeeSchedule;
+use crate::config::{FeeSchedule, LiquidityProfile};
 use crate::domain::{
     ChainSnapshot, ContractKey, ExecutionMode, Fill, OrderCommand, OrderIntent, PositionAction,
     PriceCents, Quantity, QuoteView, TimeInForce,
 };
 use crate::error::BacktestError;
 
-use super::{ExecutionModel, FeeCharge, FillDraft, assemble_fill};
+use super::{ExecutionModel, FeeCharge, FillDraft, assemble_fill, liquidity};
 
 /// The first strategy `OrderId`. Strategy ids occupy the low range
 /// `[STRATEGY_ID_BASE, MAKER_ID_BASE)`; a handle at or above [`MAKER_ID_BASE`]
@@ -106,22 +106,33 @@ pub(crate) const MAKER_ID_BASE: u64 = 1 << 48;
 /// [`OptionOrderBook`]s and reads fills back as the shared [`Fill`].
 ///
 /// Holds the two config values it needs ([`FeeSchedule`], the marketable price
-/// cap), the run `seed` (#023's liquidity RNG anchor, and the reproducibility
-/// anchor), two **disjoint** seeded `OrderId` counters, and a `BTreeMap` of
-/// leaf books keyed by [`ContractKey`] (deterministic iteration; #023 seeds
-/// these). It does **not** derive `Clone`/`PartialEq`: an [`OptionOrderBook`]
-/// carries live matching state that must not be duplicated.
+/// cap), the run `seed` (the reproducibility anchor), two **disjoint** seeded
+/// `OrderId` counters, and a `BTreeMap` of leaf books keyed by [`ContractKey`]
+/// (deterministic iteration; #023 seeds these). It does **not** derive
+/// `Clone`/`PartialEq`: an [`OptionOrderBook`] carries live matching state that
+/// must not be duplicated.
 pub struct RealisticFill {
     /// The fee schedule stamped onto each fill.
     fees: FeeSchedule,
     /// Marketable price cap in ticks off the touch (`config.marketable_cap_ticks`).
     marketable_cap_ticks: u32,
-    /// The run seed — reproducibility anchor and #023's liquidity-RNG seed.
+    /// The run seed — the reproducibility anchor. #023's ladder seeding is a
+    /// pure function of the profile, quotes, and tick and draws no RNG; the
+    /// seed is retained for any later seeded-RNG liquidity model.
     seed: u64,
     /// Next strategy `OrderId` (low, disjoint range).
     next_strategy_id: u64,
     /// Next seeded-maker `OrderId` (high, disjoint range).
     next_maker_id: u64,
+    /// The per-strike book-seeding profile (#023). `None` is the **raw
+    /// adapter** — no auto-seeding, books are hand-built via
+    /// [`Self::seed_maker_limit`]; `Some` auto-seeds from the first snapshot
+    /// [`Self::fill`] sees. The config-driven engine path always supplies
+    /// `Some(config.liquidity_profile)` (reproducible from the manifest).
+    liquidity_profile: Option<LiquidityProfile>,
+    /// Whether the initial book seeding has run. Seeding happens once, on the
+    /// first `fill` snapshot (#023); the between-snapshot refresh is #025.
+    seeded: bool,
     /// Per-contract leaf books, in stable key order (never a `HashMap`).
     books: BTreeMap<ContractKey, OptionOrderBook>,
 }
@@ -136,17 +147,24 @@ impl std::fmt::Debug for RealisticFill {
             .field("seed", &self.seed)
             .field("next_strategy_id", &self.next_strategy_id)
             .field("next_maker_id", &self.next_maker_id)
+            .field("liquidity_profile", &self.liquidity_profile)
+            .field("seeded", &self.seeded)
             .field("books", &self.books.len())
             .finish()
     }
 }
 
 impl RealisticFill {
-    /// Build a realistic fill model from the config values it needs.
+    /// Build a **raw-adapter** realistic fill model — no automatic book
+    /// seeding.
     ///
     /// The seeded `OrderId` counters start at their disjoint range bases; the
-    /// leaf-book map starts empty (#023 seeds it). `marketable_cap_ticks` must
-    /// be `> 0` — [`crate::config::BacktestConfig::validate`] guarantees it.
+    /// leaf-book map starts empty. With no [`LiquidityProfile`], [`Self::fill`]
+    /// routes against whatever depth the caller hand-builds via
+    /// [`Self::seed_maker_limit`] — the constructor tests and the raw #022
+    /// adapter path use. For the config-driven, snapshot-seeded model use
+    /// [`Self::with_liquidity_profile`]. `marketable_cap_ticks` must be `> 0` —
+    /// [`crate::config::BacktestConfig::validate`] guarantees it.
     #[must_use = "the constructed fill model must be used to produce fills"]
     pub fn new(fees: FeeSchedule, marketable_cap_ticks: u32, seed: u64) -> Self {
         Self {
@@ -155,12 +173,43 @@ impl RealisticFill {
             seed,
             next_strategy_id: STRATEGY_ID_BASE,
             next_maker_id: MAKER_ID_BASE,
+            liquidity_profile: None,
+            seeded: false,
             books: BTreeMap::new(),
         }
     }
 
-    /// The run seed — #023's liquidity-RNG anchor and the reproducibility
-    /// anchor for the seeded book.
+    /// Build a realistic fill model that **auto-seeds** each strike's book from
+    /// the first snapshot per `profile` (#023).
+    ///
+    /// Identical to [`Self::new`] but carries the [`LiquidityProfile`] the
+    /// engine reads from `config.liquidity_profile`, so [`Self::fill`] seeds the
+    /// per-strike ladders (touch + `L` deeper levels, geometric decay) **before**
+    /// routing the step's commands — a strategy order then queues behind the
+    /// seeded depth at its entry step ([docs/04 §6](../../../docs/04-execution-models.md)).
+    /// The profile is recorded in the run config, so the seeded book is
+    /// reproducible from the manifest.
+    #[must_use = "the constructed fill model must be used to produce fills"]
+    pub fn with_liquidity_profile(
+        fees: FeeSchedule,
+        marketable_cap_ticks: u32,
+        seed: u64,
+        profile: LiquidityProfile,
+    ) -> Self {
+        Self {
+            fees,
+            marketable_cap_ticks,
+            seed,
+            next_strategy_id: STRATEGY_ID_BASE,
+            next_maker_id: MAKER_ID_BASE,
+            liquidity_profile: Some(profile),
+            seeded: false,
+            books: BTreeMap::new(),
+        }
+    }
+
+    /// The run seed — the reproducibility anchor. #023's ladder seeding draws
+    /// no RNG; the seed is retained for a later seeded-RNG liquidity model.
     #[must_use]
     pub const fn seed(&self) -> u64 {
         self.seed
@@ -254,6 +303,31 @@ impl RealisticFill {
         let id = self.next_maker_order_id()?;
         let book = self.leaf_book(contract)?;
         book.add_limit_order(id, side, price_ticks, qty)?;
+        Ok(())
+    }
+
+    /// Seed each strike's book from `snap` the first time `fill` sees a
+    /// snapshot, when a [`LiquidityProfile`] is configured (#023).
+    ///
+    /// A no-op for the raw adapter (`liquidity_profile = None`) and on every
+    /// step after the first — the between-snapshot refresh is #025. The ladder
+    /// is a deterministic function of `(profile, quotes, tick)`; no RNG is
+    /// drawn, so the run `seed` is not consumed here.
+    ///
+    /// # Errors
+    ///
+    /// Propagates every [`liquidity::seed_book`] error (a mis-aligned quote,
+    /// an unresolved expiration, a maker-id exhaustion, or a book rejection).
+    fn seed_initial_books(&mut self, snap: &ChainSnapshot) -> Result<(), BacktestError> {
+        if self.seeded {
+            return Ok(());
+        }
+        // `LiquidityProfile` is `Copy`, so this reads the profile out by value
+        // — no borrow that would conflict with `&mut self` inside `seed_book`.
+        if let Some(profile) = self.liquidity_profile {
+            liquidity::seed_book(self, snap, &profile)?;
+        }
+        self.seeded = true;
         Ok(())
     }
 
@@ -389,6 +463,11 @@ impl ExecutionModel for RealisticFill {
         snap: &ChainSnapshot,
         out_fills: &mut Vec<Fill>,
     ) -> Result<(), BacktestError> {
+        // #023 initial seeding: on the first snapshot `fill` sees, seed each
+        // strike's ladder BEFORE routing commands, so a strategy order queues
+        // behind the seeded depth at its entry step. The between-snapshot
+        // refresh (cancel + reseed each step) is #025.
+        self.seed_initial_books(snap)?;
         for command in commands {
             match command {
                 OrderCommand::Submit(intent) => self.fill_submit(intent, snap, out_fills)?,
@@ -535,7 +614,7 @@ mod tests {
         MAKER_ID_BASE, RealisticFill, cents_to_ticks, marketable_limit_cents, ob_side,
         ticks_to_cents,
     };
-    use crate::config::FeeSchedule;
+    use crate::config::{FeeSchedule, LiquidityProfile, TouchSize};
     use crate::domain::{
         ChainSnapshot, ContractKey, ExecutionMode, Fill, InstrumentSpec, OrderCommand, OrderIntent,
         PositionAction, PositionId, PriceCents, Quantity, QuoteView, SimTime, StepIndex,
@@ -828,6 +907,103 @@ mod tests {
         assert!(matches!(result, Ok(())));
         assert_eq!(out.len(), 2, "only two levels within the cap fill");
         assert!(out.iter().all(|f| f.price.value() <= 505));
+    }
+
+    // --- #023 auto-seeding wiring --------------------------------------------
+
+    fn profile(
+        touch: TouchSize,
+        depth_levels: u32,
+        decay: rust_decimal::Decimal,
+    ) -> LiquidityProfile {
+        LiquidityProfile {
+            touch_size: touch,
+            depth_levels,
+            decay,
+        }
+    }
+
+    /// `with_liquidity_profile` seeds the ask ladder from the snapshot BEFORE
+    /// routing, so a marketable buy walks the auto-seeded depth (no hand-seed).
+    #[test]
+    fn test_with_liquidity_profile_auto_seeds_ask_ladder_before_routing() {
+        // QuotedSize, L=2, r=0.5, ask_size 10 → ask ladder 10@500, 5@505, 2@510.
+        let mut model = RealisticFill::with_liquidity_profile(
+            fees(),
+            10,
+            7,
+            profile(TouchSize::QuotedSize, 2, dec!(0.5)),
+        );
+        let mut out: Vec<Fill> = Vec::new();
+        // marketable buy for 12 walks 10@500 then 2@505 (cap 10 reaches 510).
+        let result = model.fill(
+            &[marketable(Side::Long, PositionAction::Open, 12, 500)],
+            &snapshot(490, 500),
+            &mut out,
+        );
+        assert!(matches!(result, Ok(())));
+        assert_eq!(out.len(), 2, "the buy walks two auto-seeded ask levels");
+        let (Some(first), Some(second)) = (out.first(), out.get(1)) else {
+            panic!("two fills expected");
+        };
+        assert_eq!((first.price.value(), first.quantity.value()), (500, 10));
+        assert_eq!((second.price.value(), second.quantity.value()), (505, 2));
+    }
+
+    /// The raw-adapter constructor (`new`) never auto-seeds: a marketable buy
+    /// into an unseeded book fills nothing.
+    #[test]
+    fn test_new_raw_adapter_does_not_auto_seed() {
+        let mut model = RealisticFill::new(fees(), 10, 7);
+        let mut out: Vec<Fill> = Vec::new();
+        let result = model.fill(
+            &[marketable(Side::Long, PositionAction::Open, 5, 500)],
+            &snapshot(490, 500),
+            &mut out,
+        );
+        assert!(matches!(result, Ok(())));
+        assert!(out.is_empty(), "no seeded depth ⇒ nothing to fill");
+    }
+
+    /// Auto-seeding draws its ids from the seeded-maker range, leaving the
+    /// strategy range untouched — the #022 disjointness holds through seeding.
+    #[test]
+    fn test_auto_seed_consumes_only_maker_ids() {
+        let mut model = RealisticFill::with_liquidity_profile(
+            fees(),
+            10,
+            7,
+            profile(TouchSize::QuotedSize, 2, dec!(0.5)),
+        );
+        let mut out: Vec<Fill> = Vec::new();
+        // A passive (non-crossing) buy limit: seeding runs, no strategy fill,
+        // and the strategy id counter advances by exactly one submit.
+        let submit = OrderCommand::Submit(OrderIntent {
+            contract: contract(),
+            action: PositionAction::Open,
+            side: Side::Long,
+            quantity: qty(1),
+            limit: Some(PriceCents::new(400)), // well below ask, rests, no cross
+            tif: TimeInForce::Gtc,
+            decision_mid: PriceCents::new(495),
+        });
+        let result = model.fill(&[submit], &snapshot(490, 500), &mut out);
+        assert!(matches!(result, Ok(())));
+        // Next maker id is in the high range (seeding consumed several);
+        // next strategy id is in the low range and advanced past the base.
+        let (Ok(next_maker), Ok(next_strategy)) =
+            (model.next_maker_order_id(), model.next_strategy_order_id())
+        else {
+            panic!("both id ranges must still mint");
+        };
+        assert!(
+            seq(next_maker) > MAKER_ID_BASE,
+            "maker ids were consumed by seeding"
+        );
+        assert!(
+            seq(next_strategy) < MAKER_ID_BASE,
+            "strategy ids stay in the low range"
+        );
     }
 
     // --- resting limit that does not cross yields no fill --------------------

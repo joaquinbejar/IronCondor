@@ -190,6 +190,7 @@ pub fn condor_config(path: &Path, seed: u64) -> BacktestConfig {
         },
         slippage: SlippageModel::None,
         marketable_cap_ticks: 10,
+        liquidity_profile: ironcondor::LiquidityProfile::default(),
         limits: ResourceLimits::default(),
         output_dir: "runs/out".into(),
         overwrite: false,

@@ -85,7 +85,9 @@ pub mod execution;
 pub mod python;
 pub mod run;
 
-pub use config::{BacktestConfig, FeeSchedule, ResourceLimits, SlippageModel};
+pub use config::{
+    BacktestConfig, FeeSchedule, LiquidityProfile, ResourceLimits, SlippageModel, TouchSize,
+};
 pub use data::{
     DataFeed, DataSourceSpec, FeedKind, ParquetFeed, RawQuote, SnapshotMeta, TapeMeta,
     feed_catalogue, raw_quotes_to_snapshot, snapshot_to_option_chain,
