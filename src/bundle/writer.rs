@@ -27,9 +27,27 @@
 //! In the same environment two identical runs produce **byte-identical** Parquet
 //! tables and a manifest byte-identical **after stripping `created_utc`**:
 //!
-//! - Every table is written in its fixed sort order (`fills` by
-//!   `(step, order_id, fill_seq)`, `positions` by `(step, position_id)`, the two
-//!   per-step tables by `step`) — no `HashMap` iteration reaches a row.
+//! - Every table is written in its fixed sort order via the **pinned sort-key
+//!   helpers** ([`fill_sort_key`] `(step, order_id, fill_seq)`,
+//!   [`position_sort_key`] `(step, position_id)`, [`equity_sort_key`] /
+//!   [`greeks_sort_key`] by `step`) — the **single** source of each table's
+//!   order, shared with the reader — and no `HashMap` iteration reaches a row.
+//!
+//! # Write = encode-time build of the wire rows (the #35 orphan reconciled, #36)
+//!
+//! The engine collects the in-loop write carriers ([`FillRecord`] /
+//! [`PositionSnapshot`], carrying an [`Arc<str>`](std::sync::Arc)-interned
+//! `ContractKey` so a per-step push stays heap-allocation-free inside the PB-1
+//! zero-alloc boundary). The writer, being **termination-phase** and free to
+//! allocate, **builds the flat wire rows** ([`FillRow`] / [`PositionRow`], the
+//! reader's decode target) from those carriers at encode time — deriving the
+//! wire `contract_id`, stamping `strategy_run_id`, and mapping the `Side` /
+//! `OptionStyle` / `ExecutionMode` enums to their wire strings **once**, in the
+//! row builder — then sorts them through the pinned [`fill_sort_key`] /
+//! [`position_sort_key`] helpers. This unifies the wire-row representation
+//! (write = encode-time build, read = decode target) and removes the previous
+//! duplication where the sort order lived inline in the writer and again in the
+//! reader; the produced Parquet bytes are unchanged.
 //! - Parquet is written with a **pinned codec** ([`Compression::SNAPPY`]) and a
 //!   **pinned `created_by`** string, so the file bytes do not vary with the
 //!   `parquet` crate version or a per-run timestamp.
@@ -79,10 +97,13 @@ use sha2::{Digest, Sha256};
 
 use crate::analytics::metrics::Metrics;
 use crate::bundle::schema::{
-    BUNDLE_SCHEMA, Manifest, RowCounts, RunId, equity_sort_key, greeks_sort_key,
+    BUNDLE_SCHEMA, Manifest, RowCounts, RunId, equity_sort_key, fill_sort_key, greeks_sort_key,
+    position_sort_key,
 };
 use crate::config::BacktestConfig;
-use crate::domain::{EquityPoint, ExecutionMode, GreeksAttributionRow, StrategySpec};
+use crate::domain::{
+    EquityPoint, ExecutionMode, FillRow, GreeksAttributionRow, PositionRow, StrategySpec,
+};
 use crate::engine::{BacktestRun, FillRecord, PositionSnapshot};
 use crate::error::BacktestError;
 
@@ -291,13 +312,18 @@ fn encode_fills(run: &BacktestRun, run_id: &str, path: &Path) -> Result<u64, Bac
         Field::new("mode", DataType::Utf8, false),
     ]));
 
-    // Sort by FILLS_SORT_COLUMNS = (step, order_id, fill_seq), the unique key.
-    let mut order: Vec<&FillRecord> = run.fills.iter().collect();
-    order.sort_by_key(|record| (record.fill.step.value(), record.order_id, record.fill_seq));
-    let count = row_count(order.len())?;
+    // Build the flat wire rows from the collector records at encode time, then
+    // sort by the pinned FILLS_SORT_COLUMNS = (step, order_id, fill_seq) unique
+    // key via `fill_sort_key` — the single source of the table's order.
+    let mut rows: Vec<FillRow> = Vec::with_capacity(run.fills.len());
+    for record in &run.fills {
+        rows.push(fill_row(record, run_id)?);
+    }
+    rows.sort_by_key(fill_sort_key);
+    let count = row_count(rows.len())?;
 
     let mut writer = open_writer(&schema, path)?;
-    for chunk in order.chunks(WRITE_BATCH_ROWS) {
+    for chunk in rows.chunks(WRITE_BATCH_ROWS) {
         let n = chunk.len();
         let (mut step, mut ts) = (Vec::with_capacity(n), Vec::with_capacity(n));
         let mut run_ids = Vec::with_capacity(n);
@@ -324,26 +350,25 @@ fn encode_fills(run: &BacktestRun, run_id: &str, path: &Path) -> Result<u64, Bac
             Vec::with_capacity(n),
             Vec::with_capacity(n),
         );
-        for record in chunk {
-            let fill = &record.fill;
-            step.push(i32_from_u32(fill.step.value())?);
-            ts.push(fill.ts.value());
-            run_ids.push(run_id);
-            trade.push(i64_from_u64(record.trade_id)?);
-            position.push(i64_from_u64(record.position_id)?);
-            order_ids.push(i64_from_u64(record.order_id)?);
-            fill_seq.push(i32_from_u32(record.fill_seq)?);
-            underlying.push(fill.contract.underlying.as_str());
-            expiration.push(fill.contract.expiration_ns()?);
-            contract.push(fill.contract.to_contract_id()?);
-            strike.push(i64_from_u64(fill.contract.strike.value())?);
-            style.push(style_str(fill.contract.style));
-            side.push(side_str(fill.side));
-            quantity.push(i32_from_u32(fill.quantity.value())?);
-            price.push(i64_from_u64(fill.price.value())?);
-            fees.push(fill.fees.value());
-            slippage.push(fill.slippage.value());
-            mode.push(mode_str(fill.mode));
+        for row in chunk {
+            step.push(i32_from_u32(row.step)?);
+            ts.push(row.ts_ns);
+            run_ids.push(row.strategy_run_id.as_str());
+            trade.push(i64_from_u64(row.trade_id)?);
+            position.push(i64_from_u64(row.position_id)?);
+            order_ids.push(i64_from_u64(row.order_id)?);
+            fill_seq.push(i32_from_u32(row.fill_seq)?);
+            underlying.push(row.underlying.as_str());
+            expiration.push(row.expiration_ns);
+            contract.push(row.contract_id.as_str());
+            strike.push(i64_from_u64(row.strike_cents)?);
+            style.push(row.style.as_str());
+            side.push(row.side.as_str());
+            quantity.push(i32_from_u32(row.quantity)?);
+            price.push(i64_from_u64(row.price_cents)?);
+            fees.push(row.fees_cents);
+            slippage.push(row.slippage_cents);
+            mode.push(row.mode.as_str());
         }
         let columns: Vec<ArrayRef> = vec![
             Arc::new(Int32Array::from(step)) as ArrayRef,
@@ -440,13 +465,18 @@ fn encode_positions(run: &BacktestRun, path: &Path) -> Result<u64, BacktestError
         Field::new("open_at_end", DataType::Boolean, false),
     ]));
 
-    // Sort by POSITIONS_SORT_COLUMNS = (step, position_id), ≤ 1 row per step.
-    let mut order: Vec<&PositionSnapshot> = run.positions.iter().collect();
-    order.sort_by_key(|row| (row.step, row.position_id));
-    let count = row_count(order.len())?;
+    // Build the flat wire rows from the collector snapshots at encode time, then
+    // sort by the pinned POSITIONS_SORT_COLUMNS = (step, position_id) key via
+    // `position_sort_key` — the single source of the table's order (≤ 1 row/step).
+    let mut rows: Vec<PositionRow> = Vec::with_capacity(run.positions.len());
+    for snapshot in &run.positions {
+        rows.push(position_row(snapshot)?);
+    }
+    rows.sort_by_key(position_sort_key);
+    let count = row_count(rows.len())?;
 
     let mut writer = open_writer(&schema, path)?;
-    for chunk in order.chunks(WRITE_BATCH_ROWS) {
+    for chunk in rows.chunks(WRITE_BATCH_ROWS) {
         let n = chunk.len();
         let (mut step, mut ts, mut position, mut trade, mut contract) = (
             Vec::with_capacity(n),
@@ -472,14 +502,14 @@ fn encode_positions(run: &BacktestRun, path: &Path) -> Result<u64, BacktestError
             ts.push(row.ts_ns);
             position.push(i64_from_u64(row.position_id)?);
             trade.push(i64_from_u64(row.trade_id)?);
-            contract.push(row.contract.to_contract_id()?);
-            side.push(side_str(row.side));
+            contract.push(row.contract_id.as_str());
+            side.push(row.side.as_str());
             quantity.push(i32_from_u32(row.quantity)?);
             avg_price.push(i64_from_u64(row.avg_price_cents)?);
             mark.push(i64_from_u64(row.mark_cents)?);
             unrealized.push(row.unrealized_cents);
             stale.push(row.stale_mark);
-            exit_reason.push(row.exit_reason.as_ref().map(exit_reason_str));
+            exit_reason.push(row.exit_reason.clone());
             open_at_end.push(row.open_at_end);
         }
         let columns: Vec<ArrayRef> = vec![
@@ -560,6 +590,72 @@ fn encode_greeks(run: &BacktestRun, path: &Path) -> Result<u64, BacktestError> {
     }
     close_writer(writer)?;
     Ok(count)
+}
+
+// ---------------------------------------------------------------------------
+// Encode-time wire-row builders (collector carrier -> flat wire row)
+// ---------------------------------------------------------------------------
+
+/// Build one `fills.parquet` wire row ([`FillRow`]) from an in-loop
+/// [`FillRecord`] carrier: stamp `strategy_run_id`, derive the wire
+/// `contract_id` / `expiration_ns` from the [`crate::domain::ContractKey`], and
+/// map the `Side` / `OptionStyle` / `ExecutionMode` enums to their wire strings.
+/// Termination-phase, free to allocate.
+///
+/// # Errors
+///
+/// [`BacktestError::Conversion`] if the fill's contract cannot resolve its
+/// absolute expiration or its canonical `contract_id` (e.g. an unresolved
+/// `Days` expiration).
+fn fill_row(record: &FillRecord, run_id: &str) -> Result<FillRow, BacktestError> {
+    let fill = &record.fill;
+    Ok(FillRow {
+        step: fill.step.value(),
+        ts_ns: fill.ts.value(),
+        strategy_run_id: run_id.to_string(),
+        trade_id: record.trade_id,
+        position_id: record.position_id,
+        order_id: record.order_id,
+        fill_seq: record.fill_seq,
+        underlying: fill.contract.underlying.as_str().to_string(),
+        expiration_ns: fill.contract.expiration_ns()?,
+        contract_id: fill.contract.to_contract_id()?,
+        strike_cents: fill.contract.strike.value(),
+        style: style_str(fill.contract.style).to_string(),
+        side: side_str(fill.side).to_string(),
+        quantity: fill.quantity.value(),
+        price_cents: fill.price.value(),
+        fees_cents: fill.fees.value(),
+        slippage_cents: fill.slippage.value(),
+        mode: mode_str(fill.mode).to_string(),
+    })
+}
+
+/// Build one `positions.parquet` wire row ([`PositionRow`]) from an in-loop
+/// [`PositionSnapshot`] carrier: derive the wire `contract_id`, map the leg
+/// `Side` and the applied [`ExitReason`] to their wire strings (`exit_reason`
+/// the only nullable column). Termination-phase, free to allocate.
+///
+/// # Errors
+///
+/// [`BacktestError::Conversion`] if the leg's contract cannot resolve its
+/// canonical `contract_id`.
+fn position_row(snapshot: &PositionSnapshot) -> Result<PositionRow, BacktestError> {
+    Ok(PositionRow {
+        step: snapshot.step,
+        ts_ns: snapshot.ts_ns,
+        position_id: snapshot.position_id,
+        trade_id: snapshot.trade_id,
+        contract_id: snapshot.contract.to_contract_id()?,
+        side: side_str(snapshot.side).to_string(),
+        quantity: snapshot.quantity,
+        avg_price_cents: snapshot.avg_price_cents,
+        mark_cents: snapshot.mark_cents,
+        unrealized_cents: snapshot.unrealized_cents,
+        stale_mark: snapshot.stale_mark,
+        exit_reason: snapshot.exit_reason.as_ref().map(exit_reason_str),
+        open_at_end: snapshot.open_at_end,
+    })
 }
 
 // ---------------------------------------------------------------------------

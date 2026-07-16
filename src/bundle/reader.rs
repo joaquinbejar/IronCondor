@@ -56,13 +56,14 @@
 //!   [`GreeksAttributionRow`] ([`crate::domain::result`]) are the flat,
 //!   `serde`-able read / validate / serialize targets. The **reader** decodes
 //!   Parquet **into** these, so they (and the [`fill_sort_key`] /
-//!   [`position_sort_key`] extractors, previously unused by the inline-sorting
-//!   writer) become the reader's canonical decode-and-sort target.
+//!   [`position_sort_key`] extractors) are the reader's canonical
+//!   decode-and-sort target.
 //!
-//! The writer still sorts each table inline rather than through the
-//! `*_sort_key` helpers; unifying that write-side duplication is a small
-//! follow-up for a future writer touch (tracked with #36), **out of #35 scope**
-//! — this reader does not refactor the writer.
+//! Since #36 the **writer also sorts through the `*_sort_key` helpers** — it
+//! builds the [`FillRow`] / [`PositionRow`] wire rows at encode time and sorts
+//! them by [`fill_sort_key`] / [`position_sort_key`], so the pinned per-table
+//! order lives in exactly one place, shared by write and read; the #35
+//! write-side sort duplication is fully reconciled.
 //!
 //! # Resource ceilings (each checked before an allocation is sized)
 //!
@@ -140,7 +141,8 @@ pub struct ValidatedManifest {
     pub run_id: String,
     /// The RFC 3339 wall-clock provenance field (never read back by the engine).
     pub created_utc: String,
-    /// The `ironcondor` crate version + git short sha (build identity).
+    /// The `ironcondor` crate version (`CARGO_PKG_VERSION`, build identity — no
+    /// per-commit git sha, so the `run_id` is stable across commits).
     pub code_version: String,
     /// The sha256 of `Cargo.lock` at build (build identity).
     pub lockfile_sha256: String,
