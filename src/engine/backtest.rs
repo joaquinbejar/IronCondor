@@ -59,7 +59,7 @@ use crate::config::BacktestConfig;
 use crate::data::{DataFeed, DataSourceSpec};
 use crate::domain::{
     Cents, ChainSnapshot, EquityPoint, Fill, GreeksAttributionRow, OpenPosition, OrderCommand,
-    OrderId, OrderIntent, PositionAction, PositionId, Quantity, TradeId,
+    OrderId, OrderIntent, PositionAction, PositionId, PriceCents, Quantity, TradeId,
 };
 use crate::engine::bundle_collector::{BundleCollector, FillRecord, PositionSnapshot};
 use crate::engine::clock::SimClock;
@@ -68,7 +68,7 @@ use crate::engine::strategy::{ChainContext, Strategy};
 use crate::engine::substrate::{AttributionCollector, AttributionSubstrate};
 use crate::engine::tradelog::{ClosedTrade, TradeLogCollector};
 use crate::error::BacktestError;
-use crate::execution::ExecutionModel;
+use crate::execution::{ExecutionModel, FillGroup};
 
 /// Seeded, deterministic monotonic id counters.
 ///
@@ -425,6 +425,7 @@ impl<S: Strategy, X: ExecutionModel> RunState<S, X> {
         }
         fills.clear();
         execution.fill(cmds.as_slice(), snapshot, fills)?;
+        let groups = execution.fill_groups();
         // Startup emits opening intents only, so no close reason is consulted;
         // the ranges make every `Close` (were one ever emitted) a ManualClose.
         let reasons = CloseReasons {
@@ -435,6 +436,7 @@ impl<S: Strategy, X: ExecutionModel> RunState<S, X> {
         apply_step_fills(
             cmds.as_slice(),
             fills.as_slice(),
+            groups,
             snapshot,
             inventory,
             ids,
@@ -529,6 +531,11 @@ impl<S: Strategy, X: ExecutionModel> RunState<S, X> {
         // e. the single execution phase (naive = e2 only; realistic e1 is v0.2).
         fills.clear();
         execution.fill(cmds.as_slice(), snapshot, fills)?;
+        // The fill→order grouping for this call (empty ⇒ single-shot 1:1, naive;
+        // non-empty ⇒ one group per filling `Submit`, realistic). Borrows
+        // `execution` immutably, disjoint from the inventory/ledger/bundle borrows
+        // `apply_step_fills` takes.
+        let groups = execution.fill_groups();
 
         // Mint ids + update the inventory + move cash (close validation lives in
         // apply_step_fills, which fails an unknown/oversized close as Execution),
@@ -536,6 +543,7 @@ impl<S: Strategy, X: ExecutionModel> RunState<S, X> {
         apply_step_fills(
             cmds.as_slice(),
             fills.as_slice(),
+            groups,
             snapshot,
             inventory,
             ids,
@@ -624,40 +632,165 @@ impl CloseReasons {
     }
 }
 
+/// The quantity-weighted aggregate of one order's fills — the reference an
+/// [`OpenPosition`] / [`ClosedTrade`] carries when a single order fills across
+/// several price levels.
+///
+/// Cash itself moves **exactly**, per fill, through [`Ledger::apply_fill`]; this
+/// aggregate is the leg-level reference (its entry/exit premium is the VWAP, its
+/// `quantity` the total filled, its `fees` / `slippage` the sums), so a
+/// single-shot fill (`n = 1`) degenerates to that one fill's own values.
+struct FillAggregate {
+    /// Total contracts filled across the order's levels.
+    quantity: Quantity,
+    /// Quantity-weighted average price (VWAP), integer cents, **half-to-even**
+    /// rounded — the repo's single money-rounding policy.
+    vwap: PriceCents,
+    /// Sum of the levels' fees (each `≥ 0`), integer cents.
+    fees: Cents,
+    /// Sum of the levels' signed slippage, integer cents.
+    slippage: Cents,
+}
+
+/// Aggregate an order's contiguous run of level fills into a [`FillAggregate`].
+///
+/// # Errors
+///
+/// [`BacktestError::ArithmeticOverflow`] on quantity / notional / fee / slippage
+/// overflow, or an empty run (`fills` is guaranteed non-empty by the caller).
+fn aggregate_fills(fills: &[Fill]) -> Result<FillAggregate, BacktestError> {
+    let mut total_qty: u64 = 0;
+    let mut notional: u128 = 0;
+    let mut total_fees: i64 = 0;
+    let mut total_slippage: i64 = 0;
+    for fill in fills {
+        let q = u64::from(fill.quantity.value());
+        total_qty = total_qty
+            .checked_add(q)
+            .ok_or(BacktestError::ArithmeticOverflow)?;
+        let leg_notional = u128::from(fill.price.value())
+            .checked_mul(u128::from(q))
+            .ok_or(BacktestError::ArithmeticOverflow)?;
+        notional = notional
+            .checked_add(leg_notional)
+            .ok_or(BacktestError::ArithmeticOverflow)?;
+        total_fees = total_fees
+            .checked_add(fill.fees.value())
+            .ok_or(BacktestError::ArithmeticOverflow)?;
+        total_slippage = total_slippage
+            .checked_add(fill.slippage.value())
+            .ok_or(BacktestError::ArithmeticOverflow)?;
+    }
+    let quantity =
+        Quantity::new(u32::try_from(total_qty).map_err(|_| BacktestError::ArithmeticOverflow)?)?;
+    let vwap = vwap_cents(notional, total_qty)?;
+    Ok(FillAggregate {
+        quantity,
+        vwap,
+        fees: Cents::new(total_fees),
+        slippage: Cents::new(total_slippage),
+    })
+}
+
+/// The volume-weighted average price `notional / total_qty` in integer cents,
+/// **half-to-even** rounded (the repo's single money-rounding policy). Exact for
+/// a single-shot order (`notional = price × qty`, so it recovers `price`).
+///
+/// # Rounding policy (must agree with `PriceCents::from_decimal_dollars`)
+///
+/// This is a **second** encoding of the repo's one money-rounding policy:
+/// `PriceCents::from_decimal_dollars` rounds `Decimal` amounts half-to-even (and
+/// the liquidity seeder does the same via `round_dp_with_strategy(0,
+/// MidpointNearestEven)`). Here the division stays in `u128` — no `Decimal`, no
+/// `f64` — so the tie rule is implemented directly (`2·remainder` vs the
+/// divisor, ties to the even quotient). The two implementations **must produce
+/// the same cents for the same mathematical value**; the half-to-even tie
+/// branch is locked to the policy by
+/// [`tests::test_vwap_cents_half_to_even_ties_match_money_policy`].
+///
+/// # Errors
+///
+/// [`BacktestError::Execution`] if `total_qty` is zero (an empty order — never
+/// reached, the caller aggregates `≥ 1` fills each of quantity `> 0`);
+/// [`BacktestError::ArithmeticOverflow`] on the rounding arithmetic.
+#[must_use = "the computed VWAP is the leg's reference entry/exit premium"]
+fn vwap_cents(notional: u128, total_qty: u64) -> Result<PriceCents, BacktestError> {
+    if total_qty == 0 {
+        return Err(BacktestError::Execution(
+            "cannot average a zero-quantity order".to_string(),
+        ));
+    }
+    let divisor = u128::from(total_qty);
+    let quotient = notional / divisor;
+    let remainder = notional % divisor;
+    // Half-to-even: compare 2·remainder to the divisor.
+    let twice_rem = remainder
+        .checked_mul(2)
+        .ok_or(BacktestError::ArithmeticOverflow)?;
+    let rounded = if twice_rem < divisor {
+        quotient
+    } else if twice_rem > divisor {
+        quotient
+            .checked_add(1)
+            .ok_or(BacktestError::ArithmeticOverflow)?
+    } else if quotient.is_multiple_of(2) {
+        // Exactly halfway → round to the even neighbour.
+        quotient
+    } else {
+        quotient
+            .checked_add(1)
+            .ok_or(BacktestError::ArithmeticOverflow)?
+    };
+    let cents = u64::try_from(rounded).map_err(|_| BacktestError::ArithmeticOverflow)?;
+    Ok(PriceCents::new(cents))
+}
+
 /// Correlate the step's fills back to its commands to mint lifecycle ids,
 /// update the position inventory, move the ledger cash, and record the per-leg
 /// trade log on opens and closes.
 ///
-/// Naive mode fills every `Submit` single-shot and in submission order, and
-/// produces no fill for a `Cancel` / `Replace`, so the fills line up with the
-/// `Submit`s one-to-one. Each `Submit` mints one [`OrderId`]; a group of `Open`s
-/// in one step shares one freshly minted [`TradeId`]; each `Open` mints a
-/// [`PositionId`], pushes an inventory leg, and records the leg's open in the
-/// trade log; each `Close` reduces (partial) or removes (full) its leg after
-/// validating the quantity, and records a realised [`ClosedTrade`] with the
-/// phase's [`ExitReason`]. Cash moves through the ledger for every fill.
+/// # The fill→order grouping
 ///
-/// Each `Submit` mints one `OrderId`; the fill it correlates to is captured
-/// together with its `trade_id` / `position_id` / `order_id` into the bundle fill
-/// stream (`FillRecord`, #34) — the `Fill` alone carries no ids. A full close
-/// also pushes the leg's terminal `positions.parquet` row (the beginning-of-step
-/// mark, the closing step's snapshot mid).
+/// Each `Submit` mints one [`OrderId`] and owns a contiguous run of one or more
+/// fills. `groups` (the [`ExecutionModel::fill_groups`] channel, [`FillGroup`])
+/// says how many fills each `Submit` produced: an **empty** `groups` is the
+/// single-shot 1:1 contract (naive mode — exactly one fill per `Submit`, in
+/// submission order); a **non-empty** `groups` maps each filling `Submit` to its
+/// level count (realistic mode — a marketable order walking `n` levels yields
+/// `n` fills, one group of `fill_count = n`). Either way the run's fills are
+/// aggregated to **one** leg: a group of `Open`s in a step shares one freshly
+/// minted [`TradeId`]; each `Open` mints one [`PositionId`], pushes one inventory
+/// leg whose `quantity` is the total filled and whose `entry_premium` is the VWAP
+/// across its levels, and records one trade-log open; each `Close` reduces
+/// (partial) or removes (full) its leg by the **total** filled quantity. Every
+/// level fill is applied to the ledger **individually** (so cash stays exact) and
+/// is written as its own bundle `FillRecord` with an incrementing `fill_seq`
+/// (`0..n`), all sharing the order's ids — the `(step, order_id, fill_seq)` unique
+/// key ([docs/05 §7](../../../docs/05-analytics-and-reporting.md#7-fillsparquet)).
+/// A full close pushes one terminal `positions.parquet` row for the whole close.
+///
+/// The `groups` must account for **exactly** the produced fills: any surplus is
+/// an uncorrelated fill (a refresh-generated fill of a prior-step resting order —
+/// routing those through the engine's inventory is deferred with the resting-order
+/// lifecycle), and any shortfall is a `Submit` that produced no fill; both are a
+/// typed [`BacktestError::Execution`].
 ///
 /// # Errors
 ///
 /// - [`BacktestError::Execution`] if a `Close` names an unknown leg or an
-///   oversized quantity, or if the fill count does not match the submit count
-///   (multi-level / refresh fills are a v0.2 realistic-mode concern).
-/// - [`BacktestError::ArithmeticOverflow`] from id minting, the ledger, the
-///   trade log's realised-P&L arithmetic, or the bundle collector's unrealised
-///   arithmetic.
+///   oversized quantity, if a `Submit` produced no fill, or if the fills are not
+///   fully correlated to the submitted orders.
+/// - [`BacktestError::ArithmeticOverflow`] from id minting, the aggregation, the
+///   ledger, the trade log's realised-P&L arithmetic, or the bundle collector's
+///   unrealised arithmetic.
 #[allow(
     clippy::too_many_arguments,
-    reason = "the correlation step threads the loop's per-step buffers, id counters, ledger, trade log, bundle collector, and close-phase ranges; splitting it would fragment the single fill-correlation pass"
+    reason = "the correlation step threads the loop's per-step buffers, fill grouping, id counters, ledger, trade log, bundle collector, and close-phase ranges; splitting it would fragment the single fill-correlation pass"
 )]
 fn apply_step_fills(
     cmds: &[OrderCommand],
     fills: &[Fill],
+    groups: &[FillGroup],
     snapshot: &ChainSnapshot,
     inventory: &mut Vec<OpenPosition>,
     ids: &mut IdCounters,
@@ -668,23 +801,81 @@ fn apply_step_fills(
 ) -> Result<(), BacktestError> {
     let multiplier = snapshot.spec.contract_multiplier;
     let ts_ns = snapshot.ts.value();
-    let mut fills_iter = fills.iter();
+
+    // Coverage precheck: the groups (or the implicit one-fill-per-`Submit` mapping
+    // when `groups` is empty) must account for EXACTLY the produced fills, so the
+    // per-command consumption below never mis-attributes a fill.
+    let expected_fills = if groups.is_empty() {
+        cmds.iter()
+            .filter(|cmd| matches!(cmd, OrderCommand::Submit(_)))
+            .count()
+    } else {
+        let mut total: usize = 0;
+        for group in groups {
+            let count =
+                usize::try_from(group.fill_count).map_err(|_| BacktestError::ArithmeticOverflow)?;
+            total = total
+                .checked_add(count)
+                .ok_or(BacktestError::ArithmeticOverflow)?;
+        }
+        total
+    };
+    if expected_fills != fills.len() {
+        return Err(BacktestError::Execution(format!(
+            "execution fills are not fully correlated to submitted orders \
+             ({} fills, {expected_fills} expected from the order grouping; a surplus is an \
+             uncorrelated refresh fill and a shortfall is a submit that did not fill)",
+            fills.len()
+        )));
+    }
+
+    let mut cursor: usize = 0;
+    let mut groups_iter = groups.iter().peekable();
     // One trade_id per step's group of Open intents.
     let mut step_trade: Option<TradeId> = None;
     for (idx, cmd) in cmds.iter().enumerate() {
         match cmd {
             OrderCommand::Submit(intent) => {
                 let order_id = ids.mint_order()?;
-                let fill = fills_iter.next().ok_or_else(|| {
+                // How many fills this `Submit` produced: exactly one under the
+                // empty-groups single-shot contract, else this command's group.
+                let count = if groups.is_empty() {
+                    1
+                } else {
+                    match groups_iter.peek() {
+                        Some(group) if group.command_index == idx => {
+                            let count = usize::try_from(group.fill_count)
+                                .map_err(|_| BacktestError::ArithmeticOverflow)?;
+                            groups_iter.next();
+                            count
+                        }
+                        // No group at this index ⇒ this Submit produced no fill.
+                        _ => 0,
+                    }
+                };
+                if count == 0 {
+                    return Err(BacktestError::Execution(format!(
+                        "submitted order at command index {idx} produced no fill \
+                         (a zero-fill order cannot open or close a leg)"
+                    )));
+                }
+                let end = cursor
+                    .checked_add(count)
+                    .ok_or(BacktestError::ArithmeticOverflow)?;
+                let order_fills = fills.get(cursor..end).ok_or_else(|| {
                     BacktestError::Execution(
-                        "execution produced fewer fills than submitted orders (naive mode fills each submit single-shot)"
-                            .to_string(),
+                        "fill correlation ran past the produced fills".to_string(),
                     )
                 })?;
+                cursor = end;
+                let first = order_fills.first().ok_or_else(|| {
+                    BacktestError::Execution("an order's fill run is empty".to_string())
+                })?;
                 debug_assert!(
-                    fill.contract == intent.contract,
-                    "a naive fill must echo the submitted contract"
+                    order_fills.iter().all(|f| f.contract == intent.contract),
+                    "a fill must echo its submitted contract"
                 );
+                let agg = aggregate_fills(order_fills)?;
                 match intent.action {
                     PositionAction::Open => {
                         let trade_id = match step_trade {
@@ -698,32 +889,44 @@ fn apply_step_fills(
                         let position_id = ids.mint_position()?;
                         inventory.push(OpenPosition {
                             position_id,
-                            contract: fill.contract.clone(),
-                            side: fill.side,
-                            quantity: fill.quantity,
-                            entry_premium: fill.price,
+                            contract: first.contract.clone(),
+                            side: first.side,
+                            quantity: agg.quantity,
+                            entry_premium: agg.vwap,
                         });
                         trade_log.record_open(
                             position_id,
                             trade_id,
-                            fill.contract.clone(),
-                            fill.side,
-                            fill.quantity,
-                            fill.price,
+                            first.contract.clone(),
+                            first.side,
+                            agg.quantity,
+                            agg.vwap,
                             ts_ns,
                         );
-                        bundle.record_open_fill(fill, order_id.value(), trade_id, position_id);
+                        bundle.register_open_leg(position_id, trade_id, agg.vwap, first.side);
+                        for (level, fill) in order_fills.iter().enumerate() {
+                            let fill_seq = u32::try_from(level)
+                                .map_err(|_| BacktestError::ArithmeticOverflow)?;
+                            bundle.record_open_fill(
+                                fill,
+                                order_id.value(),
+                                trade_id,
+                                position_id,
+                                fill_seq,
+                            );
+                            ledger.apply_fill(fill, multiplier)?;
+                        }
                     }
                     PositionAction::Close(position_id) => {
-                        let full_close = reduce_leg(inventory, position_id, fill.quantity)?;
+                        let full_close = reduce_leg(inventory, position_id, agg.quantity)?;
                         let reason = reasons.reason_for(idx);
                         trade_log.record_close(
                             position_id,
-                            fill.price,
-                            fill.fees,
-                            fill.slippage,
+                            agg.vwap,
+                            agg.fees,
+                            agg.slippage,
                             ts_ns,
-                            fill.quantity,
+                            agg.quantity,
                             multiplier,
                             reason.clone(),
                         )?;
@@ -731,30 +934,44 @@ fn apply_step_fills(
                         // (a fill exists, so the contract is normally quoted); an
                         // absent quote carries forward in the collector.
                         let snapshot_mark =
-                            snapshot.quotes.get(&fill.contract).map(|quote| quote.mid);
-                        bundle.record_close_fill(
-                            fill,
-                            order_id.value(),
-                            position_id,
-                            full_close,
-                            snapshot_mark,
-                            multiplier,
-                            reason,
-                        )?;
+                            snapshot.quotes.get(&first.contract).map(|quote| quote.mid);
+                        for (level, fill) in order_fills.iter().enumerate() {
+                            let fill_seq = u32::try_from(level)
+                                .map_err(|_| BacktestError::ArithmeticOverflow)?;
+                            bundle.record_close_fill(
+                                fill,
+                                order_id.value(),
+                                position_id,
+                                fill_seq,
+                            )?;
+                            ledger.apply_fill(fill, multiplier)?;
+                        }
+                        if full_close {
+                            bundle.record_close_terminal(
+                                &first.contract,
+                                first.step.value(),
+                                first.ts.value(),
+                                position_id,
+                                agg.quantity.value(),
+                                snapshot_mark,
+                                multiplier,
+                                reason,
+                            )?;
+                        }
                     }
                 }
-                ledger.apply_fill(fill, multiplier)?;
             }
-            // Naive mode keeps no resting book, so cancel/replace produce no
-            // fill and no inventory/cash effect; resting-order lifecycle (and
-            // its order-id minting) lands with the realistic book (v0.2).
+            // Cancel/replace produce no fill and no inventory/cash effect here;
+            // resting-order lifecycle (and its order-id minting) lands with the
+            // realistic book (v0.2).
             OrderCommand::Cancel(_) | OrderCommand::Replace { .. } => {}
         }
     }
-    if fills_iter.next().is_some() {
+    // The precheck guarantees full coverage; assert the walk consumed every fill
+    // and every group as defence in depth.
+    if cursor != fills.len() || groups_iter.next().is_some() {
         return Err(BacktestError::Execution(
-            "execution produced more fills than submitted orders (multi-level / refresh fills are v0.2)"
-                .to_string(),
+            "execution fills were not fully correlated to submitted orders".to_string(),
         ));
     }
     Ok(())
@@ -829,7 +1046,7 @@ mod tests {
     use rand_chacha::rand_core::RngCore;
     use rust_decimal_macros::dec;
 
-    use super::{BacktestEngine, BacktestRun};
+    use super::{BacktestEngine, BacktestRun, vwap_cents};
     use crate::config::{BacktestConfig, FeeSchedule, SlippageModel};
     use crate::data::DataSourceSpec;
     use crate::data::feed::InMemoryFeed;
@@ -1310,5 +1527,378 @@ mod tests {
         };
         let run = BacktestEngine::run(&cfg, feed_of(&[200]), naive(), strategy, "hold");
         assert!(matches!(run, Err(BacktestError::Config(_))));
+    }
+
+    /// A **realistic marketable order that walks two price levels** produces one
+    /// [`Fill`] per level, all correlated to ONE order (`order_id` /
+    /// `position_id` / `trade_id`) with an incrementing `fill_seq`, and the
+    /// aggregate leg carries the total filled quantity and the VWAP entry premium.
+    /// This is the multi-level capability the #36 conformance fixture drives — the
+    /// engine's fill→order grouping lifting the old 1:1 constraint.
+    ///
+    /// Book (thin): a `Flat` touch of 3 plus two uniform deeper levels (`r = 1`)
+    /// stepping one tick, seeded from `S0` (bid 190 / ask 210, tick 5). A
+    /// marketable buy for 5 sweeps `3 @ 210` then `2 @ 215` — two fills at
+    /// progressively worse prices.
+    #[cfg(feature = "orderbook")]
+    #[test]
+    fn test_realistic_marketable_open_walks_two_levels_into_one_correlated_order() {
+        use crate::config::{LiquidityProfile, TouchSize};
+        use crate::execution::RealisticFill;
+
+        /// Opens one long call for `lots` contracts (marketable IOC) at
+        /// `on_start` and holds it to feed exhaustion.
+        struct OpenLots {
+            lots: u32,
+        }
+
+        impl Strategy for OpenLots {
+            fn on_start(
+                &mut self,
+                ctx: &mut ChainContext,
+                out: &mut Vec<OrderCommand>,
+            ) -> Result<(), BacktestError> {
+                let Some(quote) = ctx.snapshot.quotes.get(&call_key()) else {
+                    panic!("the call is quoted in the fixture");
+                };
+                out.push(OrderCommand::Submit(OrderIntent {
+                    contract: call_key(),
+                    action: PositionAction::Open,
+                    side: Side::Long,
+                    quantity: qty(self.lots),
+                    limit: None,
+                    tif: crate::domain::TimeInForce::Ioc,
+                    decision_mid: quote.mid,
+                }));
+                Ok(())
+            }
+
+            fn on_snapshot(
+                &mut self,
+                _ctx: &mut ChainContext,
+                _out: &mut Vec<OrderCommand>,
+            ) -> Result<(), BacktestError> {
+                Ok(())
+            }
+
+            fn on_end(
+                &mut self,
+                _ctx: &mut ChainContext,
+                _out: &mut Vec<OrderCommand>,
+            ) -> Result<(), BacktestError> {
+                Ok(())
+            }
+        }
+
+        let profile = LiquidityProfile {
+            touch_size: TouchSize::Flat { contracts: 3 },
+            depth_levels: 2,
+            decay: dec!(1),
+        };
+        let fees = FeeSchedule {
+            per_contract_cents: 65,
+            per_order_cents: 100,
+        };
+        let run_once = || {
+            let execution = RealisticFill::with_liquidity_profile(fees, 10, 7, profile);
+            let Ok(run) = BacktestEngine::run(
+                &config(),
+                feed_of(&[200, 200]),
+                execution,
+                OpenLots { lots: 5 },
+                "multilevel",
+            ) else {
+                panic!("the multi-level realistic run succeeds");
+            };
+            run
+        };
+        let run = run_once();
+
+        // One marketable order walked two levels ⇒ two correlated FillRecords.
+        assert_eq!(run.fills.len(), 2, "the buy for 5 walks two ask levels");
+        let (Some(f0), Some(f1)) = (run.fills.first(), run.fills.get(1)) else {
+            panic!("two fill records expected");
+        };
+        // All fills of the order share ONE order / leg / trade; fill_seq 0,1.
+        assert_eq!(f0.order_id, f1.order_id, "one order across both levels");
+        assert_eq!(f0.position_id, f1.position_id, "one leg across both levels");
+        assert_eq!(f0.trade_id, f1.trade_id, "one trade across both levels");
+        assert_eq!(f0.fill_seq, 0);
+        assert_eq!(f1.fill_seq, 1);
+        // Progressively worse prices for a buy, per-level sizes summing to 5.
+        assert_eq!((f0.fill.price.value(), f0.fill.quantity.value()), (210, 3));
+        assert_eq!((f1.fill.price.value(), f1.fill.quantity.value()), (215, 2));
+        assert!(
+            f1.fill.price.value() > f0.fill.price.value(),
+            "each deeper level fills worse for a buy"
+        );
+        assert!(
+            run.fills
+                .iter()
+                .all(|r| r.fill.mode == ExecutionMode::Realistic)
+        );
+        // The once-per-order fee sits on the first level only.
+        assert_eq!(f0.fill.fees.value(), 3 * 65 + 100);
+        assert_eq!(f1.fill.fees.value(), 2 * 65);
+
+        // The (step, order_id, fill_seq) bundle key is unique across the order.
+        let mut keys: Vec<(u32, u64, u32)> = run
+            .fills
+            .iter()
+            .map(|r| (r.fill.step.value(), r.order_id, r.fill_seq))
+            .collect();
+        let total = keys.len();
+        keys.sort_unstable();
+        keys.dedup();
+        assert_eq!(
+            keys.len(),
+            total,
+            "the (step, order_id, fill_seq) key must be unique"
+        );
+
+        // The aggregate leg: total filled quantity 5, VWAP entry premium.
+        assert_eq!(run.open_at_end.len(), 1, "the single leg is held open");
+        let Some(leg) = run.open_at_end.first() else {
+            panic!("one open leg at end");
+        };
+        assert_eq!(leg.quantity.value(), 5, "aggregate quantity across levels");
+        // VWAP = round_half_even((210·3 + 215·2) / 5) = 1060 / 5 = 212.
+        assert_eq!(leg.entry_premium.value(), 212, "VWAP entry premium");
+        assert_eq!(leg.side, Side::Long);
+
+        // Cash moved EXACTLY per fill (not via the VWAP): a Long buy debits
+        // Σ(price·qty·mult) + Σ fees = (210·3·100 + 295) + (215·2·100 + 130)
+        // = 63_295 + 43_130 = 106_425. Final position marks at S_last mid 200:
+        // 200·5·100 = 100_000, so equity = 10_000_000 − 106_425 + 100_000.
+        let Some(last) = run.equity_curve.last() else {
+            panic!("a final equity point exists");
+        };
+        assert_eq!(last.position_value_cents, 100_000);
+        assert_eq!(last.equity_cents, 10_000_000 - 106_425 + 100_000);
+
+        // Determinism: the same (seed, config, data) reproduces the fill stream.
+        let again = run_once();
+        assert_eq!(run.fills, again.fills, "the fill stream is deterministic");
+        assert_eq!(run.equity_curve, again.equity_curve);
+    }
+
+    /// [`vwap_cents`] is a second encoding of the repo's half-to-even money
+    /// policy, so its **tie** branch (untested by the exact-division multi-level
+    /// scenario, where `1060 / 5 = 212`) must agree with
+    /// [`crate::domain::PriceCents::from_decimal_dollars`]. This hits a genuine
+    /// `.5` tie in **both** directions — rounding down to an even quotient and up
+    /// to an even quotient — and cross-checks each against the money policy, so
+    /// the raw-`u128` rounding can never silently drift from `from_decimal_dollars`.
+    #[test]
+    fn test_vwap_cents_half_to_even_ties_match_money_policy() {
+        use rust_decimal::Decimal;
+
+        // The money-policy oracle: the same cents value expressed as dollars and
+        // rounded by the single `from_decimal_dollars` half-to-even path.
+        let oracle = |notional: u128, total_qty: u64| -> u64 {
+            let Ok(n) = i64::try_from(notional) else {
+                panic!("fixture notional fits i64");
+            };
+            let dollars = Decimal::from(n) / Decimal::from(total_qty) / Decimal::ONE_HUNDRED;
+            let Ok(price) = PriceCents::from_decimal_dollars(dollars) else {
+                panic!("the oracle price must convert");
+            };
+            price.value()
+        };
+
+        // Tie DOWN to even: 842 / 4 = 210.5, quotient 210 already even ⇒ 210.
+        let Ok(down) = vwap_cents(842, 4) else {
+            panic!("vwap must compute");
+        };
+        assert_eq!(down.value(), 210, "210.5 ties to the even 210, not 211");
+        assert_eq!(
+            down.value(),
+            oracle(842, 4),
+            "the tie-down cent must equal the money policy"
+        );
+
+        // Tie UP to even: 846 / 4 = 211.5, quotient 211 odd ⇒ rounds up to 212.
+        let Ok(up) = vwap_cents(846, 4) else {
+            panic!("vwap must compute");
+        };
+        assert_eq!(up.value(), 212, "211.5 ties to the even 212, not 211");
+        assert_eq!(
+            up.value(),
+            oracle(846, 4),
+            "the tie-up cent must equal the money policy"
+        );
+
+        // Non-tie sanity, both sides of the midpoint.
+        let Ok(below) = vwap_cents(841, 4) else {
+            panic!("vwap must compute");
+        };
+        assert_eq!(below.value(), 210, "210.25 rounds down to 210");
+        let Ok(above) = vwap_cents(843, 4) else {
+            panic!("vwap must compute");
+        };
+        assert_eq!(above.value(), 211, "210.75 rounds up to 211");
+    }
+
+    /// A **realistic marketable CLOSE that walks two price levels** reduces its
+    /// leg by the total swept quantity, writes exactly ONE terminal
+    /// `positions.parquet` row for the whole close, and emits one `FillRecord`
+    /// per level (`fill_seq = 0, 1`) with per-fill cash exact. This exercises the
+    /// close side of the fill→order grouping (aggregate + `record_close_terminal`),
+    /// which the open-only scenario left at `n = 1`.
+    ///
+    /// Book (thin, symmetric `Flat` 3 + two uniform deeper levels): a long call
+    /// for 5 opens by sweeping the ask (`3 @ 210`, `2 @ 215`), then a marketable
+    /// sell-to-close for 5 sweeps the bid **down** (`3 @ 190`, `2 @ 185`).
+    #[cfg(feature = "orderbook")]
+    #[test]
+    fn test_realistic_marketable_close_walks_two_levels_into_one_terminal_row() {
+        use crate::config::{LiquidityProfile, TouchSize};
+        use crate::execution::RealisticFill;
+
+        /// Opens one long call for `lots` at `on_start`, then closes the whole leg
+        /// (marketable sell-to-close) at the first `on_snapshot`.
+        struct OpenThenCloseLots {
+            lots: u32,
+            closed: bool,
+        }
+
+        impl Strategy for OpenThenCloseLots {
+            fn on_start(
+                &mut self,
+                ctx: &mut ChainContext,
+                out: &mut Vec<OrderCommand>,
+            ) -> Result<(), BacktestError> {
+                let Some(quote) = ctx.snapshot.quotes.get(&call_key()) else {
+                    panic!("the call is quoted in the fixture");
+                };
+                out.push(OrderCommand::Submit(OrderIntent {
+                    contract: call_key(),
+                    action: PositionAction::Open,
+                    side: Side::Long,
+                    quantity: qty(self.lots),
+                    limit: None,
+                    tif: crate::domain::TimeInForce::Ioc,
+                    decision_mid: quote.mid,
+                }));
+                Ok(())
+            }
+
+            fn on_snapshot(
+                &mut self,
+                ctx: &mut ChainContext,
+                out: &mut Vec<OrderCommand>,
+            ) -> Result<(), BacktestError> {
+                if self.closed {
+                    return Ok(());
+                }
+                let Some(leg) = ctx.open.first() else {
+                    return Ok(());
+                };
+                let Some(quote) = ctx.snapshot.quotes.get(&call_key()) else {
+                    panic!("the call is quoted in the fixture");
+                };
+                out.push(OrderCommand::Submit(OrderIntent {
+                    contract: call_key(),
+                    action: PositionAction::Close(leg.position_id),
+                    side: Side::Short, // sell-to-close a long leg
+                    quantity: leg.quantity,
+                    limit: None,
+                    tif: crate::domain::TimeInForce::Ioc,
+                    decision_mid: quote.mid,
+                }));
+                self.closed = true;
+                Ok(())
+            }
+
+            fn on_end(
+                &mut self,
+                _ctx: &mut ChainContext,
+                _out: &mut Vec<OrderCommand>,
+            ) -> Result<(), BacktestError> {
+                Ok(())
+            }
+        }
+
+        let profile = LiquidityProfile {
+            touch_size: TouchSize::Flat { contracts: 3 },
+            depth_levels: 2,
+            decay: dec!(1),
+        };
+        let fees = FeeSchedule {
+            per_contract_cents: 65,
+            per_order_cents: 100,
+        };
+        let execution = RealisticFill::with_liquidity_profile(fees, 10, 7, profile);
+        let Ok(run) = BacktestEngine::run(
+            &config(),
+            feed_of(&[200]),
+            execution,
+            OpenThenCloseLots {
+                lots: 5,
+                closed: false,
+            },
+            "close-walk",
+        ) else {
+            panic!("the multi-level close run succeeds");
+        };
+
+        // The sell-to-close swept two bid levels ⇒ two Short close fills, all
+        // correlated to ONE close order with incrementing fill_seq.
+        let closes: Vec<_> = run
+            .fills
+            .iter()
+            .filter(|r| r.fill.side == Side::Short)
+            .collect();
+        assert_eq!(closes.len(), 2, "the close for 5 walks two bid levels");
+        let (Some(c0), Some(c1)) = (closes.first(), closes.get(1)) else {
+            panic!("two close fill records expected");
+        };
+        assert_eq!(
+            c0.order_id, c1.order_id,
+            "one close order across both levels"
+        );
+        assert_eq!(c0.position_id, 1);
+        assert_eq!(c1.position_id, 1);
+        assert_eq!(c0.fill_seq, 0);
+        assert_eq!(c1.fill_seq, 1);
+        // A sell walks the bid DOWN: 190 then 185 (progressively worse), 3 then 2.
+        assert_eq!((c0.fill.price.value(), c0.fill.quantity.value()), (190, 3));
+        assert_eq!((c1.fill.price.value(), c1.fill.quantity.value()), (185, 2));
+        assert!(
+            c1.fill.price.value() < c0.fill.price.value(),
+            "each deeper level fills worse for a sell"
+        );
+
+        // The whole leg (5) closed ⇒ no open-at-end, and EXACTLY ONE terminal row
+        // for the multi-level close, carrying the total swept quantity.
+        assert!(run.open_at_end.is_empty(), "the whole leg closed");
+        let terminals: Vec<_> = run
+            .positions
+            .iter()
+            .filter(|p| p.exit_reason.is_some())
+            .collect();
+        assert_eq!(
+            terminals.len(),
+            1,
+            "one terminal row for the multi-level close, not one per level"
+        );
+        let Some(term) = terminals.first() else {
+            panic!("one terminal row");
+        };
+        assert_eq!(term.position_id, 1);
+        assert_eq!(
+            term.quantity, 5,
+            "the terminal row aggregates the total closed quantity"
+        );
+
+        // Per-fill cash is exact (not via any VWAP): the open debits 106_425
+        // (63_295 + 43_130); the close credits (190·3·100 − 295) + (185·2·100 −
+        // 130) = 56_705 + 36_870 = 93_575. The leg is flat at the end, so
+        // equity = 10_000_000 − 106_425 + 93_575 and position value is 0.
+        let Some(last) = run.equity_curve.last() else {
+            panic!("a final equity point exists");
+        };
+        assert_eq!(last.position_value_cents, 0);
+        assert_eq!(last.equity_cents, 10_000_000 - 106_425 + 93_575);
     }
 }

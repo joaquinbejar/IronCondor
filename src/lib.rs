@@ -114,7 +114,7 @@ pub use engine::{
 pub use error::BacktestError;
 #[cfg(feature = "orderbook")]
 pub use execution::RealisticFill;
-pub use execution::{ExecutionModel, NaiveFill};
+pub use execution::{ExecutionModel, FillGroup, NaiveFill};
 pub use run::run_backtest;
 
 /// The migrated OptionChain-Simulator session surface (feature `simulator`):

@@ -206,36 +206,93 @@ impl BundleCollector {
         }
     }
 
-    /// Record a leg opening: push its [`FillRecord`] and start its live-leg
-    /// bookkeeping (trade id, entry premium, opened side).
+    /// Start a leg's live-leg bookkeeping (trade id, **average** entry premium,
+    /// opened side) — called **once per opened leg**, before its per-level fills.
+    ///
+    /// `avg_price` is the leg's quantity-weighted average entry (the VWAP across
+    /// the order's fills); for a single-shot open it is simply the one fill's
+    /// price. It is the reference the terminal-row and per-step unrealised-P&L
+    /// arithmetic marks against — cash itself moves exactly, per fill, through the
+    /// ledger.
+    pub fn register_open_leg(
+        &mut self,
+        position_id: PositionId,
+        trade_id: TradeId,
+        avg_price: PriceCents,
+        side: Side,
+    ) {
+        self.open_legs.insert(
+            position_id,
+            LegMeta {
+                trade_id,
+                entry_premium: avg_price,
+                side,
+            },
+        );
+    }
+
+    /// Record one opening fill: push its [`FillRecord`] with the given `fill_seq`
+    /// (the 0-based index within the order — `0` for a single-shot open, `0..n`
+    /// for an order walking `n` price levels). The leg's live-leg bookkeeping is
+    /// registered separately once via [`Self::register_open_leg`], so an order's
+    /// several level fills share one `trade_id` / `position_id` and one entry.
     pub fn record_open_fill(
         &mut self,
         fill: &Fill,
         order_id: u64,
         trade_id: TradeId,
         position_id: PositionId,
+        fill_seq: u32,
     ) {
         self.fills.push(FillRecord {
             fill: fill.clone(),
             trade_id: trade_id.value(),
             position_id: position_id.value(),
             order_id,
-            fill_seq: 0,
+            fill_seq,
         });
-        self.open_legs.insert(
-            position_id,
-            LegMeta {
-                trade_id,
-                entry_premium: fill.price,
-                side: fill.side,
-            },
-        );
     }
 
-    /// Record a leg close: push its [`FillRecord`] and, on a **full** close, its
-    /// terminal [`PositionSnapshot`] (observed at the beginning-of-step endpoint)
-    /// and drop the live-leg bookkeeping. A **partial** close writes no terminal
-    /// row — the reduced leg keeps taking ordinary open rows.
+    /// Record one closing fill: push its [`FillRecord`] with the given `fill_seq`
+    /// (`0` for a single-shot close, `0..n` for a close walking `n` price levels),
+    /// correlated to the leg's `trade_id`. The terminal [`PositionSnapshot`] and
+    /// the live-leg drop are handled separately once via
+    /// [`Self::record_close_terminal`], so an order's several level fills share
+    /// one leg and produce **one** terminal row.
+    ///
+    /// # Errors
+    ///
+    /// [`BacktestError::Execution`] if `position_id` names no open leg (an
+    /// internal invariant — the loop validated the close against inventory before
+    /// calling this).
+    pub fn record_close_fill(
+        &mut self,
+        fill: &Fill,
+        order_id: u64,
+        position_id: PositionId,
+        fill_seq: u32,
+    ) -> Result<(), BacktestError> {
+        let leg = *self.open_legs.get(&position_id).ok_or_else(|| {
+            BacktestError::Execution(format!(
+                "bundle close targets position {} which is not open",
+                position_id.value()
+            ))
+        })?;
+        self.fills.push(FillRecord {
+            fill: fill.clone(),
+            trade_id: leg.trade_id.value(),
+            position_id: position_id.value(),
+            order_id,
+            fill_seq,
+        });
+        Ok(())
+    }
+
+    /// Write a **full** close's terminal [`PositionSnapshot`] (observed at the
+    /// beginning-of-step endpoint) and drop the live-leg bookkeeping — called
+    /// **once** after all of the close's level fills, with `closed_quantity` the
+    /// total contracts closed across those levels. A **partial** close does not
+    /// call this (the reduced leg keeps taking ordinary open rows).
     ///
     /// `snapshot_mark` is the closing step's snapshot mid for the contract (a fill
     /// exists, so it is normally quoted); when absent, the entry premium is
@@ -250,64 +307,56 @@ impl BundleCollector {
     ///   arithmetic overflows.
     #[allow(
         clippy::too_many_arguments,
-        reason = "one argument per close-time signal (fill, order id, leg id, full-close flag, snapshot mark, multiplier, reason); the collector centralises the fill + terminal-row bookkeeping in one place"
+        reason = "one argument per terminal-row signal (contract, step, ts, leg id, closed size, snapshot mark, multiplier, reason); the collector centralises the terminal-row bookkeeping in one place"
     )]
-    pub fn record_close_fill(
+    pub fn record_close_terminal(
         &mut self,
-        fill: &Fill,
-        order_id: u64,
+        contract: &ContractKey,
+        step: u32,
+        ts_ns: i64,
         position_id: PositionId,
-        full_close: bool,
+        closed_quantity: u32,
         snapshot_mark: Option<PriceCents>,
         contract_multiplier: u32,
         exit_reason: ExitReason,
     ) -> Result<(), BacktestError> {
         let leg = *self.open_legs.get(&position_id).ok_or_else(|| {
             BacktestError::Execution(format!(
-                "bundle close targets position {} which is not open",
+                "bundle terminal-row for position {} which is not open",
                 position_id.value()
             ))
         })?;
-        self.fills.push(FillRecord {
-            fill: fill.clone(),
-            trade_id: leg.trade_id.value(),
+        // Terminal row: the beginning-of-step mark is the closing step's snapshot
+        // mid (a fill exists ⇒ the contract is quoted). If somehow absent, carry
+        // the entry premium forward and flag it stale rather than fabricate a
+        // price.
+        let (mark, stale) = match snapshot_mark {
+            Some(mid) => (mid, false),
+            None => (leg.entry_premium, true),
+        };
+        let unrealized = unrealized_cents(
+            mark,
+            leg.entry_premium,
+            closed_quantity,
+            contract_multiplier,
+            leg.side,
+        )?;
+        self.positions.push(PositionSnapshot {
+            step,
+            ts_ns,
             position_id: position_id.value(),
-            order_id,
-            fill_seq: 0,
+            trade_id: leg.trade_id.value(),
+            contract: contract.clone(),
+            side: leg.side,
+            quantity: closed_quantity,
+            avg_price_cents: leg.entry_premium.value(),
+            mark_cents: mark.value(),
+            unrealized_cents: unrealized,
+            stale_mark: stale,
+            exit_reason: Some(exit_reason),
+            open_at_end: false,
         });
-        if full_close {
-            // Terminal row: the beginning-of-step mark is the closing step's
-            // snapshot mid (a fill exists ⇒ the contract is quoted). If somehow
-            // absent, carry the entry premium forward and flag it stale rather
-            // than fabricate a price.
-            let (mark, stale) = match snapshot_mark {
-                Some(mid) => (mid, false),
-                None => (leg.entry_premium, true),
-            };
-            let unrealized = unrealized_cents(
-                mark,
-                leg.entry_premium,
-                fill.quantity.value(),
-                contract_multiplier,
-                leg.side,
-            )?;
-            self.positions.push(PositionSnapshot {
-                step: fill.step.value(),
-                ts_ns: fill.ts.value(),
-                position_id: position_id.value(),
-                trade_id: leg.trade_id.value(),
-                contract: fill.contract.clone(),
-                side: leg.side,
-                quantity: fill.quantity.value(),
-                avg_price_cents: leg.entry_premium.value(),
-                mark_cents: mark.value(),
-                unrealized_cents: unrealized,
-                stale_mark: stale,
-                exit_reason: Some(exit_reason),
-                open_at_end: false,
-            });
-            self.open_legs.remove(&position_id);
-        }
+        self.open_legs.remove(&position_id);
         Ok(())
     }
 
@@ -503,7 +552,13 @@ mod tests {
     #[test]
     fn test_record_open_pushes_one_fill_and_no_position_row() {
         let mut collector = BundleCollector::with_capacity(4);
-        collector.record_open_fill(&open_fill(2_000, 0), 1, TradeId::new(1), PositionId::new(1));
+        collector.record_open_fill(
+            &open_fill(2_000, 0),
+            1,
+            TradeId::new(1),
+            PositionId::new(1),
+            0,
+        );
         let (fills, positions) = collector.into_parts();
         assert_eq!(fills.len(), 1);
         assert!(
@@ -522,7 +577,19 @@ mod tests {
     #[test]
     fn test_collect_step_emits_open_row_per_marked_leg() {
         let mut collector = BundleCollector::with_capacity(4);
-        collector.record_open_fill(&open_fill(2_000, 0), 1, TradeId::new(7), PositionId::new(1));
+        collector.register_open_leg(
+            PositionId::new(1),
+            TradeId::new(7),
+            PriceCents::new(2_000),
+            Side::Short,
+        );
+        collector.record_open_fill(
+            &open_fill(2_000, 0),
+            1,
+            TradeId::new(7),
+            PositionId::new(1),
+            0,
+        );
         let Ok(()) = collector.collect_step(0, TS0, &[mark(1_900, 2, false)], false) else {
             panic!("collect step");
         };
@@ -544,18 +611,35 @@ mod tests {
     #[test]
     fn test_full_close_writes_terminal_row_with_exit_reason() {
         let mut collector = BundleCollector::with_capacity(4);
-        collector.record_open_fill(&open_fill(2_000, 0), 1, TradeId::new(7), PositionId::new(1));
-        // Full close of 2 at step 3, snapshot mid 1_800.
-        let Ok(()) = collector.record_close_fill(
-            &close_fill(1_750, 3, 2),
-            2,
+        collector.register_open_leg(
             PositionId::new(1),
-            true,
+            TradeId::new(7),
+            PriceCents::new(2_000),
+            Side::Short,
+        );
+        collector.record_open_fill(
+            &open_fill(2_000, 0),
+            1,
+            TradeId::new(7),
+            PositionId::new(1),
+            0,
+        );
+        // Full close of 2 at step 3, snapshot mid 1_800.
+        let cf = close_fill(1_750, 3, 2);
+        let Ok(()) = collector.record_close_fill(&cf, 2, PositionId::new(1), 0) else {
+            panic!("record close fill");
+        };
+        let Ok(()) = collector.record_close_terminal(
+            &cf.contract,
+            cf.step.value(),
+            cf.ts.value(),
+            PositionId::new(1),
+            cf.quantity.value(),
             Some(PriceCents::new(1_800)),
             100,
             ExitReason::Other("end_of_data".to_string()),
         ) else {
-            panic!("record close");
+            panic!("record close terminal");
         };
         // After a full close, a later collect_step over an empty mark set adds
         // nothing (the leg is gone from inventory).
@@ -591,17 +675,23 @@ mod tests {
     #[test]
     fn test_partial_close_writes_no_terminal_row_and_leg_stays_open() {
         let mut collector = BundleCollector::with_capacity(4);
-        collector.record_open_fill(&open_fill(2_000, 0), 1, TradeId::new(7), PositionId::new(1));
-        // Partial close of 1 of 2 (full_close = false).
-        let Ok(()) = collector.record_close_fill(
-            &close_fill(1_900, 2, 1),
-            2,
+        collector.register_open_leg(
             PositionId::new(1),
-            false,
-            Some(PriceCents::new(1_900)),
-            100,
-            ExitReason::ManualClose,
-        ) else {
+            TradeId::new(7),
+            PriceCents::new(2_000),
+            Side::Short,
+        );
+        collector.record_open_fill(
+            &open_fill(2_000, 0),
+            1,
+            TradeId::new(7),
+            PositionId::new(1),
+            0,
+        );
+        // Partial close of 1 of 2: record only the fill, no terminal row.
+        let Ok(()) =
+            collector.record_close_fill(&close_fill(1_900, 2, 1), 2, PositionId::new(1), 0)
+        else {
             panic!("partial close");
         };
         // The reduced leg (qty 1) still takes an ordinary open row.
@@ -624,7 +714,19 @@ mod tests {
     #[test]
     fn test_open_at_end_flag_set_on_final_step_open_rows() {
         let mut collector = BundleCollector::with_capacity(4);
-        collector.record_open_fill(&open_fill(2_000, 0), 1, TradeId::new(7), PositionId::new(1));
+        collector.register_open_leg(
+            PositionId::new(1),
+            TradeId::new(7),
+            PriceCents::new(2_000),
+            Side::Short,
+        );
+        collector.record_open_fill(
+            &open_fill(2_000, 0),
+            1,
+            TradeId::new(7),
+            PositionId::new(1),
+            0,
+        );
         // Final step with the leg still open ⇒ open_at_end = true on its open row.
         let Ok(()) = collector.collect_step(5, TS0, &[mark(2_100, 2, false)], true) else {
             panic!("collect final step");
