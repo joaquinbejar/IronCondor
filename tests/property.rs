@@ -625,6 +625,32 @@ fn test_same_seed_same_result_iron_condor_and_rng_strategy() {
     assert_eq!(c.open_at_end, d.open_at_end);
 }
 
+/// `same_seed_same_result` over a **`ShortStrangle`** run (#28): the v0.2 second
+/// strategy, driven through the same generic adapter + engine, is byte-identical
+/// for a fixed `(seed, config, data)`. Determinism is a property of the loop,
+/// not of `IronCondor`.
+#[test]
+fn test_same_seed_same_result_short_strangle() {
+    let Ok(dir) = tempfile::tempdir() else {
+        panic!("tempdir creates");
+    };
+    let path = dir.path().join("strangle.parquet");
+    let rows = common::strangle_rows(5);
+    if common::write_parquet(&path, &rows).is_err() {
+        panic!("the strangle fixture writes");
+    }
+
+    let (Ok(a), Ok(b)) = (
+        common::run_strangle(&path, 314),
+        common::run_strangle(&path, 314),
+    ) else {
+        panic!("both short strangle runs succeed");
+    };
+    assert_eq!(a.equity_curve, b.equity_curve);
+    assert_eq!(a.open_at_end, b.open_at_end);
+    assert_eq!(a.result.final_capital, b.result.final_capital);
+}
+
 // --- mark-to-market ledger properties (issue #15) --------------------------
 
 /// The fixed contract multiplier of the ledger-property snapshots

@@ -1,0 +1,29 @@
+{
+  "data_source": {
+    "kind": "parquet",
+    "path": "chain/short_strangle.parquet",
+    "sha256": ""
+  },
+  "mode": "naive",
+  "seed": 42,
+  "initial_capital": 10000000,
+  "fees": {
+    "per_contract_cents": 65,
+    "per_order_cents": 100
+  },
+  "slippage": {
+    "model": "none"
+  },
+  "limits": {
+    "max_steps": 100000,
+    "max_contracts_per_snapshot": 50000,
+    "max_total_bytes": 2147483648,
+    "max_file_bytes": 4294967296,
+    "max_decompressed_bytes": 8589934592,
+    "max_manifest_bytes": 16777216,
+    "max_string_len": 65536,
+    "max_rows_per_table": 100000000
+  },
+  "output_dir": "runs/out",
+  "overwrite": false
+}

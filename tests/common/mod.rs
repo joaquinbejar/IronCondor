@@ -15,11 +15,11 @@ use parquet::arrow::ArrowWriter;
 use ironcondor::{
     BacktestConfig, BacktestEngine, BacktestRun, CsvFeed, DataSourceSpec, ExecutionMode,
     FeeSchedule, IronCondorSpec, NaiveFill, OptStratAdapter, ParquetFeed, PriceCents, Quantity,
-    ResourceLimits, SlippageModel, StrategySpec, Underlying,
+    ResourceLimits, ShortStrangleSpec, SlippageModel, StrategySpec, Underlying,
 };
 use optionstratlib::ExpirationDate;
 use optionstratlib::simulation::ExitPolicy;
-use optionstratlib::strategies::IronCondor;
+use optionstratlib::strategies::{IronCondor, ShortStrangle};
 use rust_decimal::Decimal;
 
 /// The tape anchor `ts_0` (ns since epoch, UTC).
@@ -95,6 +95,25 @@ pub fn condor_rows(steps: u32, perturb: Option<Perturb>) -> Vec<Row> {
                 }
                 _ => (bid, ask),
             };
+            rows.push((step_i, ts, strike, style, bid, ask));
+        }
+    }
+    rows
+}
+
+/// Build `steps` snapshots of the two short-strangle legs (short call 520000,
+/// short put 480000), tick-aligned to 5c, with flat mids 800/700 (matching
+/// [`short_strangle_spec`]). A deliberately small, flat, two-leg analogue of
+/// [`condor_rows`] for the `short_strangle_naive` golden (#28).
+pub fn strangle_rows(steps: u32) -> Vec<Row> {
+    // (strike, style, bid, ask) — mids are 800/700.
+    let legs: [(i64, &'static str, i64, i64); 2] =
+        [(520_000, "call", 795, 805), (480_000, "put", 695, 705)];
+    let mut rows = Vec::new();
+    for step in 0..steps {
+        let step_i = i32::try_from(step).unwrap_or(i32::MAX);
+        let ts = TS0 + i64::from(step) * NANOS_PER_DAY;
+        for (strike, style, bid, ask) in legs {
             rows.push((step_i, ts, strike, style, bid, ask));
         }
     }
@@ -207,6 +226,38 @@ pub fn iron_condor_spec() -> StrategySpec {
     })
 }
 
+/// The short-strangle spec whose two leg strikes match [`strangle_rows`]:
+/// short call 520000, short put 480000 (both OTM around a 500000 spot). Money
+/// fields are integer cents; rates/vol are `Decimal`. The strategy-level premia
+/// and per-leg fees do not reach the engine ledger (the engine marks from
+/// snapshot mids and charges `config.fees`), so they are set to clean values.
+pub fn short_strangle_spec() -> StrategySpec {
+    let Ok(underlying) = Underlying::new("SPX") else {
+        panic!("SPX is valid");
+    };
+    let Ok(quantity) = Quantity::new(1) else {
+        panic!("1 is a valid quantity");
+    };
+    StrategySpec::ShortStrangle(ShortStrangleSpec {
+        underlying,
+        underlying_price: cents(500_000),
+        call_strike: cents(520_000),
+        put_strike: cents(480_000),
+        expiration: ExpirationDate::DateTime(chrono::DateTime::from_timestamp_nanos(EXPIRY)),
+        call_implied_volatility: Decimal::new(20, 2),
+        put_implied_volatility: Decimal::new(20, 2),
+        risk_free_rate: Decimal::new(5, 2),
+        dividend_yield: Decimal::ZERO,
+        quantity,
+        premium_short_call: cents(800),
+        premium_short_put: cents(700),
+        open_fee_short_call: cents(65),
+        close_fee_short_call: cents(65),
+        open_fee_short_put: cents(65),
+        close_fee_short_put: cents(65),
+    })
+}
+
 /// A valid `BacktestConfig` for a naive run over `path`, with the given seed.
 pub fn condor_config(path: &Path, seed: u64) -> BacktestConfig {
     BacktestConfig {
@@ -259,4 +310,19 @@ pub fn run_condor_csv(dir: &Path, seed: u64) -> Result<BacktestRun, String> {
         .map_err(|e| e.to_string())?;
     let execution = NaiveFill::new(config.slippage.clone(), config.fees);
     BacktestEngine::run(&config, feed, execution, adapter, "iron_condor").map_err(|e| e.to_string())
+}
+
+/// Open `path` as a `ParquetFeed`, wrap a [`ShortStrangle`] (the v0.2 second
+/// strategy) built via `from_spec` with a non-triggering exit policy, and run to
+/// completion — the strangle analogue of [`run_condor`], driving the **same**
+/// generic adapter and engine loop. `strategy_name` is `"short_strangle"`.
+pub fn run_strangle(path: &Path, seed: u64) -> Result<BacktestRun, String> {
+    let config = condor_config(path, seed);
+    let feed = ParquetFeed::open(path, &ResourceLimits::default()).map_err(|e| e.to_string())?;
+    let exit = ExitPolicy::TimeSteps(1_000_000);
+    let adapter = OptStratAdapter::<ShortStrangle>::from_spec(&short_strangle_spec(), exit)
+        .map_err(|e| e.to_string())?;
+    let execution = NaiveFill::new(config.slippage.clone(), config.fees);
+    BacktestEngine::run(&config, feed, execution, adapter, "short_strangle")
+        .map_err(|e| e.to_string())
 }

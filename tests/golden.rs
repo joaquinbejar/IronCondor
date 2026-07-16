@@ -252,6 +252,175 @@ fn test_golden_detects_a_deliberate_change() {
     );
 }
 
+/// The short-strangle naive golden (#28): the **same v0.1 scope** (the equity
+/// curve and minimal metrics, the same comparison oracle and `BLESS` path) as
+/// the iron-condor naive golden, but for the **second strategy** — proving the
+/// strategy seam generalises beyond `IronCondor` through the **unchanged**
+/// generic `OptStratAdapter` and engine loop.
+///
+/// The run is assembled directly (`ParquetFeed` + [`ironcondor::NaiveFill`] +
+/// `OptStratAdapter::<ShortStrangle>` → `BacktestEngine::run` →
+/// `metrics::populate`) because the v0.1 `run_backtest` composition root wires
+/// only `IronCondor`; extending it is out of #28's scope. The chain is generated
+/// in-test from [`common::strangle_rows`], and `config.json`'s `data_source.path`
+/// is the documentary placeholder the test overrides.
+mod short_strangle {
+    use std::path::{Path, PathBuf};
+
+    use ironcondor::analytics::metrics;
+    use ironcondor::{
+        BacktestConfig, BacktestEngine, DataSourceSpec, EquityPoint, NaiveFill, OptStratAdapter,
+        ParquetFeed, ResourceLimits,
+    };
+    use optionstratlib::simulation::ExitPolicy;
+    use optionstratlib::strategies::ShortStrangle;
+
+    use super::oracle::MetricsSummary;
+    use super::{GOLDEN_STEPS, bless_enabled, common, oracle, serialise_curve, serialise_metrics};
+
+    /// Absolute path to the committed short-strangle golden fixture directory.
+    fn fixture_dir() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/short_strangle_naive")
+    }
+
+    /// Load the pinned `config.json` (mode = naive) and repoint its data source
+    /// at the freshly-generated chain (the file path is a documentary
+    /// placeholder — see the iron-condor golden's module docs).
+    fn golden_config(chain_path: &Path) -> BacktestConfig {
+        let config_path = fixture_dir().join("config.json");
+        let Ok(text) = std::fs::read_to_string(&config_path) else {
+            panic!("the short strangle golden config.json must be readable at {config_path:?}");
+        };
+        let Ok(mut config) = serde_json::from_str::<BacktestConfig>(&text) else {
+            panic!("config.json must deserialise into a BacktestConfig");
+        };
+        config.data_source = DataSourceSpec::Parquet {
+            path: chain_path.display().to_string(),
+            sha256: String::new(),
+        };
+        config
+    }
+
+    /// Write the deterministic canonical two-leg strangle chain into `dir`.
+    fn write_chain(dir: &Path) -> PathBuf {
+        let chain_path = dir.join("short_strangle.parquet");
+        let rows = common::strangle_rows(GOLDEN_STEPS);
+        if common::write_parquet(&chain_path, &rows).is_err() {
+            panic!("the canonical short strangle golden chain must write");
+        }
+        chain_path
+    }
+
+    /// Assemble the short-strangle naive run directly and return the equity
+    /// curve + minimal metrics.
+    fn run_golden(chain_path: &Path) -> (Vec<EquityPoint>, MetricsSummary) {
+        let config = golden_config(chain_path);
+        let Ok(feed) = ParquetFeed::open(chain_path, &ResourceLimits::default()) else {
+            panic!("the canonical short strangle golden chain must open");
+        };
+        // A non-triggering exit so on_end is the sole closer (matches naive).
+        let exit = ExitPolicy::TimeSteps(1_000_000);
+        let Ok(adapter) =
+            OptStratAdapter::<ShortStrangle>::from_spec(&common::short_strangle_spec(), exit)
+        else {
+            panic!("the short strangle adapter must build");
+        };
+        let execution = NaiveFill::new(config.slippage.clone(), config.fees);
+        let Ok(mut run) = BacktestEngine::run(&config, feed, execution, adapter, "short_strangle")
+        else {
+            panic!("the canonical short strangle golden run must succeed");
+        };
+        let Ok(initial) = i64::try_from(config.initial_capital) else {
+            panic!("initial capital must fit i64 cents");
+        };
+        if metrics::populate(&mut run.result, &run.equity_curve, initial).is_err() {
+            panic!("the minimal metrics must populate the short strangle result");
+        }
+        let Ok(metrics) = MetricsSummary::from_result(&run.result) else {
+            panic!("the minimal metrics must be extractable from the result");
+        };
+        (run.equity_curve, metrics)
+    }
+
+    /// The short-strangle naive golden: run the canonical fixture and compare the
+    /// produced equity curve + minimal metrics against the committed `expected/`
+    /// via the shared oracle. `BLESS=1` regenerates `expected/` instead.
+    #[test]
+    fn test_golden_short_strangle_naive_matches_committed_v01_artifacts() {
+        let Ok(dir) = tempfile::tempdir() else {
+            panic!("a tempdir for the generated chain must create");
+        };
+        let chain_path = write_chain(dir.path());
+        let (curve, metrics) = run_golden(&chain_path);
+
+        let expected_dir = fixture_dir().join("expected");
+        let curve_path = expected_dir.join("equity_curve.json");
+        let metrics_path = expected_dir.join("metrics.json");
+
+        if bless_enabled() {
+            if std::fs::write(&curve_path, serialise_curve(&curve)).is_err()
+                || std::fs::write(&metrics_path, serialise_metrics(&metrics)).is_err()
+            {
+                panic!("BLESS must be able to rewrite the expected short strangle artifacts");
+            }
+            // Blessed — regeneration path skips the comparison by design.
+            return;
+        }
+
+        let Ok(expected_curve_text) = std::fs::read_to_string(&curve_path) else {
+            panic!("expected/equity_curve.json must exist — regenerate with BLESS=1");
+        };
+        let Ok(expected_metrics_text) = std::fs::read_to_string(&metrics_path) else {
+            panic!("expected/metrics.json must exist — regenerate with BLESS=1");
+        };
+        let Ok(expected_curve) = serde_json::from_str::<Vec<EquityPoint>>(&expected_curve_text)
+        else {
+            panic!("expected/equity_curve.json must deserialise");
+        };
+        let Ok(expected_metrics) = serde_json::from_str::<MetricsSummary>(&expected_metrics_text)
+        else {
+            panic!("expected/metrics.json must deserialise");
+        };
+
+        if let Err(diff) = oracle::compare_equity_curves(&curve, &expected_curve) {
+            panic!(
+                "short strangle golden equity-curve divergence: {diff} (regenerate with BLESS=1 if intended)"
+            );
+        }
+        if let Err(diff) = oracle::compare_metrics(&metrics, &expected_metrics) {
+            panic!(
+                "short strangle golden metrics divergence: {diff} (regenerate with BLESS=1 if intended)"
+            );
+        }
+    }
+
+    /// Same-environment run-twice for the short strangle: same `(seed, config,
+    /// data)` ⇒ byte-identical serialised equity curve and metrics across two
+    /// runs (the byte-determinism half of the contract for the second strategy).
+    #[test]
+    fn test_golden_short_strangle_run_twice_equity_and_metrics_are_byte_identical() {
+        let Ok(dir) = tempfile::tempdir() else {
+            panic!("a tempdir for the generated chain must create");
+        };
+        let chain_path = write_chain(dir.path());
+
+        let (curve_a, metrics_a) = run_golden(&chain_path);
+        let (curve_b, metrics_b) = run_golden(&chain_path);
+
+        assert_eq!(
+            serialise_curve(&curve_a),
+            serialise_curve(&curve_b),
+            "the serialised short strangle equity curve must be byte-identical across two runs"
+        );
+        assert_eq!(
+            serialise_metrics(&metrics_a),
+            serialise_metrics(&metrics_b),
+            "the serialised short strangle minimal metrics must be byte-identical across two runs"
+        );
+        assert_eq!(metrics_a, metrics_b);
+    }
+}
+
 /// The realistic-mode golden (feature `orderbook`, #24): the same v0.1 scope
 /// (equity curve + minimal metrics) as the naive golden above, but the run is
 /// assembled with [`ironcondor::RealisticFill`] so entries and exits route
