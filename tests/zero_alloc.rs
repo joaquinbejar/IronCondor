@@ -149,8 +149,9 @@ const STEPS: u32 = 64;
 /// Warmup step `K`. The condor opens once (at `on_start`, before step 0) and
 /// every one of its four contracts is marked at step 0's ledger settle, so all
 /// one-time growth — the `cmds`/`fills`/`equity_curve` buffers (sized at
-/// startup), the ledger's `marks` `BTreeMap` and `position_marks` scratch (grown
-/// on first mark at step 0) — is complete before step 1. `K = 8` is well past
+/// startup), the ledger's `marks` and `greeks` `BTreeMap`s and the
+/// `position_marks` scratch (grown on first mark at step 0) — is complete before
+/// step 1. `K = 8` is well past
 /// that single entry and fully into steady state, so the delta `K..last`
 /// measures only warm per-step bodies.
 const K: usize = 8;
