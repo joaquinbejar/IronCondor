@@ -127,10 +127,13 @@ This is the **v0.1 naive-throughput baseline** that later gates build on:
 - **#019 — zero-alloc replay-loop gate.** A separate hard CI invariant
   (per-step allocations must not grow with step count); this bench is the
   throughput companion to it, not the alloc gate itself.
-- **#051 — percentile-regression gate (before v1.0).** CI will compare a tracked
-  hot-path percentile against **this committed baseline** (not an absolute
-  number, so it tracks its own hardware). A merge that regresses the tracked
-  percentile beyond the stated tolerance fails
+- **#51 — hot-path regression gate (v1.0).** This naive baseline is protected
+  **portably** by the realistic/naive overhead **ratio floor** (18×) in
+  `scripts/bench_gate.sh`: a naive-mode regression slows naive, collapses the
+  ratio toward 1, and trips the floor — see the §H2 regression-gate tolerance
+  table for the band. The gate compares the dimensionless ratio against the
+  committed band, not an absolute number, so it tracks its own hardware; a merge
+  that regresses it beyond the band fails
   ([docs/07 §6](docs/07-performance-and-security.md#6-regression-gates-in-ci-before-v10)).
 
 ---
@@ -292,9 +295,138 @@ protects the naive baseline and the realistic overhead **portably**:
   a gross regression (the reduced-sample ratio measured 34.1× here, well inside
   the band). Verified locally: the gate PASSES on the current baseline and FAILS
   (exit 1) on a forced gross ratio (99× or 9×) or a forced 200 µs/step naive.
-- **Relationship to #051.** This is the first live percentile-tracked regression
-  gate; #051 extends the same machinery to the remaining hot paths (conversion,
-  bundle writer, PyO3) against their `BENCH.md` baselines.
+- **Relationship to #051.** This was the first live percentile-tracked regression
+  gate; **#51 extended the same machinery** to the remaining hot paths
+  (conversion §H3, bundle writer §H4, PyO3 §H5) against their `BENCH.md`
+  baselines. The bands below are each of those gates' committed tolerances.
+
+### Regression-gate tolerance (#51)
+
+| Gated quantity | Baseline | Band | Trips on |
+|----------------|----------|------|----------|
+| realistic / naive overhead ratio p50 | 36.13× | **[18×, 72×]** | a ~2× disproportionate naive (floor) or realistic (ceiling) regression |
+| naive per-step p50 (coarse backstop) | 2186 ns | **≤ 100 000 ns** | a catastrophic absolute naive regression the ratio is blind to (the SOLE absolute-number gate, #29) |
+
+`scripts/bench_gate.sh`, CI job `bench-gate`. The ratio is dimensionless and
+hardware-portable (a uniform clock factor cancels); the coarse ceiling is the
+one documented absolute backstop, set ~45× above the M4 baseline so CI hardware
+never approaches it.
+
+---
+
+## H3 / PB-4 — Conversion-boundary scaling (v1.0 baseline, #51)
+
+- **Bench:** `benches/conversion.rs` (`cargo bench --bench conversion`)
+- **Date measured:** 2026-07-17
+- **What it measures:** [`raw_quotes_to_snapshot`] — the DTO-independent
+  validation core in `src/data/convert.rs` that **every feed reuses** (there is
+  no second validation path), timed over a single snapshot of **growing contract
+  count**. One O(contracts) pass: per quote it rejects a non-positive /
+  non-tick-aligned strike, a non-tick bid/ask, a crossed quote, and a NaN /
+  infinite analytic; derives the one deterministic `mid`; resolves the expiry
+  once; and inserts into a `BTreeMap<ContractKey, QuoteView>`. This is the
+  per-snapshot boundary work a feed pays at tape materialisation — hot path
+  **H3**. The `snapshot_to_option_chain` sibling (the deferred-reprice path, off
+  the per-step loop) is the same O(contracts) complexity and is not separately
+  gated.
+- **Workload / scale:** one snapshot at **512 / 2 048 / 8 192 contracts** — a
+  **16×** sweep — each contract a distinct tick-aligned strike
+  (`100 000 + i·500` cents on the 5 c grid), one style, one expiry, a constant
+  tick-aligned `bid ≤ ask`, and finite analytics (so every quote validates and
+  every `ContractKey` is unique). The range spans below and well above a
+  realistic option chain, wide enough to expose super-linearity.
+- **Samples:** **61 008 / 14 295 / 3 573** recorded conversions (criterion
+  warmup + measurement at `--sample-size 100 --measurement-time 10`, all at
+  steady state after an explicit 32-conversion per-size warmup).
+
+### Measured percentiles
+
+Per-conversion latency is the raw measured quantity (each timed iteration is one
+full `raw_quotes_to_snapshot` over the size's contracts); `ns/contract` is the
+p50 divided by the contract count — a fair per-contract figure because every
+recorded conversion at a size processes exactly that many contracts.
+
+| contracts | samples | p50 | p99 | p99.9 | **ns/contract (p50)** |
+|-----------|---------|-----|-----|-------|------------------------|
+| 512       | 61 008  | 225.53 µs | 250.75 µs | 292.10 µs | 440.5 |
+| 2 048     | 14 295  | 953.86 µs | 1141.76 µs | 1173.50 µs | 465.75 |
+| 8 192     | 3 573   | 4061.18 µs | 4325.38 µs | 4501.50 µs | **495.75** |
+
+- **Scaling verdict — LINEAR (PB-4: MET).** Contracts grew **16×** (512 →
+  8 192); the per-contract cost rose only **1.13×** (440.5 → 495.75 ns/contract)
+  — a mild `log(contracts)` `BTreeMap`-assembly factor (≈ 1.44× worst case over
+  16×), **not** the ~16× a quadratic core would show. The conversion is
+  **O(contracts) single-pass**, converging to **≈ 2.0 M contracts/sec** on the
+  reference machine.
+- **The gated quantity is the cost ratio.** The dimensionless per-contract cost
+  ratio (largest / smallest = **1.125×**) is what the CI linearity gate tracks —
+  it is a within-run ratio, so a uniform hardware clock factor cancels and the
+  gate is portable to Linux CI.
+
+**Coordinated-omission disclosure.** A **closed-loop** micro-bench — each
+conversion starts immediately after the previous finishes, no external arrival
+schedule — so coordinated omission **does not apply**; the histogram records raw
+back-to-back latency (`Histogram::record`, not `record_correct`).
+
+**Tail-resolution caveat (honest).** The 512- and 2 048-contract sizes are richly
+resolved (61 k / 14 k samples). The 8 192-contract size has **3 573** recorded
+conversions (it is ~18× slower, so fewer fit the window): p50 and p99 are solid,
+p99.9 rests on ~3 samples beyond p99 — treat it as "≥ p99", not an independently
+resolved quantile. The **cost ratio** is taken at p50, where every size is solid.
+
+### Run conditions
+
+| Field | Value |
+|-------|-------|
+| CPU | Apple M4 Max |
+| Cores | 16 (16 physical) |
+| Memory | 64 GiB |
+| OS | macOS 26.5.2 (build 25F84) |
+| Toolchain | rustc 1.97.0 (2d8144b78 2026-07-07) |
+| Build profile | `bench` (optimized, `cargo bench`) |
+| Bench harness | `criterion` 0.5.1, `harness = false`, `--sample-size 100` |
+| Percentiles | `hdrhistogram` 7.5.4 (3 significant figures) |
+| `Cargo.lock` sha256 | `52e6e87afd51d878df63c046c2177946677ea92e5b59e55d1ed602063fabcb7b` |
+
+### Interpretation
+
+- **What the number means.** Converting one snapshot of `N` contracts costs
+  **≈ 496 ns per contract** at steady state on the reference machine — a single
+  O(contracts) validation pass with a `BTreeMap` assembly, no re-conversion. At
+  the p50 an 8 192-contract chain converts in **≈ 4.06 ms**.
+- **Did it meet PB-4?** PB-4's measurement clause is *"O(contracts) single pass
+  per snapshot; assert linear scaling across chain sizes"*
+  ([docs/07 §3](docs/07-performance-and-security.md#3-budgets-design-targets--pending-the-v01-bench-suite)).
+  **Met — measured, not asserted:** the per-contract cost is ~flat (1.13× over
+  16× contracts), so the pass is linear (with the expected mild `log n` map
+  factor), not quadratic.
+- **Scale.** Single snapshot, single core; the conversion runs once per snapshot
+  at materialisation, before the replay loop (the loop sees only the validated
+  `ChainSnapshot`, never a raw DTO).
+
+### Regression-gate tolerance (#51)
+
+| Gated quantity | Baseline | Ceiling | Trips on |
+|----------------|----------|---------|----------|
+| per-contract cost ratio (largest / smallest, 16× sweep) | 1.125× | **≤ 4.0×** | a quadratic-class super-linear regression — a quadratic core shows ≈ 16× |
+
+`scripts/linearity_gate.sh`, CI job `bench-gate`. The ceiling is a **shape
+bound**, not an absolute performance number, and it catches super-linear SHAPE,
+not magnitude: it separates the linear / `n·log n` regime (≈ 1.1–1.9×) from the
+quadratic one (≈ 16×), anchored to the O(contracts) scaling shape above. A uniform
+constant-factor slowdown that preserves the ratio passes silently (that case is
+the H1/H2 absolute backstop's job, §H2). **Scope:** the gate covers
+`raw_quotes_to_snapshot` (the per-snapshot validation core) only, **not**
+`snapshot_to_option_chain` (the deferred-reprice sibling, off the per-step loop).
+The gated quantity is a within-run dimensionless ratio, so a uniform clock factor
+cancels and the gate is portable to Linux CI.
+
+### Downstream
+
+This is the **v1.0 conversion baseline** the #51 linearity gate builds on — the
+first PB-4 measurement (previously a DESIGN TARGET pending its bench). The gate
+does not record new baselines; it wraps this one
+([docs/07 §6](docs/07-performance-and-security.md#6-regression-gates-in-ci-before-v10)).
 
 ---
 
@@ -548,14 +680,28 @@ as "OS-jitter-bounded", not an encode cost. The larger sizes have tight p99/p50
 - **Scale.** Single core, single strategy; the write is termination-phase, run
   once per backtest (Monte-Carlo parallelism is across runs, not within one).
 
+### Regression-gate tolerance (#51)
+
+| Gated quantity | Baseline | Ceiling | Trips on |
+|----------------|----------|---------|----------|
+| per-row cost ratio (largest / smallest, 128× row sweep) | ≈ 0.14–0.25× (healthy; cost *falls* with amortisation) | **≤ 2.0×** | a quadratic-class super-linear writer — **effective trip ≈ O(rows^1.5) and worse**; a true O(rows²) writer shows ≈ 128× |
+
+`scripts/linearity_gate.sh`, CI job `bench-gate`. The ceiling is a **shape
+bound**, not an absolute performance number, and it catches super-linear SHAPE,
+not magnitude: a uniform constant-factor slowdown that preserves the ratio passes
+silently here (that case is the H1/H2 absolute backstop's job, §H2). **Honest
+tightness caveat:** because the healthy per-row cost *falls* with amortisation
+(ratio ≈ 0.2×, far below 1.0), the 2.0× ceiling **reads tighter than it
+enforces** — it trips only at roughly **O(rows^1.5) and worse**, a quadratic-class
+regression, not at an `n·log n` drift. The gated quantity is a within-run
+dimensionless ratio, so a uniform clock factor cancels and the gate is portable to
+Linux CI.
+
 ### Downstream
 
-This is the **v0.3 bundle-writer baseline** the future gate builds on:
-
-- **#051 — percentile-regression gate (before v1.0).** CI will compare a tracked
-  writer percentile (or the per-row cost / bytes-per-row) against **this committed
-  baseline**. This issue lands the **measurement**; #051 wraps it in the gate
-  ([docs/07 §6](docs/07-performance-and-security.md#6-regression-gates-in-ci-before-v10)).
+This is the **v0.3 bundle-writer baseline** the #51 linearity gate builds on. The
+gate wraps the per-row cost ratio above (it does not record a new baseline)
+([docs/07 §6](docs/07-performance-and-security.md#6-regression-gates-in-ci-before-v10)).
 
 ---
 
@@ -764,15 +910,31 @@ reported result, not any single cell.
   (~78 ns), the full-marshal cost (~1.25 µs), and the **boundary fraction of a run
   (~0.04 %)**, which a uniform clock-speed factor largely preserves.
 
+### Regression-gate tolerance (#51)
+
+| Gated quantity | Baseline | Band | Trips on |
+|----------------|----------|------|----------|
+| full-config / single-crossing marshal ratio p50 | 16.03× (1250 ns / 78 ns) | **[8×, 32×]** | a ~2× disproportionate regression in the config/strategy marshal path (ceiling) or an inflated crossing floor (floor) |
+
+`scripts/pyo3_gate.sh`, CI job `bench-gate` (built with the `python` feature under
+`PYO3_PYTHON`). The gate tracks the **dimensionless full/single ratio**, not an
+absolute nanosecond count: both numbers are measured in the same embedded
+interpreter, same process, so a uniform clock factor cancels and the gate is
+portable to Linux CI. It catches a **disproportionate** marshal-path regression
+(SHAPE), not magnitude — a uniform slowdown of *both* the full and single crossing
+preserves the ratio and passes silently (as with H3/H4, the uniform-slowdown case
+is the H1/H2 absolute backstop's job, §H2). The band is a factor of two each way
+around the committed 16× baseline — noise-safe with reduced CI samples, tight
+enough to catch a ~2× disproportionate marshal-path regression.
+`marshal_single_call` is the batch-mean per-crossing floor (each sample the mean
+over 512 crossings), so the ratio is stable even at reduced sample counts
+(measured 15.7–16.4× reduced-sample here).
+
 ### Downstream
 
-This is the **v0.4 PyO3-boundary baseline** the future gate builds on:
-
-- **#051 — percentile-regression gate (before v1.0).** CI will compare a tracked
-  boundary percentile (the `marshal_full_config` p50, or the per-crossing floor)
-  against **this committed baseline**, not an absolute number, so it tracks its own
-  hardware. This issue lands the **measurement**; #051 wraps it in the gate
-  ([docs/07 §6](docs/07-performance-and-security.md#6-regression-gates-in-ci-before-v10)).
+This is the **v0.4 PyO3-boundary baseline** the #51 marshal-ratio gate builds on.
+The gate wraps the full/single ratio above (it does not record a new baseline)
+([docs/07 §6](docs/07-performance-and-security.md#6-regression-gates-in-ci-before-v10)).
 
 [`run_backtest`]: src/run.rs
 [`write_bundle`]: src/bundle/writer.rs

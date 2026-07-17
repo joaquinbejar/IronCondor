@@ -10,6 +10,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Hot-path percentile/linearity regression gates for every tracked path
+  H1–H5 are wired into CI (#51).** The `BENCH.md` baselines (H1/H2 #29, H4 #37,
+  H5 #43) are now wrapped in gates that fail a merge which regresses a tracked
+  quantity beyond its committed tolerance. **Every gate is baseline-relative —
+  no absolute-number threshold** except the one documented `#29` coarse naive
+  backstop; each gated quantity is a **dimensionless within-run ratio**, so a
+  uniform hardware clock factor cancels and the gate is portable from the Apple
+  M4 Max baselines to the Linux CI runners:
+  - a new **conversion bench** `benches/conversion.rs` (H3/PB-4, previously a
+    DESIGN TARGET with no bench) times `raw_quotes_to_snapshot` over a 16×
+    contract sweep and emits the per-contract cost ratio; its baseline
+    (per-contract cost ratio 1.13×, LINEAR) is recorded in `BENCH.md` §H3;
+  - `scripts/linearity_gate.sh` gates the H3 conversion (per-contract cost
+    ratio ≤ 4.0×) and H4 bundle-writer (per-row cost ratio ≤ 2.0×) **linearity**
+    — a super-linear O(n²) regression fails;
+  - `scripts/pyo3_gate.sh` gates the H5 PyO3 boundary (full/single marshal ratio
+    band [8×, 32×]); `benches/pyo3_marshal.rs` gains the machine-readable
+    `MARSHAL_*` lines it parses;
+  - the existing `scripts/bench_gate.sh` (#29) continues to gate H1+H2 via the
+    realistic/naive overhead ratio band [18×, 72×] plus the coarse naive
+    backstop;
+  - the `bench-gate` CI job now runs all four gate steps plus a **PB-1 zero-alloc
+    reaffirmation** (`cargo test --test zero_alloc`, reference — the canonical
+    hard gate stays the separate `zero-alloc` job);
+  - `BENCH.md` records the per-gate tolerance + run conditions next to each
+    baseline, and `scripts/GATE-EVIDENCE.md` captures the fail-closed evidence
+    (each gate proven to FAIL on a real bench-driven super-linear/disproportionate
+    scratch change, reverted, plus override self-tests). No production code
+    (`src/data/convert.rs`, `src/bundle/writer.rs`, `src/python/*`) changed.
 - **The determinism golden suite is hardened to the full bundle for every named
   scenario (#50).** The frozen four-table + `manifest.json` bundle golden (#36)
   covered only `iron_condor_naive`; it now covers **every** named golden scenario

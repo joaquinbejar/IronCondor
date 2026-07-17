@@ -115,24 +115,64 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.97.0
+      # The H5 PyO3 gate builds the `python` feature, which links libpython in
+      # embedding mode (pyo3 WITHOUT extension-module, #38), so it needs a shared
+      # libpython >= the abi3-py310 floor. The H1/H2 ratio and H3/H4 linearity
+      # gates need no interpreter.
+      - id: setup-python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - uses: Swatinem/rust-cache@v2
-      # PB-3 regression gate (#29, docs/07 §6, docs/TESTING.md §11.1). Runs the
-      # realistic-vs-naive A/B bench (`benches/realistic_overhead.rs`) with
-      # REDUCED criterion samples (short job — full-fidelity numbers are the
-      # local BENCH.md measurement) and fails the build if the DIMENSIONLESS
-      # realistic/naive overhead RATIO leaves its committed band.
+      # --------------------------------------------------------------------
+      # The v1.0 hot-path regression gates (#51, docs/07 §6, docs/TESTING.md
+      # §11.1) — one gate per tracked hot path H1–H5 against its BENCH.md
+      # baseline. EVERY gate is baseline-RELATIVE: it compares a DIMENSIONLESS
+      # within-run ratio against a committed band, NOT an absolute nanosecond
+      # count, because the BENCH.md baselines are Apple M4 Max while this runner
+      # is Linux — an absolute compare would false-positive every run. A uniform
+      # clock-speed factor cancels in every gated ratio.
       #
-      # Why the ratio, not an absolute number: the BENCH.md baseline is Apple
-      # M4 Max but this runner is Linux — an absolute-ns compare would false-
-      # positive every run. The ratio is HARDWARE-PORTABLE: both modes run the
-      # same `run_backtest` over the same tape in the same process, so a uniform
-      # clock-speed factor cancels and the ratio only moves on a real
-      # algorithmic regression in one mode (a naive regression drops it toward 1
-      # → trips the floor; a realistic blow-up raises it → trips the ceiling).
-      # A coarse absolute naive ceiling is a documented backstop for the one
-      # case the ratio is blind to (a regression that slows BOTH modes equally).
-      # Distinct from the zero-alloc gate (PB-1) and the throughput bench (PB-2).
-      - run: ./scripts/bench_gate.sh
+      # HONEST SCOPE: the H3/H4/H5 gates catch a super-linear / disproportionate
+      # SHAPE regression, NOT a magnitude one — a uniform constant-factor slowdown
+      # that preserves the ratio passes silently (that case is the H1/H2 coarse
+      # naive backstop's job, below). "One gate per hot path" means each path has
+      # a baseline gate, not that every regression on it is caught. The SOLE
+      # documented absolute number is the #29 coarse naive ceiling inside
+      # bench_gate.sh — a catastrophic-only backstop, never approached on CI
+      # hardware. A shortened --measurement-time keeps the stage short (the
+      # linearity benches fix their own sample count programmatically, so a
+      # --sample-size flag would be dead); full-fidelity numbers are the local
+      # BENCH.md entries.
+      # --------------------------------------------------------------------
+      # H1 replay loop + H2 fill models (#29): the realistic/naive overhead ratio
+      # band [18x, 72x]. A naive regression drops the ratio toward 1 (trips the
+      # floor — the naive-throughput protection); a realistic blow-up raises it
+      # (trips the ceiling). Plus the coarse absolute naive backstop.
+      - name: "H1+H2 — naive-throughput / realistic-overhead ratio gate"
+        run: ./scripts/bench_gate.sh
+      # H3 conversion + H4 bundle writer: the LINEARITY gates. The per-contract
+      # (conversion) and per-row (writer) within-run cost ratios must stay under
+      # their committed shape ceilings, so a super-linear O(n^2) regression fails.
+      # Dimensionless, so hardware-portable.
+      - name: "H3+H4 — conversion / bundle-writer linearity gate"
+        run: ./scripts/linearity_gate.sh
+      # H5 PyO3 boundary: the full-config / single-crossing marshal ratio band
+      # [8x, 32x]. A regression in the config/strategy marshal path relative to
+      # the trivial crossing floor fails. PYO3_PYTHON pins the interpreter
+      # setup-python provisioned.
+      - name: "H5 — PyO3 boundary marshal-ratio gate"
+        env:
+          PYO3_PYTHON: ${{ steps.setup-python.outputs.python-path }}
+        run: ./scripts/pyo3_gate.sh
+      # PB-1 zero-alloc REAFFIRMATION (reference, NOT reimplemented). The
+      # canonical hard gate is the separate `zero-alloc` job above; this re-runs
+      # the SAME `tests/zero_alloc.rs` invariant inside the perf-gate stage so the
+      # zero-steady-state-allocation guarantee is reaffirmed alongside the
+      # percentile/linearity gates (#51 acceptance criterion). A non-zero per-step
+      # allocation delta fails here too.
+      - name: "PB-1 — zero-alloc replay-loop gate (reaffirmation)"
+        run: cargo test --test zero_alloc
 
   security:
     name: security
