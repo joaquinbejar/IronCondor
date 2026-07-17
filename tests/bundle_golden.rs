@@ -1,17 +1,15 @@
-//! The **v0.3 golden result bundle** — the frozen `ironcondor.bundle.v1` wire
-//! contract, made executable (#36).
+//! The **golden result bundles** — the frozen `ironcondor.bundle.v1` wire
+//! contract, made executable across **every named golden scenario** (#36, #50).
 //!
 //! # What this pins
 //!
-//! A canonical `(config, data, seed)` naive iron-condor run is written to a
+//! For each named scenario a canonical `(config, data, seed)` run is written to a
 //! **frozen bundle** — `manifest.json` + the four Parquet tables (`fills`,
 //! `equity_curve`, `positions`, `greeks_attribution`) — under
-//! [`tests/golden/iron_condor_naive/expected/`](../tests/golden/iron_condor_naive).
-//! Two tests hold the freeze:
+//! `tests/golden/<scenario>/expected/`. Two tests hold each freeze:
 //!
-//! - **`write → read → equal`** ([`test_bundle_golden_iron_condor_naive_write_read_equal`]):
-//!   run → [`write_bundle`](ironcondor::write_bundle) →
-//!   [`read_bundle`](ironcondor::read_bundle) → assert the decoded bundle equals
+//! - **`write → read → equal`**: run → [`write_bundle`](ironcondor::write_bundle)
+//!   → [`read_bundle`](ironcondor::read_bundle) → assert the decoded bundle equals
 //!   the committed golden under the **single comparison oracle**
 //!   ([`oracle`], [docs/05 §12.5](../docs/05-analytics-and-reporting.md#125-equality-oracle-and-the-metrics-clause)):
 //!   decode, sort by each table's pinned key, compare integer cents **exactly**
@@ -19,10 +17,34 @@
 //!   manifest as canonical JSON with `created_utc` excluded. A value-changing
 //!   engine / attribution / schema change that leaves the golden untouched
 //!   **fails CI**.
-//! - **run-twice byte-identical** ([`test_bundle_run_twice_is_byte_identical`]):
-//!   same environment ⇒ the four Parquet tables are **byte-for-byte** identical
-//!   and `manifest.json` is byte-identical after stripping `created_utc`
+//! - **run-twice byte-identical**: same environment ⇒ the four Parquet tables are
+//!   **byte-for-byte** identical and `manifest.json` is byte-identical after
+//!   stripping `created_utc`
 //!   ([docs/05 §11](../docs/05-analytics-and-reporting.md#11-atomic-writes-and-determinism)).
+//!
+//! # Scenario coverage (#50 — the full four-table bundle for every named golden)
+//!
+//! The #36 bundle golden froze `iron_condor_naive` only. #50 extends the same
+//! full-bundle coverage (four tables + manifest, the single oracle, the run-twice
+//! byte test) to **every** named golden scenario the v0.1/v0.2 goldens introduced
+//! ([docs/TESTING.md §4](../docs/TESTING.md#4-golden-file-backtests)):
+//!
+//! - `iron_condor_naive` — the frozen #36 bundle (naive `IronCondor`). Its
+//!   committed bytes are the contract and stay untouched.
+//! - `short_strangle_naive` — the second strategy (naive `ShortStrangle`),
+//!   proving the bundle writer + oracle generalise beyond `IronCondor`.
+//! - `iron_condor_realistic` — the same strategy under **realistic** fills
+//!   (feature `orderbook`), proving the bundle is mode-agnostic in structure
+//!   while its values diverge (realistic pays the spread). The mode-pair
+//!   full-bundle schema test ([`realistic::test_bundle_golden_pair_schema_is_mode_agnostic`])
+//!   pins that: identical manifest key shape, divergent table values.
+//!
+//! Each scenario shares the same write→read→compare and run-twice helpers
+//! ([`assert_bundle_golden`], [`assert_run_twice`]) and the same `BLESS` path
+//! ([`bless_bundle`]) — one implementation, one oracle, per the determinism
+//! contract. The v0.1-scoped equity-curve + minimal-metrics goldens for these
+//! scenarios stay in [`tests/golden.rs`](golden.rs); this file adds the
+//! full-bundle layer on top, it does not replace them.
 //!
 //! # Why the bundle golden is stable across commits (the #36 freeze pins)
 //!
@@ -39,33 +61,33 @@
 //!   chain is **generated in-test** from the committed [`common`] builder into a
 //!   tempdir (the repo convention is "no committed binary chain"), so its file
 //!   path is random and its Parquet bytes could differ across `arrow`/`parquet`
-//!   serialisations. The golden run therefore overrides the run's data-source
-//!   provenance and tape identity to fixed canonical constants
-//!   ([`CANONICAL_DATA_PATH`] / [`CANONICAL_DATA_IDENTITY`]) — the chain's
-//!   *identity* for the golden is the committed generator, not the random bytes.
-//!   This decouples the `run_id` and the manifest from any chain-serialisation
-//!   or platform variance while keeping the four tables (the substantive P&L)
-//!   fully exercised.
+//!   serialisations. Each golden run therefore overrides the run's data-source
+//!   provenance and tape identity to fixed canonical constants (one per
+//!   scenario) — the chain's *identity* for the golden is the committed
+//!   generator, not the random bytes. This decouples the `run_id` and the
+//!   manifest from any chain-serialisation or platform variance while keeping the
+//!   four tables (the substantive P&L) fully exercised.
 //! - **The operational output path is non-semantic.** `config.output_dir` is the
 //!   tempdir write target; it is excluded from the semantic `run_id`
 //!   ([docs/05 §11](../docs/05-analytics-and-reporting.md#11-atomic-writes-and-determinism))
 //!   and is canonicalised alongside `created_utc` in the manifest comparison
 //!   ([`oracle::canonical_manifest`]).
 //!
-//! # Regenerating the golden (BLESS)
+//! # Regenerating the goldens (BLESS)
 //!
-//! A deliberate value-changing change re-blesses the golden **in the same
-//! commit**:
+//! A deliberate value-changing change re-blesses the affected golden **in the
+//! same commit**:
 //!
 //! ```text
-//! BLESS=1 cargo test --test bundle_golden
+//! BLESS=1 cargo test --test bundle_golden                     # naive scenarios
+//! BLESS=1 cargo test --test bundle_golden --features orderbook  # + realistic
 //! ```
 //!
-//! which copies the four produced Parquet tables into `expected/` and writes a
-//! **normalised** `manifest.json` (canonical `created_utc` + canonical
-//! `output_dir`, so the committed golden is clean and reproducible-looking — the
-//! comparison strips both anyway). Review the diff, then commit it alongside the
-//! code change.
+//! which copies the four produced Parquet tables into the scenario's `expected/`
+//! and writes a **normalised** `manifest.json` (canonical `created_utc` +
+//! canonical `output_dir`, so the committed golden is clean and
+//! reproducible-looking — the comparison strips both anyway). Review the diff,
+//! then commit it alongside the code change.
 
 use std::path::{Path, PathBuf};
 
@@ -77,7 +99,7 @@ use ironcondor::{
     StrategySpec, read_bundle, write_bundle,
 };
 use optionstratlib::simulation::ExitPolicy;
-use optionstratlib::strategies::IronCondor;
+use optionstratlib::strategies::{IronCondor, ShortStrangle};
 
 mod common;
 mod oracle;
@@ -86,23 +108,29 @@ mod oracle;
 /// mark, and the terminal `on_end` close of every leg.
 const GOLDEN_STEPS: u32 = 8;
 
-/// The canonical (documentary) data-source path recorded in the golden manifest
-/// — a placeholder, not the tempdir the chain is generated into (see the module
-/// docs).
+/// The canonical (documentary) iron-condor data-source path recorded in the
+/// golden manifest — a placeholder, not the tempdir the chain is generated into
+/// (see the module docs).
 const CANONICAL_DATA_PATH: &str = "iron_condor.parquet";
 
-/// The canonical tape identity hashed into the golden `run_id` — pinned so the
-/// `run_id` is independent of the generated chain's Parquet bytes / platform.
+/// The canonical (documentary) short-strangle data-source path.
+const CANONICAL_STRANGLE_DATA_PATH: &str = "short_strangle.parquet";
+
+/// The canonical tape identity hashed into the naive iron-condor `run_id` —
+/// pinned so the `run_id` is independent of the generated chain's Parquet bytes.
 const CANONICAL_DATA_IDENTITY: &str = "golden:iron_condor_naive:ironcondor.bundle.v1";
 
-/// The canonical `created_utc` written into the committed golden manifest (the
+/// The canonical tape identity hashed into the short-strangle `run_id`.
+const CANONICAL_STRANGLE_DATA_IDENTITY: &str = "golden:short_strangle_naive:ironcondor.bundle.v1";
+
+/// The canonical `created_utc` written into a committed golden manifest (the
 /// comparison strips `created_utc`, so any fixed value works; a clean epoch
 /// timestamp keeps the committed file reproducible-looking).
 const CANONICAL_CREATED_UTC: &str = "1970-01-01T00:00:00+00:00";
 
-/// The canonical operational output path written into the committed golden
-/// manifest (the comparison canonicalises `config.output_dir`, so the real
-/// tempdir never reaches the frozen file).
+/// The canonical operational output path written into a committed golden manifest
+/// (the comparison canonicalises `config.output_dir`, so the real tempdir never
+/// reaches the frozen file).
 const CANONICAL_OUTPUT_DIR: &str = "golden-out";
 
 /// The four Parquet tables of the bundle, in a fixed order.
@@ -113,9 +141,12 @@ const TABLE_FILES: [&str; 4] = [
     "greeks_attribution.parquet",
 ];
 
-/// Absolute path to the committed golden bundle directory.
-fn expected_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/iron_condor_naive/expected")
+/// Absolute path to a scenario's committed golden `expected/` directory.
+fn expected_dir(scenario: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/golden")
+        .join(scenario)
+        .join("expected")
 }
 
 /// Whether `BLESS=1` is set — regenerate the committed golden bundle.
@@ -123,20 +154,22 @@ fn bless_enabled() -> bool {
     std::env::var_os("BLESS").is_some_and(|value| value == "1")
 }
 
-/// The canonical data-source provenance recorded in the golden manifest (an
-/// unpinned `sha256`, so `read_bundle` never tries to re-hash the absent chain).
-fn canonical_data_source() -> DataSourceSpec {
+/// A canonical data-source provenance recorded in a golden manifest (an unpinned
+/// `sha256`, so `read_bundle` never tries to re-hash the absent chain).
+fn canonical_data_source(path: &str) -> DataSourceSpec {
     DataSourceSpec::Parquet {
-        path: CANONICAL_DATA_PATH.to_string(),
+        path: path.to_string(),
         sha256: String::new(),
     }
 }
 
-/// The pinned semantic config for the canonical golden run (naive iron condor).
-fn golden_config(output_dir: &Path) -> BacktestConfig {
+/// The pinned semantic config shared by the naive iron-condor golden (#36) and
+/// the short-strangle golden — same seed / capital / fees / slippage / limits;
+/// the caller supplies the mode and data-source path.
+fn base_config(mode: ExecutionMode, data_path: &str, output_dir: &Path) -> BacktestConfig {
     BacktestConfig {
-        data_source: canonical_data_source(),
-        mode: ExecutionMode::Naive,
+        data_source: canonical_data_source(data_path),
+        mode,
         seed: 42,
         initial_capital: 10_000_000,
         fees: FeeSchedule {
@@ -152,34 +185,16 @@ fn golden_config(output_dir: &Path) -> BacktestConfig {
     }
 }
 
-/// Assemble and run the canonical naive iron-condor bundle run: generate the
-/// deterministic chain into `chain_dir`, drive `ParquetFeed → BacktestEngine::run
-/// → metrics::populate → attribution::attribute`, and pin the data-source
-/// identity to the canonical constants so the `run_id` + manifest are stable
-/// (see the module docs). Returns the config + strategy spec + the completed run.
-fn build_golden_run(
-    chain_dir: &Path,
-    output_dir: &Path,
-) -> (BacktestConfig, StrategySpec, BacktestRun) {
-    let chain_path = chain_dir.join("iron_condor.parquet");
-    let rows = common::condor_rows(GOLDEN_STEPS, None);
-    if common::write_parquet(&chain_path, &rows).is_err() {
-        panic!("the canonical golden chain must write");
-    }
-    let Ok(feed) = ParquetFeed::open(&chain_path, &ResourceLimits::default()) else {
-        panic!("the canonical golden chain must open");
-    };
-    let config = golden_config(output_dir);
-    let spec = common::iron_condor_spec();
-    // A non-triggering exit so on_end is the sole closer (matches the v0.1 golden).
-    let exit = ExitPolicy::TimeSteps(1_000_000);
-    let Ok(adapter) = OptStratAdapter::<IronCondor>::from_spec(&spec, exit) else {
-        panic!("the iron condor adapter must build");
-    };
-    let execution = NaiveFill::new(config.slippage.clone(), config.fees);
-    let Ok(mut run) = BacktestEngine::run(&config, feed, execution, adapter, "iron_condor") else {
-        panic!("the canonical golden run must succeed");
-    };
+/// Populate the post-run analytics (summary metrics + per-step P&L attribution)
+/// and pin the run's data-source provenance + tape identity to the scenario's
+/// canonical constants, so the `run_id` + manifest are independent of the tempdir
+/// chain path and its Parquet-serialisation bytes (see the module docs).
+fn finalize_run(
+    run: &mut BacktestRun,
+    config: &BacktestConfig,
+    data_path: &str,
+    data_identity: &str,
+) {
     let Ok(initial) = i64::try_from(config.initial_capital) else {
         panic!("initial capital must fit i64 cents");
     };
@@ -198,18 +213,92 @@ fn build_golden_run(
         panic!("the P&L attribution must decompose the golden run");
     };
     run.greeks_attribution = rows;
-    // Pin the data-source provenance + tape identity to canonical constants so
-    // the run_id (directory name) + manifest are independent of the tempdir
-    // chain path and its Parquet-serialisation bytes (see the module docs).
-    run.data_source = canonical_data_source();
-    run.data_identity = CANONICAL_DATA_IDENTITY.to_string();
+    run.data_source = canonical_data_source(data_path);
+    run.data_identity = data_identity.to_string();
+}
+
+/// Assemble and run the canonical **naive iron-condor** bundle run: generate the
+/// deterministic chain into `chain_dir`, drive `ParquetFeed → BacktestEngine::run
+/// → metrics::populate → attribution::attribute`, and pin the data-source
+/// identity to the canonical constants. Returns the config + strategy spec + the
+/// completed run.
+fn build_iron_condor_naive_run(
+    chain_dir: &Path,
+    output_dir: &Path,
+) -> (BacktestConfig, StrategySpec, BacktestRun) {
+    let chain_path = chain_dir.join("iron_condor.parquet");
+    let rows = common::condor_rows(GOLDEN_STEPS, None);
+    if common::write_parquet(&chain_path, &rows).is_err() {
+        panic!("the canonical golden chain must write");
+    }
+    let Ok(feed) = ParquetFeed::open(&chain_path, &ResourceLimits::default()) else {
+        panic!("the canonical golden chain must open");
+    };
+    let config = base_config(ExecutionMode::Naive, CANONICAL_DATA_PATH, output_dir);
+    let spec = common::iron_condor_spec();
+    // A non-triggering exit so on_end is the sole closer (matches the v0.1 golden).
+    let exit = ExitPolicy::TimeSteps(1_000_000);
+    let Ok(adapter) = OptStratAdapter::<IronCondor>::from_spec(&spec, exit) else {
+        panic!("the iron condor adapter must build");
+    };
+    let execution = NaiveFill::new(config.slippage.clone(), config.fees);
+    let Ok(mut run) = BacktestEngine::run(&config, feed, execution, adapter, "iron_condor") else {
+        panic!("the canonical golden run must succeed");
+    };
+    finalize_run(
+        &mut run,
+        &config,
+        CANONICAL_DATA_PATH,
+        CANONICAL_DATA_IDENTITY,
+    );
     (config, spec, run)
 }
 
-/// Copy the four produced Parquet tables into `expected/` and write a normalised
-/// `manifest.json` (canonical `created_utc` + `output_dir`) — the BLESS path.
-fn bless_bundle(produced_dir: &Path) {
-    let expected = expected_dir();
+/// Assemble and run the canonical **naive short-strangle** bundle run — the same
+/// pipeline as [`build_iron_condor_naive_run`] but with the two-leg
+/// [`ShortStrangle`] strategy over the [`common::strangle_rows`] chain, proving
+/// the bundle writer + oracle generalise to the second strategy (#28/#50).
+fn build_short_strangle_naive_run(
+    chain_dir: &Path,
+    output_dir: &Path,
+) -> (BacktestConfig, StrategySpec, BacktestRun) {
+    let chain_path = chain_dir.join("short_strangle.parquet");
+    let rows = common::strangle_rows(GOLDEN_STEPS);
+    if common::write_parquet(&chain_path, &rows).is_err() {
+        panic!("the canonical short strangle golden chain must write");
+    }
+    let Ok(feed) = ParquetFeed::open(&chain_path, &ResourceLimits::default()) else {
+        panic!("the canonical short strangle golden chain must open");
+    };
+    let config = base_config(
+        ExecutionMode::Naive,
+        CANONICAL_STRANGLE_DATA_PATH,
+        output_dir,
+    );
+    let spec = common::short_strangle_spec();
+    let exit = ExitPolicy::TimeSteps(1_000_000);
+    let Ok(adapter) = OptStratAdapter::<ShortStrangle>::from_spec(&spec, exit) else {
+        panic!("the short strangle adapter must build");
+    };
+    let execution = NaiveFill::new(config.slippage.clone(), config.fees);
+    let Ok(mut run) = BacktestEngine::run(&config, feed, execution, adapter, "short_strangle")
+    else {
+        panic!("the canonical short strangle golden run must succeed");
+    };
+    finalize_run(
+        &mut run,
+        &config,
+        CANONICAL_STRANGLE_DATA_PATH,
+        CANONICAL_STRANGLE_DATA_IDENTITY,
+    );
+    (config, spec, run)
+}
+
+/// Copy the four produced Parquet tables into the scenario's `expected/` and
+/// write a normalised `manifest.json` (canonical `created_utc` + `output_dir`) —
+/// the BLESS path.
+fn bless_bundle(scenario: &str, produced_dir: &Path) {
+    let expected = expected_dir(scenario);
     if std::fs::create_dir_all(&expected).is_err() {
         panic!("the golden expected/ directory must exist");
     }
@@ -243,54 +332,53 @@ fn bless_bundle(produced_dir: &Path) {
     }
 }
 
-/// The golden write→read→equal: run the canonical fixture, write the bundle,
-/// read it back, and compare it to the committed golden under the single oracle
-/// (tables decoded/sorted/exact, manifest canonical JSON with `created_utc`
-/// excluded). `BLESS=1` regenerates the committed golden instead.
-#[test]
-fn test_bundle_golden_iron_condor_naive_write_read_equal() {
-    let Ok(chain_dir) = tempfile::tempdir() else {
-        panic!("a tempdir for the generated chain must create");
-    };
-    let Ok(out_dir) = tempfile::tempdir() else {
-        panic!("a tempdir for the bundle output must create");
-    };
-    let (config, spec, run) = build_golden_run(chain_dir.path(), out_dir.path());
-    let Ok(produced_dir) = write_bundle(&run, &config, &spec) else {
+/// The shared golden assertion: write the produced `run` to a bundle, read it
+/// back, and compare it to the scenario's committed golden under the single
+/// oracle (tables decoded/sorted/exact, manifest canonical JSON with
+/// `created_utc` excluded). `BLESS=1` regenerates the committed golden instead.
+fn assert_bundle_golden(
+    scenario: &str,
+    config: &BacktestConfig,
+    spec: &StrategySpec,
+    run: &BacktestRun,
+) {
+    let Ok(produced_dir) = write_bundle(run, config, spec) else {
         panic!("the golden bundle must write");
     };
 
     if bless_enabled() {
-        bless_bundle(&produced_dir);
+        bless_bundle(scenario, &produced_dir);
         return;
     }
 
-    // write → read → equal, under the single comparison oracle.
     let limits = ResourceLimits::default();
     let Ok(produced) = read_bundle(&produced_dir, &limits) else {
         panic!("the produced bundle must read back");
     };
-    let Ok(expected) = read_bundle(expected_dir(), &limits) else {
+    let Ok(expected) = read_bundle(expected_dir(scenario), &limits) else {
         panic!("the committed golden bundle must read back — regenerate with BLESS=1");
     };
     if let Err(diff) = oracle::compare_bundle_tables(&produced, &expected) {
-        panic!("golden bundle table divergence: {diff} (regenerate with BLESS=1 if intended)");
+        panic!(
+            "golden bundle table divergence [{scenario}]: {diff} (regenerate with BLESS=1 if intended)"
+        );
     }
     let produced_manifest = oracle::read_manifest_json(&produced_dir);
-    let expected_manifest = oracle::read_manifest_json(&expected_dir());
+    let expected_manifest = oracle::read_manifest_json(&expected_dir(scenario));
     if let Err(diff) = oracle::compare_manifest_json(&produced_manifest, &expected_manifest) {
-        panic!("golden bundle manifest divergence: {diff} (regenerate with BLESS=1 if intended)");
+        panic!(
+            "golden bundle manifest divergence [{scenario}]: {diff} (regenerate with BLESS=1 if intended)"
+        );
     }
 }
 
-/// Same-environment run-twice: two identical runs into two fresh output roots
-/// produce **byte-identical** Parquet tables and a `manifest.json` identical
-/// after stripping `created_utc`. (The two runs use two temp output roots, so
-/// the operational `config.output_dir` legitimately differs and is canonicalised
-/// alongside `created_utc` — it is non-semantic and excluded from the `run_id`,
-/// docs/05 §11; the four tables never embed it and are compared raw byte-for-byte.)
-#[test]
-fn test_bundle_run_twice_is_byte_identical() {
+/// The shared run-twice byte assertion: build + write the scenario twice into two
+/// fresh output roots and assert the four Parquet tables are **byte-identical**
+/// and `manifest.json` is identical after stripping `created_utc` (+
+/// canonicalising the operational `output_dir`, which legitimately differs
+/// between the two temp roots — it is non-semantic and excluded from the
+/// `run_id`, docs/05 §11; the four tables never embed it and are compared raw).
+fn assert_run_twice(build: impl Fn(&Path, &Path) -> (BacktestConfig, StrategySpec, BacktestRun)) {
     let write_once = || -> (PathBuf, tempfile::TempDir, tempfile::TempDir) {
         let Ok(chain_dir) = tempfile::tempdir() else {
             panic!("a tempdir for the generated chain must create");
@@ -298,7 +386,7 @@ fn test_bundle_run_twice_is_byte_identical() {
         let Ok(out_dir) = tempfile::tempdir() else {
             panic!("a tempdir for the bundle output must create");
         };
-        let (config, spec, run) = build_golden_run(chain_dir.path(), out_dir.path());
+        let (config, spec, run) = build(chain_dir.path(), out_dir.path());
         let Ok(produced_dir) = write_bundle(&run, &config, &spec) else {
             panic!("the golden bundle must write");
         };
@@ -337,6 +425,51 @@ fn test_bundle_run_twice_is_byte_identical() {
     );
 }
 
+/// The `iron_condor_naive` golden write→read→equal (the frozen #36 bundle):
+/// run the canonical fixture, write the bundle, read it back, and compare it to
+/// the committed golden under the single oracle. `BLESS=1` regenerates instead.
+#[test]
+fn test_bundle_golden_iron_condor_naive_write_read_equal() {
+    let Ok(chain_dir) = tempfile::tempdir() else {
+        panic!("a tempdir for the generated chain must create");
+    };
+    let Ok(out_dir) = tempfile::tempdir() else {
+        panic!("a tempdir for the bundle output must create");
+    };
+    let (config, spec, run) = build_iron_condor_naive_run(chain_dir.path(), out_dir.path());
+    assert_bundle_golden("iron_condor_naive", &config, &spec, &run);
+}
+
+/// Same-environment run-twice for `iron_condor_naive`: two identical runs into two
+/// fresh output roots produce byte-identical tables + a manifest identical after
+/// stripping `created_utc`.
+#[test]
+fn test_bundle_run_twice_is_byte_identical() {
+    assert_run_twice(build_iron_condor_naive_run);
+}
+
+/// The `short_strangle_naive` golden write→read→equal (#50): the same full
+/// four-table + manifest freeze as the iron-condor bundle, for the second
+/// strategy through the **unchanged** generic writer + oracle.
+#[test]
+fn test_bundle_golden_short_strangle_naive_write_read_equal() {
+    let Ok(chain_dir) = tempfile::tempdir() else {
+        panic!("a tempdir for the generated chain must create");
+    };
+    let Ok(out_dir) = tempfile::tempdir() else {
+        panic!("a tempdir for the bundle output must create");
+    };
+    let (config, spec, run) = build_short_strangle_naive_run(chain_dir.path(), out_dir.path());
+    assert_bundle_golden("short_strangle_naive", &config, &spec, &run);
+}
+
+/// Same-environment run-twice for `short_strangle_naive` (#50): byte-identical
+/// four tables + manifest across two runs.
+#[test]
+fn test_bundle_run_twice_short_strangle_is_byte_identical() {
+    assert_run_twice(build_short_strangle_naive_run);
+}
+
 /// The oracle's near-boundary float cases ([docs/05 §12.5](../docs/05-analytics-and-reporting.md#125-equality-oracle-and-the-metrics-clause)):
 /// signed zero equal, `NaN` never equal (a produced `NaN` is itself a load
 /// error the reader rejects), `±∞` equal only to the same infinity. These pin
@@ -360,4 +493,212 @@ fn test_oracle_near_boundary_float_cases() {
     assert!(!oracle::floats_equal(f64::INFINITY, f64::NEG_INFINITY));
     assert!(!oracle::floats_equal(f64::NEG_INFINITY, f64::INFINITY));
     assert!(!oracle::floats_equal(f64::INFINITY, 1.0));
+}
+
+/// The realistic-mode bundle golden (feature `orderbook`, #24/#50): the same
+/// full four-table + manifest freeze as the naive bundle, but the run is
+/// assembled with [`ironcondor::RealisticFill`] so entries and exits route
+/// through the seeded `option-chain-orderbook` book — the values diverge from
+/// naive (the fill-risk signal the mode exists to surface), the structure does
+/// not (the mode-pair schema test pins that).
+#[cfg(feature = "orderbook")]
+mod realistic {
+    use std::path::Path;
+
+    use ironcondor::{
+        BacktestConfig, BacktestEngine, BacktestRun, ExecutionMode, OptStratAdapter, ParquetFeed,
+        RealisticFill, ResourceLimits, StrategySpec, read_bundle,
+    };
+    use optionstratlib::simulation::ExitPolicy;
+    use optionstratlib::strategies::IronCondor;
+
+    use super::{
+        CANONICAL_DATA_PATH, GOLDEN_STEPS, assert_bundle_golden, assert_run_twice, base_config,
+        common, expected_dir, finalize_run, oracle,
+    };
+
+    /// The canonical tape identity hashed into the realistic `run_id`.
+    const CANONICAL_REALISTIC_DATA_IDENTITY: &str =
+        "golden:iron_condor_realistic:ironcondor.bundle.v1";
+
+    /// Assemble the realistic run **directly**: a `ParquetFeed`, a
+    /// `RealisticFill::with_liquidity_profile` seeded from the config's seed +
+    /// liquidity profile, and the `IronCondor` adapter, driven through
+    /// `BacktestEngine::run` → `metrics::populate` → `attribution::attribute`,
+    /// over the **same** canonical chain as the naive bundle.
+    fn build_iron_condor_realistic_run(
+        chain_dir: &Path,
+        output_dir: &Path,
+    ) -> (BacktestConfig, StrategySpec, BacktestRun) {
+        let chain_path = chain_dir.join("iron_condor.parquet");
+        let rows = common::condor_rows(GOLDEN_STEPS, None);
+        if common::write_parquet(&chain_path, &rows).is_err() {
+            panic!("the canonical golden chain must write");
+        }
+        let Ok(feed) = ParquetFeed::open(&chain_path, &ResourceLimits::default()) else {
+            panic!("the canonical golden chain must open");
+        };
+        let config = base_config(ExecutionMode::Realistic, CANONICAL_DATA_PATH, output_dir);
+        let spec = common::iron_condor_spec();
+        let exit = ExitPolicy::TimeSteps(1_000_000);
+        let Ok(adapter) = OptStratAdapter::<IronCondor>::from_spec(&spec, exit) else {
+            panic!("the iron condor adapter must build");
+        };
+        let execution = RealisticFill::with_liquidity_profile(
+            config.fees,
+            config.marketable_cap_ticks,
+            config.seed,
+            config.liquidity_profile,
+        );
+        let Ok(mut run) = BacktestEngine::run(&config, feed, execution, adapter, "iron_condor")
+        else {
+            panic!("the canonical realistic golden run must succeed");
+        };
+        finalize_run(
+            &mut run,
+            &config,
+            CANONICAL_DATA_PATH,
+            CANONICAL_REALISTIC_DATA_IDENTITY,
+        );
+        (config, spec, run)
+    }
+
+    /// The `iron_condor_realistic` golden write→read→equal (#50): the full
+    /// four-table + manifest freeze under realistic fills.
+    #[test]
+    fn test_bundle_golden_iron_condor_realistic_write_read_equal() {
+        let Ok(chain_dir) = tempfile::tempdir() else {
+            panic!("a tempdir for the generated chain must create");
+        };
+        let Ok(out_dir) = tempfile::tempdir() else {
+            panic!("a tempdir for the bundle output must create");
+        };
+        let (config, spec, run) = build_iron_condor_realistic_run(chain_dir.path(), out_dir.path());
+        assert_bundle_golden("iron_condor_realistic", &config, &spec, &run);
+    }
+
+    /// Same-environment run-twice for `iron_condor_realistic` (#50): byte-identical
+    /// four tables + manifest across two seeded-book runs.
+    #[test]
+    fn test_bundle_run_twice_realistic_is_byte_identical() {
+        assert_run_twice(build_iron_condor_realistic_run);
+    }
+
+    /// #50 mode-pair full-bundle schema parity: the committed `iron_condor_naive`
+    /// and `iron_condor_realistic` bundles — the **same strategy** under both
+    /// modes — share an **identical manifest key shape** and identical decoded
+    /// table column sets while their **values diverge** (realistic pays the
+    /// spread). This proves the full bundle is mode-agnostic in structure end to
+    /// end: analytics cannot tell which mode produced a bundle from its shape
+    /// ([04 §2](../docs/04-execution-models.md#2-the-executionmodel-trait-and-the-shared-fill-report)).
+    /// It reads the committed `expected/` bundles only — it never blesses.
+    #[test]
+    fn test_bundle_golden_pair_schema_is_mode_agnostic() {
+        let limits = ResourceLimits::default();
+        let Ok(naive) = read_bundle(expected_dir("iron_condor_naive"), &limits) else {
+            panic!("the committed naive golden bundle must read back");
+        };
+        let Ok(realistic) = read_bundle(expected_dir("iron_condor_realistic"), &limits) else {
+            panic!("the committed realistic golden bundle must read back");
+        };
+
+        // Manifest structure parity: identical top-level key shape + dtypes, and
+        // identical `config` key shape. (The `mode` VALUE differs — naive vs
+        // realistic — which the value check below relies on.)
+        let naive_manifest = oracle::read_manifest_json(&expected_dir("iron_condor_naive"));
+        let realistic_manifest = oracle::read_manifest_json(&expected_dir("iron_condor_realistic"));
+        assert_eq!(
+            manifest_schema(&naive_manifest),
+            manifest_schema(&realistic_manifest),
+            "manifest top-level key shape must be mode-agnostic"
+        );
+        assert_eq!(
+            config_schema(&naive_manifest),
+            config_schema(&realistic_manifest),
+            "manifest config key shape must be mode-agnostic"
+        );
+
+        // The two bundles have the same row counts per table (same scenario, same
+        // number of steps / legs) — the decoded row TYPES are identical by
+        // construction, so equal lengths is the structural claim at the table
+        // level.
+        assert_eq!(
+            naive.fills.len(),
+            realistic.fills.len(),
+            "fills row count must be mode-agnostic"
+        );
+        assert_eq!(
+            naive.equity_curve.len(),
+            realistic.equity_curve.len(),
+            "equity_curve row count must be mode-agnostic"
+        );
+        assert_eq!(
+            naive.positions.len(),
+            realistic.positions.len(),
+            "positions row count must be mode-agnostic"
+        );
+        assert_eq!(
+            naive.greeks_attribution.len(),
+            realistic.greeks_attribution.len(),
+            "greeks_attribution row count must be mode-agnostic"
+        );
+
+        // Values diverge: realistic crosses the seeded spread on entry and exit,
+        // so at least one fill price and at least one equity point must differ.
+        assert!(
+            naive
+                .fills
+                .iter()
+                .zip(realistic.fills.iter())
+                .any(|(n, r)| n.price_cents != r.price_cents),
+            "realistic fills must diverge from naive — realistic pays the spread"
+        );
+        assert!(
+            naive
+                .equity_curve
+                .iter()
+                .zip(realistic.equity_curve.iter())
+                .any(|(n, r)| n.equity_cents != r.equity_cents),
+            "realistic equity must diverge from naive — it collapsed into naive fills"
+        );
+    }
+
+    /// The JSON kind of a value — its "dtype" at the serialised boundary.
+    fn json_kind(value: &serde_json::Value) -> &'static str {
+        match value {
+            serde_json::Value::Null => "null",
+            serde_json::Value::Bool(_) => "bool",
+            serde_json::Value::Number(_) => "number",
+            serde_json::Value::String(_) => "string",
+            serde_json::Value::Array(_) => "array",
+            serde_json::Value::Object(_) => "object",
+        }
+    }
+
+    /// The sorted `(key, dtype)` pairs of a JSON object — its schema.
+    fn schema_of(value: &serde_json::Value) -> Vec<(String, &'static str)> {
+        let Some(obj) = value.as_object() else {
+            panic!("expected a JSON object to extract a schema from");
+        };
+        let mut pairs: Vec<(String, &'static str)> =
+            obj.iter().map(|(k, v)| (k.clone(), json_kind(v))).collect();
+        pairs.sort();
+        pairs
+    }
+
+    /// The manifest's top-level key shape, with `created_utc` (wall-clock) and the
+    /// opaque `metrics` object excluded — the structural surface a consumer sees.
+    fn manifest_schema(manifest: &serde_json::Value) -> Vec<(String, &'static str)> {
+        let mut pairs = schema_of(manifest);
+        pairs.retain(|(k, _)| k != "created_utc" && k != "metrics");
+        pairs
+    }
+
+    /// The manifest's embedded `config` key shape.
+    fn config_schema(manifest: &serde_json::Value) -> Vec<(String, &'static str)> {
+        let Some(config) = manifest.as_object().and_then(|o| o.get("config")) else {
+            panic!("the manifest must carry a config object");
+        };
+        schema_of(config)
+    }
 }

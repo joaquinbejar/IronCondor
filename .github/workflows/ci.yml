@@ -62,7 +62,18 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
+      # The determinism golden suite (#17, #36, #50). `--test golden` is the
+      # v0.1 equity-curve + minimal-metrics goldens; `--test bundle_golden` is
+      # the frozen four-table + manifest bundle goldens for every named scenario
+      # (iron_condor_naive / short_strangle_naive / iron_condor_realistic) under
+      # the single comparison oracle + the run-twice byte-identical assertion.
+      # The `orderbook` runs add the realistic-mode goldens (naive-only feature
+      # sets skip them, #[cfg(feature = "orderbook")]); `orderbook` needs no
+      # Python interpreter, so this job stays on the bare toolchain.
       - run: cargo test --test golden
+      - run: cargo test --test golden --features orderbook
+      - run: cargo test --test bundle_golden
+      - run: cargo test --test bundle_golden --features orderbook
 
   surface:
     name: surface
