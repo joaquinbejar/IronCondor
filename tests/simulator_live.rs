@@ -15,7 +15,8 @@ use ironcondor::{
     ApiClient, ChainResponse, CreateSessionRequest, MarketSimulator, SessionResponse, SessionState,
 };
 
-/// A recorded `GET /api/v1/chain` body — the wire shape the client must parse
+/// A recorded advance body (`POST /api/v1/chain/step`, also served by the
+/// read-only `GET /api/v1/chain` peek) — the wire shape the client must parse
 /// without a live server.
 const CHAIN_FIXTURE: &str = r#"{
     "underlying": "SPX",
@@ -34,12 +35,25 @@ const CHAIN_FIXTURE: &str = r#"{
     "session_info": {"id": "sess-1", "current_step": 3, "total_steps": 3}
 }"#;
 
-/// A recorded `POST /api/v1/chain` body.
+/// A recorded `POST /api/v1/chain` body (simulator v0.1.0: the echoed
+/// `parameters` block carries the effective walk `seed`).
 const SESSION_FIXTURE: &str = r#"{
     "id": "sess-1",
     "created_at": "2026-07-15T00:00:00Z",
     "updated_at": "2026-07-15T00:00:00Z",
-    "parameters": {"symbol": "SPX"},
+    "parameters": {
+        "symbol": "SPX",
+        "initial_price": 4300.0,
+        "volatility": 0.2,
+        "risk_free_rate": 0.03,
+        "method": {"GeometricBrownian": {"dt": 0.004, "drift": 0.0, "volatility": 0.2}},
+        "time_frame": "Day",
+        "dividend_yield": 0.0,
+        "skew_slope": null,
+        "smile_curve": null,
+        "spread": 0.02,
+        "seed": 42
+    },
     "current_step": 0,
     "total_steps": 3,
     "state": "Initialized"
@@ -71,6 +85,11 @@ fn test_stub_session_fixture_parses_real_state_string() {
         SessionState::Initialized
     );
     assert_eq!(session.total_steps, 3);
+    assert_eq!(
+        session.parameters.seed,
+        Some(42),
+        "the effective walk seed is read back from the echoed parameters"
+    );
 }
 
 /// End-to-end against a real OptionChain-Simulator. `#[ignore]` by default;
@@ -103,6 +122,7 @@ async fn test_live_session_roundtrip_creates_advances_deletes() {
         skew_slope: None,
         smile_curve: None,
         spread: Some(0.02),
+        seed: Some(42),
     };
 
     match sim.create_simulation(request).await {

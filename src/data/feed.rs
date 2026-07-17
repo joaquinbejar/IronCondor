@@ -188,9 +188,12 @@ impl FeedKind {
 
     /// Whether this feed reproduces the same tape from the same source today.
     ///
-    /// File feeds are byte-reproducible (their `sha256` pins the input); the
-    /// simulator feed is **not reproducible today** — the server walk is
-    /// unseeded, so the same request can yield a different tape
+    /// File feeds are byte-reproducible (their `sha256` pins the input). The
+    /// simulator feed is **not yet claimed reproducible**: the upstream seed
+    /// channel exists (simulator v0.1.0, sent as `CreateSessionRequest::seed`)
+    /// but same-seed tape identity end-to-end is asserted by the issue #45
+    /// materialisation closing test — this flag flips only when that test
+    /// lands green
     /// ([docs/03 §3](../../../docs/03-data-layer.md#3-feed-catalogue),
     /// [docs/03 §6](../../../docs/03-data-layer.md#6-synthetic-feed--optionchain-simulator)).
     #[must_use]

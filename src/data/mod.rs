@@ -42,9 +42,9 @@ use crate::data::simulator::CreateSessionRequest;
 /// pins exactly `Debug + Clone + PartialEq + Serialize + Deserialize`
 /// ([docs/03 §2](../../../docs/03-data-layer.md#2-the-datafeed-trait)).
 // The `Simulator` variant is intentionally larger than the file variants — the
-// design pins `session: CreateSessionRequest` inline (docs/03 §2), and boxing
-// it would deviate from the pinned shape for a spec that is constructed once
-// per run, never on a hot path. The size lint is therefore silenced here.
+// design pins the full `CreateSessionRequest` in its payload (docs/03 §2), and
+// boxing it would deviate from the pinned shape for a spec that is constructed
+// once per run, never on a hot path. The size lint is therefore silenced here.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -67,31 +67,49 @@ pub enum DataSourceSpec {
     ///
     /// Recorded verbatim in the manifest as **provenance and a re-read
     /// locator**; the `run_id` data identity, however, is the `tape_sha256`
-    /// (the materialised-tape hash), because the recorded `session` +
-    /// `data_seed` cannot pin the tape — the upstream server walk is unseeded
+    /// (the materialised-tape hash) — same-seed tape identity across sessions
+    /// is asserted only by the issue #45 closing test
     /// ([docs/03 §2](../../../docs/03-data-layer.md#2-the-datafeed-trait),
     /// [docs/03 §6](../../../docs/03-data-layer.md#6-synthetic-feed--optionchain-simulator)).
+    ///
+    /// The payload is a newtype over [`SimulatorSourceSpec`] rather than an
+    /// inline struct variant: serde silently ignores `deny_unknown_fields` on
+    /// an internally-tagged enum (serde-rs/serde#1600), so rejecting unknown
+    /// keys — mandated for this spec — requires the fields to live on a
+    /// struct that carries the attribute itself. The wire shape is unchanged
+    /// (the inner fields inline beside the `kind` tag).
     #[cfg(feature = "simulator")]
-    Simulator {
-        /// The walk parameters sent to the simulator on `create_session`.
-        session: CreateSessionRequest,
-        /// Which simulator instance served the session (its base URL).
-        base_url: String,
-        /// The **data** seed — distinct from the engine seed (`config.seed`).
-        /// Controls **no** RNG today (the server walk is unseeded); it only
-        /// **records intent** and will drive the server walk once the upstream
-        /// seed channel exists
-        /// ([docs/03 §6](../../../docs/03-data-layer.md#6-synthetic-feed--optionchain-simulator)).
-        /// Defaults to `config.seed` then.
-        data_seed: u64,
-        /// The `sha256` of the materialised tape
-        /// ([docs/03 §6.1](../../../docs/03-data-layer.md#61-materialised-tape--no-blocking-in-the-loop)) —
-        /// the `run_id` data identity, persisted so a simulator run's tape can
-        /// be verified later.
-        tape_sha256: String,
-        /// The server build id when it exposes one; `None` otherwise.
-        simulator_version: Option<String>,
-    },
+    Simulator(SimulatorSourceSpec),
+}
+
+/// The provenance payload of [`DataSourceSpec::Simulator`]
+/// ([docs/03 §2](../../../docs/03-data-layer.md#2-the-datafeed-trait)).
+///
+/// `deny_unknown_fields` holds here (and on the nested request DTO), so a
+/// manifest or config carrying a mistyped or unexpected key fails loudly at
+/// the boundary instead of being silently dropped.
+#[cfg(feature = "simulator")]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SimulatorSourceSpec {
+    /// The walk parameters sent to the simulator on `create_session`.
+    pub session: CreateSessionRequest,
+    /// Which simulator instance served the session (its base URL).
+    pub base_url: String,
+    /// The **data** seed — distinct from the engine seed (`config.seed`).
+    /// Since upstream v0.1.0 the simulator accepts a walk seed
+    /// (`CreateSessionRequest::seed`), so this value **can drive the server
+    /// walk**: tape materialisation (issue #45) sends it as `session.seed`,
+    /// defaulting to `config.seed` when the run config does not set it
+    /// ([docs/03 §6](../../../docs/03-data-layer.md#6-synthetic-feed--optionchain-simulator)).
+    pub data_seed: u64,
+    /// The `sha256` of the materialised tape
+    /// ([docs/03 §6.1](../../../docs/03-data-layer.md#61-materialised-tape--no-blocking-in-the-loop)) —
+    /// the `run_id` data identity, persisted so a simulator run's tape can
+    /// be verified later.
+    pub tape_sha256: String,
+    /// The server build id when it exposes one; `None` otherwise.
+    pub simulator_version: Option<String>,
 }
 
 #[cfg(test)]
@@ -123,12 +141,11 @@ mod tests {
     }
 
     #[cfg(feature = "simulator")]
-    #[test]
-    fn test_data_source_spec_simulator_kind_tagged_round_trip() {
+    fn simulator_spec() -> DataSourceSpec {
         use crate::data::simulator::CreateSessionRequest;
         use serde_json::json;
 
-        let spec = DataSourceSpec::Simulator {
+        DataSourceSpec::Simulator(super::SimulatorSourceSpec {
             session: CreateSessionRequest {
                 symbol: "SPX".to_string(),
                 steps: 20,
@@ -144,15 +161,60 @@ mod tests {
                 skew_slope: None,
                 smile_curve: None,
                 spread: Some(0.02),
+                seed: Some(7),
             },
             base_url: "http://localhost:7070".to_string(),
             data_seed: 7,
             tape_sha256: "cafef00d".to_string(),
-            simulator_version: Some("0.0.2".to_string()),
-        };
+            simulator_version: Some("0.1.0".to_string()),
+        })
+    }
+
+    #[cfg(feature = "simulator")]
+    #[test]
+    fn test_data_source_spec_simulator_kind_tagged_round_trip() {
+        let spec = simulator_spec();
         let json = serde_json::to_string(&spec).unwrap_or_default();
         assert!(json.contains("\"kind\":\"simulator\""));
+        assert!(
+            json.contains("\"base_url\""),
+            "the newtype payload inlines beside the kind tag: {json}"
+        );
         let back: Result<DataSourceSpec, _> = serde_json::from_str(&json);
         assert!(matches!(back, Ok(ref s) if *s == spec));
+    }
+
+    #[cfg(feature = "simulator")]
+    #[test]
+    fn test_data_source_spec_simulator_rejects_unknown_top_level_field() {
+        // deny_unknown_fields must hold through the internal `kind` tag — the
+        // reason the payload is a struct, not an inline variant.
+        let spec = simulator_spec();
+        let json = serde_json::to_string(&spec).unwrap_or_default();
+        let Some(poisoned) = json
+            .strip_suffix('}')
+            .map(|j| format!("{j},\"surprise\":1}}"))
+        else {
+            panic!("serialised spec must be a JSON object");
+        };
+        let back: Result<DataSourceSpec, _> = serde_json::from_str(&poisoned);
+        assert!(
+            back.is_err(),
+            "an unknown key in the simulator payload must be rejected"
+        );
+    }
+
+    #[cfg(feature = "simulator")]
+    #[test]
+    fn test_data_source_spec_simulator_rejects_unknown_session_field() {
+        let spec = simulator_spec();
+        let json = serde_json::to_string(&spec).unwrap_or_default();
+        let poisoned = json.replace("\"session\":{", "\"session\":{\"surprise\":1,");
+        assert_ne!(poisoned, json, "the session object must be present");
+        let back: Result<DataSourceSpec, _> = serde_json::from_str(&poisoned);
+        assert!(
+            back.is_err(),
+            "an unknown key nested in the session request must be rejected"
+        );
     }
 }

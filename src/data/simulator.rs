@@ -10,14 +10,27 @@
 //!
 //! - **Wire DTOs** ([`CreateSessionRequest`], [`ChainResponse`], …) defined
 //!   **locally** rather than depending on the `optionchain_simulator` server
-//!   crate, pinned to the shape in
-//!   [docs/specs/optionstratlib.md §7](../../../docs/specs/optionstratlib.md#7-optionchain-simulator-dtos)
-//!   (simulator v0.0.2). Their `f64` price fields are **wire-only**: the single
-//!   `ChainResponse` → `optionstratlib::chains::OptionChain` conversion is a
-//!   separate deliverable (issue #7), so **no downstream code consumes these
-//!   floats yet**.
-//! - [`ApiClient`] — the async REST client over `/api/v1/chain`. Async is
-//!   confined to this module; the engine loop never `.await`s.
+//!   crate (that crate drags actix-web/utoipa/… into the graph), verified
+//!   field-for-field against the upstream checkout at **v0.1.0**
+//!   (commit `63eac033efea`, read 2026-07-17;
+//!   [docs/specs/optionstratlib.md §7](../../../docs/specs/optionstratlib.md#7-optionchain-simulator-dtos)).
+//!   Their `f64` price fields are **wire-only**; the single
+//!   `ChainResponse` → `ChainSnapshot` conversion lives in
+//!   `src/data/convert.rs` and nowhere else.
+//! - **The seed channel (upstream v0.1.0).** `CreateSessionRequest` carries an
+//!   optional `seed: Option<u64>`: two sessions created with identical
+//!   parameters and the same seed produce the same snapshot sequence, and when
+//!   `seed` is omitted the server draws a random one and **echoes the
+//!   effective seed back** in [`SessionResponse`]`.parameters.seed` so it can
+//!   be recorded. The field is skip-serialized when `None`, so requests stay
+//!   byte-compatible with the older seedless (v0.0.2) surface. End-to-end
+//!   same-seed reproducibility of a materialised tape is asserted by the
+//!   issue #45 closing test, not here.
+//! - [`ApiClient`] — the async REST client over `/api/v1/chain`. Per the
+//!   v0.1.0 surface, `GET /api/v1/chain?sessionid=` is a **read-only peek**
+//!   and the advance is `POST /api/v1/chain/step?sessionid=`
+//!   ([`ApiClient::get_next_step`]). Async is confined to this module; the
+//!   engine loop never `.await`s.
 //! - [`MarketSimulator`] — the session step wrapper, with the two migrated
 //!   `MarketSimulator` bugs fixed in flight
 //!   ([docs/02 §10](../../../docs/02-engine-architecture.md#10-migrated-scaffold-and-its-known-bugs),
@@ -41,7 +54,7 @@ use serde_json::Value;
 use crate::error::BacktestError;
 
 // ---------------------------------------------------------------------------
-// Wire DTOs (locally defined; simulator v0.0.2 shape, `f64` prices wire-only)
+// Wire DTOs (locally defined; simulator v0.1.0 shape, `f64` prices wire-only)
 // ---------------------------------------------------------------------------
 
 /// A request to create a new simulation session (`POST /api/v1/chain`).
@@ -51,9 +64,10 @@ use crate::error::BacktestError;
 /// prices and rates are `f64` **on the wire**, and `method` is a tagged walk
 /// enum (mirroring `optionstratlib::simulation::WalkType`) carried as raw JSON
 /// so this crate need not vendor the full walk taxonomy. This DTO is only ever
-/// **serialised outbound**; per the pinned v0.0.2 surface it carries no `seed`
-/// field (the upstream seed channel is a deferred feature request,
-/// [docs/03 §6](../../../docs/03-data-layer.md#6-synthetic-feed--optionchain-simulator)).
+/// **serialised outbound**. The optional `seed` is the upstream v0.1.0 seed
+/// channel — the server walk is **seeded when this is set** and the effective
+/// seed is echoed back in [`SessionResponse`]`.parameters.seed`
+/// ([docs/03 §6](../../../docs/03-data-layer.md#6-synthetic-feed--optionchain-simulator)).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateSessionRequest {
@@ -91,14 +105,25 @@ pub struct CreateSessionRequest {
     /// Optional bid-ask spread factor (wire `f64`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spread: Option<f64>,
+    /// Optional RNG seed for the server-side walk (upstream v0.1.0). When set,
+    /// two sessions with identical parameters and the same seed produce the
+    /// same snapshot sequence; when `None` (omitted on the wire, keeping the
+    /// request compatible with older servers) the server draws a random seed
+    /// and reports the effective value back in
+    /// [`SessionResponse`]`.parameters.seed`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u64>,
 }
 
 /// A partial update to an existing session (`PATCH /api/v1/chain`).
 ///
 /// Every field is optional; absent fields (serialised as omitted) keep their
-/// current server value. The v0.0.2 all-`Option` shape is used — the later
-/// tri-state `Patch` "clear vs keep" refinement is out of scope for the
-/// migration.
+/// current server value. Upstream v0.1.0 models the optional fields as a
+/// tri-state `Patch` (absent = keep, value = replace, `null` = clear /
+/// re-seed); this outbound-only mirror deliberately expresses the
+/// **keep-or-replace subset** with plain `Option` — an omitted `Option::None`
+/// serialises exactly like `Patch::Absent` and a `Some` like `Patch::Value`,
+/// while the explicit-`null` "clear" signal is not sent by this client.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateSessionRequest {
@@ -144,6 +169,12 @@ pub struct UpdateSessionRequest {
     /// Replacement spread factor (wire `f64`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spread: Option<f64>,
+    /// Replacement walk seed. `Some` re-seeds the walk with the given value
+    /// (upstream `Patch::Value`); `None` keeps the current seed
+    /// (`Patch::Absent`). The upstream `null` = "re-seed randomly" signal is
+    /// deliberately not expressible here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u64>,
 }
 
 /// The session metadata returned by create / replace / update
@@ -151,7 +182,9 @@ pub struct UpdateSessionRequest {
 ///
 /// `state` is a **raw wire string** (e.g. `"Initialized"`, `"In Progress"`);
 /// [`SessionState::from_wire`] parses it into the typed [`SessionState`]. The
-/// echoed `parameters` object is carried as raw JSON and is not consumed.
+/// echoed `parameters` block is typed ([`SessionParametersResponse`]) because
+/// it carries the **effective walk seed** the server actually used — the value
+/// a reproducible re-run must record.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionResponse {
     /// Server-issued session id (a UUID string).
@@ -160,8 +193,9 @@ pub struct SessionResponse {
     pub created_at: String,
     /// Last-update timestamp (wire string).
     pub updated_at: String,
-    /// The session's current parameters, echoed as raw JSON (not consumed).
-    pub parameters: Value,
+    /// The session's current parameters as echoed by the server, including
+    /// the effective walk seed.
+    pub parameters: SessionParametersResponse,
     /// The current step index the session is at.
     pub current_step: usize,
     /// The total number of steps in the session.
@@ -170,11 +204,51 @@ pub struct SessionResponse {
     pub state: String,
 }
 
-/// A single option chain snapshot returned by `GET /api/v1/chain?sessionid=`.
+/// The parameters block echoed inside every [`SessionResponse`]
+/// (upstream `SessionParametersResponse`, v0.1.0).
 ///
-/// Its `contracts` carry `f64` prices that are **wire-only** — the conversion
-/// into `optionstratlib` integer-cents types is issue #7 and does not exist
-/// yet. Note the `session_info` block carries **no state field** (only step
+/// Lenient on deserialize (no `deny_unknown_fields`) so a newer server field
+/// never breaks parsing. Note the upstream echo carries **fewer** fields than
+/// the request (no `steps` / `days_to_expiration` / `chain_size` /
+/// `strike_interval`); the step counters live on the enclosing
+/// [`SessionResponse`] instead. The one field downstream code consumes is
+/// `seed` — the **effective walk seed** (always populated by a v0.1.0 server,
+/// whether the request set one or the server drew one at random).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct SessionParametersResponse {
+    /// Underlying ticker symbol.
+    pub symbol: String,
+    /// Initial underlying price (wire `f64`).
+    pub initial_price: f64,
+    /// Annualised volatility (wire `f64`).
+    pub volatility: f64,
+    /// Annualised risk-free rate (wire `f64`).
+    pub risk_free_rate: f64,
+    /// The tagged walk method, carried as raw JSON.
+    pub method: Value,
+    /// The step time frame, a plain wire string.
+    pub time_frame: String,
+    /// Annualised dividend yield (wire `f64`).
+    pub dividend_yield: f64,
+    /// Volatility-skew slope (wire `f64`).
+    pub skew_slope: Option<f64>,
+    /// Volatility-smile curvature (wire `f64`).
+    pub smile_curve: Option<f64>,
+    /// Bid-ask spread factor (wire `f64`).
+    pub spread: Option<f64>,
+    /// The **effective** RNG seed driving the session's walk — the requested
+    /// seed when one was sent, otherwise the random seed the server drew.
+    pub seed: Option<u64>,
+}
+
+/// A single option chain snapshot, returned both by the advance
+/// (`POST /api/v1/chain/step?sessionid=`) and the read-only peek
+/// (`GET /api/v1/chain?sessionid=`).
+///
+/// Its `contracts` carry `f64` prices that are **wire-only** — the single
+/// conversion into integer-cents types is
+/// [`crate::data::chain_response_to_snapshot`] in `src/data/convert.rs`.
+/// Note the `session_info` block carries **no state field** (only step
 /// counters), which is why the wrapper *derives* the session state from it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct ChainResponse {
@@ -352,6 +426,23 @@ impl ApiClient {
     /// The conventional default simulator host.
     pub const DEFAULT_BASE_URL: &'static str = "http://localhost:7070";
 
+    /// The base URL to use when the caller does not name one: the `API_URL`
+    /// environment variable when set, otherwise [`Self::DEFAULT_BASE_URL`].
+    #[must_use]
+    pub fn base_url_from_env() -> String {
+        Self::base_url_from(std::env::var("API_URL").ok())
+    }
+
+    /// The pure resolution rule behind [`Self::base_url_from_env`], split out
+    /// so it is testable without mutating process-global environment state.
+    #[must_use]
+    fn base_url_from(api_url: Option<String>) -> String {
+        match api_url {
+            Some(url) if !url.trim().is_empty() => url,
+            _ => Self::DEFAULT_BASE_URL.to_string(),
+        }
+    }
+
     /// Build a client for `base_url` with the given request `timeout`.
     ///
     /// A trailing `/` on `base_url` is trimmed so path joins never double up.
@@ -400,16 +491,24 @@ impl ApiClient {
             .map_err(|e| BacktestError::Session(format!("parse session response failed: {e}")))
     }
 
-    /// Advance the session one step and return the next chain snapshot.
+    /// Advance the session one step and return the served chain snapshot
+    /// (`POST /api/v1/chain/step?sessionid=`).
+    ///
+    /// Per the upstream v0.1.0 surface the plain `GET /api/v1/chain` is a
+    /// **read-only peek** that never moves the cursor; the advance is this
+    /// dedicated `POST` step resource. The server also accepts an optional
+    /// `expected_step` precondition (412 on mismatch) for ambiguous-retry
+    /// resolution; this client does not retry, so it does not send one.
     ///
     /// # Errors
     ///
-    /// [`BacktestError::Session`] on transport failure, a non-2xx status, or an
+    /// [`BacktestError::Session`] on transport failure, a non-2xx status
+    /// (including `410 Gone` once the session has completed), or an
     /// unparseable response body.
     pub async fn get_next_step(&self, session_id: &str) -> Result<ChainResponse, BacktestError> {
-        let url = format!("{}/api/v1/chain?sessionid={session_id}", self.base_url);
+        let url = format!("{}/api/v1/chain/step?sessionid={session_id}", self.base_url);
         let response =
-            self.client.get(&url).send().await.map_err(|e| {
+            self.client.post(&url).send().await.map_err(|e| {
                 BacktestError::Session(format!("get_next_step request failed: {e}"))
             })?;
         if !response.status().is_success() {
@@ -652,7 +751,8 @@ impl MarketSimulator {
 mod tests {
     use super::{
         ApiClient, ChainResponse, CreateSessionRequest, MarketSimulator, OptionContractResponse,
-        OptionPriceResponse, SessionInfoResponse, SessionResponse, SessionState,
+        OptionPriceResponse, SessionInfoResponse, SessionParametersResponse, SessionResponse,
+        SessionState,
     };
     use crate::error::BacktestError;
     use serde_json::json;
@@ -674,7 +774,11 @@ mod tests {
             id: "11111111-1111-1111-1111-111111111111".to_string(),
             created_at: "2026-07-15T00:00:00Z".to_string(),
             updated_at: "2026-07-15T00:00:00Z".to_string(),
-            parameters: json!({}),
+            parameters: SessionParametersResponse {
+                symbol: "SPX".to_string(),
+                seed: Some(42),
+                ..SessionParametersResponse::default()
+            },
             current_step: current,
             total_steps: total,
             state: state.to_string(),
@@ -797,6 +901,7 @@ mod tests {
             skew_slope: None,
             smile_curve: None,
             spread: Some(0.02),
+            seed: None,
         };
         let text = serde_json::to_string(&req).unwrap_or_default();
         assert!(text.contains("\"GeometricBrownian\""));
@@ -804,8 +909,59 @@ mod tests {
             !text.contains("skew_slope"),
             "None optional fields are omitted"
         );
+        assert!(
+            !text.contains("seed"),
+            "an unset seed is omitted on the wire, keeping the request \
+             compatible with older seedless servers"
+        );
         let back: Result<CreateSessionRequest, _> = serde_json::from_str(&text);
         assert!(matches!(back, Ok(ref r) if *r == req));
+    }
+
+    #[test]
+    fn test_create_session_request_seed_serialised_when_set() {
+        let req = CreateSessionRequest {
+            symbol: "SPX".to_string(),
+            steps: 3,
+            initial_price: 100.0,
+            days_to_expiration: 30.0,
+            volatility: 0.2,
+            risk_free_rate: 0.03,
+            dividend_yield: 0.0,
+            method: json!({"Brownian": {"dt": 0.004, "drift": 0.0, "volatility": 0.2}}),
+            time_frame: "Day".to_string(),
+            chain_size: None,
+            strike_interval: None,
+            skew_slope: None,
+            smile_curve: None,
+            spread: None,
+            seed: Some(1_234_567),
+        };
+        let text = serde_json::to_string(&req).unwrap_or_default();
+        assert!(
+            text.contains("\"seed\":1234567"),
+            "a set data seed travels on the wire: {text}"
+        );
+        let back: Result<CreateSessionRequest, _> = serde_json::from_str(&text);
+        assert!(matches!(back, Ok(ref r) if r.seed == Some(1_234_567)));
+    }
+
+    #[test]
+    fn test_base_url_from_resolution_rule() {
+        assert_eq!(
+            ApiClient::base_url_from(None),
+            ApiClient::DEFAULT_BASE_URL,
+            "unset API_URL falls back to the conventional default"
+        );
+        assert_eq!(
+            ApiClient::base_url_from(Some(String::new())),
+            ApiClient::DEFAULT_BASE_URL,
+            "an empty API_URL falls back to the conventional default"
+        );
+        assert_eq!(
+            ApiClient::base_url_from(Some("http://sim.internal:9090".to_string())),
+            "http://sim.internal:9090"
+        );
     }
 
     #[test]
@@ -844,7 +1000,19 @@ mod tests {
             "id": "abc",
             "created_at": "t0",
             "updated_at": "t0",
-            "parameters": {"symbol": "SPX"},
+            "parameters": {
+                "symbol": "SPX",
+                "initial_price": 100.0,
+                "volatility": 0.2,
+                "risk_free_rate": 0.03,
+                "method": {"Brownian": {"dt": 0.004, "drift": 0.0, "volatility": 0.2}},
+                "time_frame": "Day",
+                "dividend_yield": 0.0,
+                "skew_slope": null,
+                "smile_curve": null,
+                "spread": 0.02,
+                "seed": 42
+            },
             "current_step": 0,
             "total_steps": 10,
             "state": "In Progress"
@@ -853,6 +1021,36 @@ mod tests {
         assert!(matches!(parsed, Ok(ref r) if r.state == "In Progress"));
         if let Ok(r) = parsed {
             assert_eq!(SessionState::from_wire(&r.state), SessionState::InProgress);
+            assert_eq!(
+                r.parameters.seed,
+                Some(42),
+                "the effective walk seed is read back from the echoed parameters"
+            );
+        }
+    }
+
+    #[test]
+    fn test_session_parameters_lenient_to_unknown_and_missing_optionals() {
+        // Responses stay lenient: a newer server field must never break
+        // parsing, and absent optional fields deserialise to None.
+        let text = r#"{
+            "symbol": "SPX",
+            "initial_price": 100.0,
+            "volatility": 0.2,
+            "risk_free_rate": 0.03,
+            "method": "Brownian",
+            "time_frame": "Day",
+            "dividend_yield": 0.0,
+            "some_future_field": true
+        }"#;
+        let parsed: Result<SessionParametersResponse, _> = serde_json::from_str(text);
+        match parsed {
+            Ok(p) => {
+                assert_eq!(p.symbol, "SPX");
+                assert_eq!(p.seed, None, "a seedless echo parses to None");
+                assert_eq!(p.spread, None);
+            }
+            Err(e) => panic!("a response with an unknown field must parse: {e}"),
         }
     }
 }

@@ -1,0 +1,16 @@
+{
+    "underlying": "SPX",
+    "timestamp": "2026-07-15T00:00:01Z",
+    "price": 4310.25,
+    "contracts": [
+        {
+            "strike": 4300.0,
+            "expiration": "2026-08-15T00:00:00Z",
+            "call": {"bid": 12.0, "ask": 12.5, "mid": 12.25, "delta": 0.55},
+            "put": {"bid": 9.0, "ask": 9.5, "mid": 9.25, "delta": -0.45},
+            "implied_volatility": 0.19,
+            "gamma": 0.001
+        }
+    ],
+    "session_info": {"id": "sess-1", "current_step": 1, "total_steps": 3}
+}
