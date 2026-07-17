@@ -111,6 +111,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The v1.0 pre-release + acceptance pass is one runnable, fail-closed script,
+  `scripts/release_check.sh` (#54).** It runs the [RELEASE-PROCESS.md §1]
+  mechanical checks (`cargo fmt --all --check`, `clippy --all-targets
+  --all-features -- -D warnings`, `test --all-features`, `build --release`,
+  `cargo publish --dry-run` — packaging validation only, no upload — and the
+  `[Unreleased]` non-empty §-abort rule) and the §13 acceptance gates shipped
+  across #49–#53 (the surface-freeze snapshots, the golden determinism suite +
+  `tests/golden/REGRESSION-EVIDENCE.md`, the PB-1 zero-alloc gate, the H1–H5
+  hot-path regression gates, the parser fuzz corpus replay, and the
+  adversarial-input + `cargo audit` + `cargo deny` supply-chain gates), grouped
+  into `--section`-selectable stages. Each check prints a machine-readable
+  `RESULT <PASS|FAIL|SKIP> <section.id> …` line and the run ends in a
+  `RELEASE_CHECK_RESULT=PASS|PASS_WITH_SKIPS|FAIL` verdict (exit non-zero on any
+  FAIL). The default posture is **fail-closed** — a check whose tool is absent
+  FAILs, so "all green" cannot be reached by a missing prerequisite — with
+  exactly three documented **skip-with-notice** checks whose tooling is optional
+  and CI proves independently (maturin wheel-build sanity, the `gh` milestone
+  open-issue check, the nightly + `cargo-fuzz` corpus replay); a skip is printed
+  loudly and downgrades the verdict to `PASS_WITH_SKIPS`, never a silent pass.
+  The cut itself stays **user/time-gated and is NOT automated**: the script
+  never bumps the version, locks the CHANGELOG, tags, pushes, or publishes, and
+  prints the items it cannot verify (the one-quarter stability window, the
+  explicit publish approval, and wheels-green-on-the-release-commit) as a manual
+  checklist. `docs/RELEASE-PROCESS.md` §13 documents the gate; no production
+  code changed and no new dependency was added.
 - **Hot-path percentile/linearity regression gates for every tracked path
   H1–H5 are wired into CI (#51).** The `BENCH.md` baselines (H1/H2 #29, H4 #37,
   H5 #43) are now wrapped in gates that fail a merge which regresses a tracked

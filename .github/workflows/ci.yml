@@ -294,6 +294,32 @@ jobs:
       # simulator's rustls stack were never checked).
       - run: cargo deny --all-features check
 
+  changelog-check:
+    name: changelog-check
+    # CHANGELOG discipline (docs/SEMVER.md §"CI enforcement", §"CHANGELOG
+    # discipline"): every user-visible PR must add an entry under [Unreleased].
+    # Runs ONLY on pull_request — a push to main has no base branch to diff. No
+    # toolchain needed (awk + git); the local equivalent contributors run is
+    # `scripts/check-changelog.sh <base> HEAD` (RELEASE-PROCESS §3), and
+    # release_check.sh delegates the release-cut §-abort non-empty check to the
+    # SAME script (no-arg mode).
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so the base branch (origin/<base_ref>) is present to
+          # diff against; the default fetch-depth: 1 would not fetch it.
+          fetch-depth: 0
+      # The script: (1) SKIPS a chore:/refactor:/test:/docs:/ci:/bench: title or a
+      # `[skip changelog]` token; (2) else requires the base→head CHANGELOG diff to
+      # add at least one line UNDER [Unreleased]; (3) fails closed. PR_TITLE carries
+      # the title the skip rule reads.
+      - name: CHANGELOG discipline (Keep a Changelog; SEMVER §"CI enforcement")
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: bash scripts/check-changelog.sh "origin/${{ github.base_ref }}" HEAD
+
   python-wheels:
     name: python-wheels
     strategy:
