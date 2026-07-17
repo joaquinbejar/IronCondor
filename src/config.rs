@@ -741,4 +741,44 @@ mod tests {
         let back: Result<BacktestConfig, _> = serde_json::from_str(&json);
         assert!(matches!(back, Ok(ref c) if *c == cfg));
     }
+
+    #[test]
+    fn test_config_serialized_field_set_is_pinned() {
+        // Configuration-surface freeze gate (#49, docs/SEMVER.md §"What counts
+        // as a public surface"). The serialized top-level key set of
+        // `BacktestConfig` is frozen for SemVer 1.0: adding, removing, or
+        // renaming a field changes this set and fails the test until the pinned
+        // list below is updated — the documented SemVer event (an
+        // optional-with-default field is a minor bump; a new required field is a
+        // major bump — docs/SEMVER.md §"Version increment rules").
+        let value = match serde_json::to_value(valid_config()) {
+            Ok(value) => value,
+            Err(err) => panic!("BacktestConfig must serialize: {err}"),
+        };
+        let object = match value.as_object() {
+            Some(object) => object,
+            None => panic!("BacktestConfig must serialize to a JSON object"),
+        };
+        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        let expected = [
+            "data_source",
+            "fees",
+            "initial_capital",
+            "limits",
+            "liquidity_profile",
+            "marketable_cap_ticks",
+            "mode",
+            "output_dir",
+            "overwrite",
+            "seed",
+            "slippage",
+        ];
+        assert_eq!(
+            keys, expected,
+            "BacktestConfig serialized field set drifted from the frozen v1.0 \
+             config surface; update the pinned list here and record the SemVer \
+             event (docs/SEMVER.md §\"v1.0 commitments\")"
+        );
+    }
 }
