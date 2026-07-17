@@ -33,7 +33,7 @@ use optionstratlib::strategies::IronCondor;
 
 use crate::analytics::{attribution, metrics};
 use crate::config::BacktestConfig;
-use crate::data::{DataSourceSpec, ParquetFeed};
+use crate::data::{DataFeed, DataSourceSpec, ParquetFeed};
 use crate::domain::{ExecutionMode, StrategySpec};
 use crate::engine::{BacktestEngine, BacktestRun, OptStratAdapter};
 use crate::error::BacktestError;
@@ -100,12 +100,51 @@ pub fn run_backtest(
         DataSourceSpec::Parquet { path, .. } => path.clone(),
         other => {
             return Err(BacktestError::Config(format!(
-                "run_backtest supports only a parquet data source in v0.1, got {other:?}"
+                "run_backtest supports only a parquet data source (simulator sources run \
+                 through the batch runner; csv dispatch is deferred), got {other:?}"
             )));
         }
     };
     let feed = ParquetFeed::open(&path, &config.limits)?;
 
+    run_with_feed(config, feed, strategy_spec, exit)
+}
+
+/// Run one backtest end to end over an **already-opened** feed `F`, returning
+/// the populated [`BacktestRun`] — the feed-agnostic core shared by
+/// [`run_backtest`] (Parquet) and the scenario batch runner
+/// ([`crate::batch::run_scenario_batch`], which opens a [`ParquetFeed`] or a
+/// simulator [`SimulatorFeed`](crate::data::SimulatorFeed) per run).
+///
+/// This is the consolidated composition core: it wires the
+/// [`StrategySpec::IronCondor`] adapter, selects the [`ExecutionModel`] once
+/// from `config.mode` (no per-step `dyn`), drives [`BacktestEngine::run`], then
+/// runs the post-run analytics ([`metrics::populate`] and
+/// [`attribution::attribute`]). It sits **above** both the engine and analytics
+/// layers exactly as [`run_backtest`] does, so the engine stays analytics-free.
+///
+/// `config` MUST already have passed [`BacktestConfig::validate`] — the feed
+/// (which reads `config.limits`) is opened by the caller before this runs, so
+/// validation happens there, once, and this core does not re-validate.
+///
+/// Determinism is unchanged from [`run_backtest`]: no wall clock and no RNG of
+/// its own; `(seed, config, data)` is byte-reproducible.
+///
+/// # Errors
+///
+/// - [`BacktestError::Config`] if `config.mode` is [`ExecutionMode::Realistic`]
+///   but the crate was built without the `orderbook` feature, or the initial
+///   capital exceeds the `i64` cents range.
+/// - [`BacktestError::Strategy`] / [`BacktestError::Conversion`] if the strategy
+///   spec cannot be constructed.
+/// - Any [`BacktestError`] the replay loop or the metrics pass raises
+///   (including [`BacktestError::ArithmeticOverflow`]).
+pub(crate) fn run_with_feed<F: DataFeed>(
+    config: &BacktestConfig,
+    feed: F,
+    strategy_spec: &StrategySpec,
+    exit: ExitPolicy,
+) -> Result<BacktestRun, BacktestError> {
     // The iron-condor strategy adapter (mode-agnostic — the strategy never sees
     // which fill model runs). `feed` and `adapter` are built once and moved into
     // whichever mutually-exclusive `config.mode` arm executes below.
