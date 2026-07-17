@@ -104,7 +104,7 @@ use arrow::array::{Array, Float64Array, Int32Array, Int64Array, RecordBatch, Str
 use arrow::datatypes::{DataType, Schema};
 use chrono::DateTime;
 use optionstratlib::{ExpirationDate, OptionStyle};
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::arrow_reader::{ArrowReaderOptions, ParquetRecordBatchReaderBuilder};
 use sha2::{Digest, Sha256};
 
 use crate::config::ResourceLimits;
@@ -222,8 +222,26 @@ impl ParquetFeed {
 
         // (3) Read the Parquet footer metadata; a truncated / corrupt footer is
         //     a typed Conversion, never a panic.
+        //     `with_skip_arrow_metadata(true)` is REQUIRED for no-panic on
+        //     untrusted input: a Parquet footer may embed an `ARROW:schema` IPC
+        //     flatbuffer whose parse panics inside arrow-ipc (`unimplemented!` in
+        //     `get_data_type`), which unwinds instead of returning `Err`. Skipping
+        //     it derives the schema from the Parquet schema itself — which
+        //     `validate_schema` below already checks column-for-column, so the
+        //     accepted set is unchanged for a well-formed file.
+        //     The call is ALSO run under the #52 catch_unwind backstop
+        //     (`guard_parquet`): parquet 59.1.0 (the latest published) still has a
+        //     known metadata-panic class on malformed input (arrow-rs #9840,
+        //     #9868, #5382) that unwinds instead of returning `Err`, so any such
+        //     panic is contained and mapped to a typed `BacktestError::Data`.
         let file = File::open(path_ref)?;
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| {
+        let builder = guard_parquet("metadata read", || {
+            ParquetRecordBatchReaderBuilder::try_new_with_options(
+                file,
+                ArrowReaderOptions::new().with_skip_arrow_metadata(true),
+            )
+        })?
+        .map_err(|e| {
             conv(
                 "failed to read parquet metadata (truncated or corrupt footer)",
                 &e,
@@ -234,6 +252,29 @@ impl ParquetFeed {
         //      is bounded BEFORE any data is decoded.
         let mut declared_bytes: u64 = 0;
         for group in builder.metadata().row_groups() {
+            // (#52) Reject a negative column-chunk offset/size BEFORE the decode
+            // loop. This exists to PREVENT (not merely catch) the known
+            // `ColumnChunkMetaData::byte_range()` assert (parquet mod.rs:1063),
+            // which PANICS during decode on a crafted negative offset: the
+            // `guard_parquet` catch_unwind backstop contains that in production
+            // (unwind), but cargo-fuzz builds `panic=abort` where a caught panic
+            // still aborts — so the fuzz targets only stay green if the panic
+            // never fires. catch_unwind remains the backstop for the residual,
+            // still-unhardened parquet metadata-panic class (arrow-rs #9840,
+            // #9868, #5382). A well-formed file has non-negative offsets, so this
+            // never rejects a valid file (the goldens are unaffected).
+            for col in group.columns() {
+                if col.compressed_size() < 0
+                    || col.data_page_offset() < 0
+                    || col.dictionary_page_offset().is_some_and(|off| off < 0)
+                {
+                    return Err(BacktestError::Data(
+                        "parquet column chunk declares a negative offset or size \
+                         (would trip byte_range)"
+                            .to_string(),
+                    ));
+                }
+            }
             let size = u64::try_from(group.total_byte_size()).map_err(|_| {
                 BacktestError::Data("parquet row group reports a negative byte size".to_string())
             })?;
@@ -253,11 +294,13 @@ impl ParquetFeed {
         let schema = builder.schema().clone();
         validate_schema(&schema)?;
 
-        // (4) Materialise the tape, grouping rows by ascending `step`.
-        let reader = builder
-            .with_batch_size(READ_BATCH_ROWS)
-            .build()
-            .map_err(|e| conv("failed to build parquet reader", &e))?;
+        // (4) Materialise the tape, grouping rows by ascending `step`. The reader
+        //     construction and every row-group decode below run under the same
+        //     #52 backstop.
+        let mut reader = guard_parquet("reader build", || {
+            builder.with_batch_size(READ_BATCH_ROWS).build()
+        })?
+        .map_err(|e| conv("failed to build parquet reader", &e))?;
 
         let mut tape: Vec<ChainSnapshot> = Vec::new();
         let mut anchor_ts: Option<SimTime> = None;
@@ -268,7 +311,15 @@ impl ParquetFeed {
         // the `max_total_bytes` ceiling (accumulated in `push_snapshot`).
         let mut total_bytes: u64 = 0;
 
-        for batch in reader {
+        loop {
+            // The upstream row-group decode is wrapped in the #52 backstop: a
+            // parquet metadata assert (e.g. a negative column-chunk offset in
+            // `byte_range`, arrow-rs #9868/#9840/#5382) is contained as a typed
+            // error, not an unwind. Our own validation below stays OUTSIDE the
+            // wrap, so a bug in this crate still panics loudly.
+            let Some(batch) = guard_parquet("row-group decode", || reader.next())? else {
+                break;
+            };
             let batch = batch.map_err(|e| conv("failed to decode a parquet row group", &e))?;
 
             // Incremental decompression guard: bound the actual materialised
@@ -1522,6 +1573,32 @@ pub(crate) fn to_hex(bytes: &[u8]) -> String {
 /// that decoded cleanly.
 fn conv<E: std::fmt::Display>(context: &str, error: &E) -> BacktestError {
     BacktestError::Data(format!("{context}: {error}"))
+}
+
+/// Run one untrusted-Parquet upstream call under the #52 catch_unwind backstop:
+/// a panic inside arrow/parquet's metadata parse or row-group decode is
+/// **contained** and mapped to a typed [`BacktestError::Data`], never an unwind
+/// across the feed boundary ([docs/07 §8](../../../docs/07-performance-and-security.md#8-untrusted-input-hardening)).
+/// It wraps ONLY the upstream call — the feed's own validation stays outside —
+/// so a bug in THIS crate still panics loudly in tests.
+///
+/// `AssertUnwindSafe` is justified: every value the closure touches (the `File`,
+/// the builder, the reader) is local to the call and is dropped on the unwind
+/// path; nothing shared or observable survives a caught panic, and the caller
+/// returns immediately without reusing the poisoned value.
+fn guard_parquet<T>(op: &'static str, f: impl FnOnce() -> T) -> Result<T, BacktestError> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(|payload| {
+        let msg = crate::error::panic_payload_message(&*payload);
+        tracing::warn!(
+            target: "ironcondor::data",
+            op,
+            panic = %msg,
+            "contained an upstream parquet panic (#52 backstop)"
+        );
+        BacktestError::Data(format!(
+            "parquet {op} panicked inside arrow/parquet and was contained by the #52 backstop: {msg}"
+        ))
+    })
 }
 
 #[cfg(test)]

@@ -188,6 +188,63 @@ jobs:
       # test/golden/zero-alloc/audit/deny.
       - run: cargo test --test security
 
+  fuzz-smoke:
+    name: fuzz-smoke
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      # cargo-fuzz needs nightly; the main crate pins stable 1.97.0 via
+      # rust-toolchain.toml. Install nightly IN THIS JOB ONLY — `cargo +nightly
+      # fuzz` overrides the repo pin for the target build, while the stable pin
+      # still drives the seed-corpus `cargo test` below. rust-toolchain.toml is
+      # NOT touched.
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Cache the main build (seed-corpus test) AND the separate fuzz
+          # workspace (its own Cargo.lock / target).
+          workspaces: |
+            .
+            fuzz
+      # cargo-fuzz, pinned + installed from source with `--locked` (the repo
+      # convention, mirroring the audit/deny jobs), with the compiled binary
+      # cached so a warm run skips the ~minutes-long build.
+      - name: Cache cargo-fuzz binary
+        id: cache-cargo-fuzz
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-fuzz
+          key: cargo-fuzz-0.13.2-${{ runner.os }}
+      - name: Install cargo-fuzz
+        if: steps.cache-cargo-fuzz.outputs.cache-hit != 'true'
+        run: cargo install --locked --version 0.13.2 cargo-fuzz
+      # Seeds are DERIVED from the committed adversarial generators
+      # (tests/fixtures/adversarial/mod.rs), never committed (corpus/ is
+      # gitignored). Materialise them on the STABLE pin before the smoke; the
+      # generators are the permanent regressions (docs/TESTING.md §12.1).
+      - name: Materialise the fuzz seed corpus
+        run: bash fuzz/seed_corpus.sh
+      # A libFuzzer smoke over each parser target — a DETERMINISTIC, provably
+      # flake-free gate. `-runs=0` REPLAYS the materialised corpus (every seed +
+      # committed regression) with ZERO mutation/exploration, so the set of
+      # tested inputs is exactly the committed corpus and the pass/fail cannot
+      # vary run-to-run (a nondeterministic red would block the whole stacked-PR
+      # chain). `-rss_limit_mb` / `-timeout` / `-malloc_limit_mb` still turn a
+      # hang / OOM / bomb into a CI crash. `-seed=1` is harmless at `-runs=0`
+      # (there is no mutation to seed) and kept for clarity. DISCOVERY of new
+      # parquet metadata-panic-class members happens in DELIBERATE LOCAL
+      # campaigns (an unpinned long run, like the ~40k-run one that found the
+      # `byte_range` case), which then become new prevention guards + committed
+      # regressions — policy in fuzz/README.md. Whole job budget is trivial
+      # (install cached, three corpus replays).
+      - name: CSV feed smoke
+        run: cargo +nightly fuzz run fuzz_csv_feed -- -runs=0 -seed=1 -rss_limit_mb=2048 -timeout=10 -malloc_limit_mb=2048
+      - name: Parquet feed smoke
+        run: cargo +nightly fuzz run fuzz_parquet_feed -- -runs=0 -seed=1 -rss_limit_mb=2048 -timeout=10 -malloc_limit_mb=2048
+      - name: Bundle read-back smoke
+        run: cargo +nightly fuzz run fuzz_bundle_readback -- -runs=0 -seed=1 -rss_limit_mb=2048 -timeout=10 -malloc_limit_mb=2048
+
   build-release:
     name: build-release
     runs-on: ubuntu-24.04
