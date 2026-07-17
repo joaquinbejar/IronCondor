@@ -1034,9 +1034,11 @@ fn push_snapshot(
 }
 
 /// Enforce `max_steps` and `max_total_bytes` for one finished snapshot, then
-/// push it onto the tape. Shared by both file feeds so the ceiling accounting
-/// is byte-for-byte identical regardless of the on-disk format.
-fn push_checked(
+/// push it onto the tape. Shared by both file feeds **and** the simulator
+/// feed (`src/data/simulator.rs`, feature `simulator`) so the ceiling
+/// accounting is byte-for-byte identical regardless of where the snapshots
+/// come from.
+pub(crate) fn push_checked(
     tape: &mut Vec<ChainSnapshot>,
     snapshot: ChainSnapshot,
     total_bytes: &mut u64,
@@ -1391,7 +1393,8 @@ fn file_sha256(path: &Path) -> Result<String, BacktestError> {
 }
 
 /// Encode bytes as lowercase hex without an extra dependency or indexing.
-fn to_hex(bytes: &[u8]) -> String {
+/// Shared with the simulator feed's tape hash (`src/data/simulator.rs`).
+pub(crate) fn to_hex(bytes: &[u8]) -> String {
     use std::fmt::Write;
     let mut out = String::with_capacity(bytes.len().saturating_mul(2));
     for byte in bytes {

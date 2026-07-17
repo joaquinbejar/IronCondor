@@ -41,16 +41,46 @@
 //!      `ChainResponse.session_info` step counters) — no longer a hardcoded
 //!      `InProgress`.
 //!
-//! The first-classed materialised-tape `SimulatorFeed` (async materialisation,
-//! ceilings, tape hashing) is v0.5 work (issue #45); this module lands the
-//! client and the bug-fixed wrapper it builds on.
+//! - [`SimulatorFeed`] — the materialised-tape [`DataFeed`] (issue #45).
+//!   [`SimulatorFeed::open`] drives one whole session to completion on a
+//!   current-thread runtime **before the loop exists** — create (sending the
+//!   configured data seed) → advance until the server's own `session_info`
+//!   reports the session ended → convert every response through the single
+//!   conversion boundary — enforcing the three [`ResourceLimits`] tape
+//!   ceilings incrementally while draining, deleting the server session on
+//!   **every** exit path, and pinning the validated tape's identity as its
+//!   canonical `sha256` ([docs/03 §6.1](../../../docs/03-data-layer.md#61-materialised-tape--no-blocking-in-the-loop)).
+//!   [`DataFeed::next`] is then a pure indexed `Vec` read — no I/O, no
+//!   `.await`, nothing blocking in the loop.
+//!
+//! # Reproducibility (honest)
+//!
+//! The seed **flows** end to end: materialisation sends
+//! `SimulatorSourceSpec::data_seed` as `CreateSessionRequest::seed` and
+//! records the **effective** seed the server echoes back. Whether two
+//! same-seed sessions materialise **identical tapes** is *server* behaviour:
+//! upstream v0.1.0 stamps each `ChainResponse.timestamp` (and renders each
+//! relative expiry) from the **wall clock** (verified 2026-07-17 against the
+//! sibling checkout), so the full-tape identity claim is still upstream-
+//! blocked even though the seeded *walk* (prices) repeats. The SIM_LIVE-gated
+//! closing tests in `tests/simulator_live.rs` assert exactly that split, and
+//! [`crate::data::FeedKind::is_reproducible`] stays `false` for this feed
+//! until the full claim is verified against a live server.
 
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
+use crate::config::ResourceLimits;
+use crate::data::convert::chain_response_to_snapshot;
+use crate::data::feed::{DataFeed, TapeMeta};
+use crate::data::historical::{push_checked, to_hex};
+use crate::data::{DataSourceSpec, SimulatorSourceSpec};
+use crate::domain::{ChainSnapshot, InstrumentSpec, Quantity, SimTime, StepIndex};
 use crate::error::BacktestError;
 
 // ---------------------------------------------------------------------------
@@ -496,9 +526,9 @@ impl ApiClient {
     ///
     /// Per the upstream v0.1.0 surface the plain `GET /api/v1/chain` is a
     /// **read-only peek** that never moves the cursor; the advance is this
-    /// dedicated `POST` step resource. The server also accepts an optional
-    /// `expected_step` precondition (412 on mismatch) for ambiguous-retry
-    /// resolution; this client does not retry, so it does not send one.
+    /// dedicated `POST` step resource. This bare form sends no
+    /// `expected_step` precondition — see [`Self::get_next_step_expecting`]
+    /// for the retry-safe variant the tape materialiser uses.
     ///
     /// # Errors
     ///
@@ -506,7 +536,38 @@ impl ApiClient {
     /// (including `410 Gone` once the session has completed), or an
     /// unparseable response body.
     pub async fn get_next_step(&self, session_id: &str) -> Result<ChainResponse, BacktestError> {
-        let url = format!("{}/api/v1/chain/step?sessionid={session_id}", self.base_url);
+        self.get_next_step_expecting(session_id, None).await
+    }
+
+    /// Advance the session one step, optionally sending the upstream
+    /// `expected_step` precondition (the session's current cursor **before**
+    /// this advance; the server answers `412` without advancing on a
+    /// mismatch).
+    ///
+    /// The precondition is what makes a **bounded retry** of this
+    /// non-idempotent `POST` safe: if an earlier attempt actually advanced
+    /// the session but its response was lost, the retry gets a typed `412`
+    /// instead of silently advancing a second time and skipping a snapshot.
+    /// The tape materialiser ([`SimulatorFeed::open`]) always sends it.
+    ///
+    /// # Errors
+    ///
+    /// [`BacktestError::Session`] on transport failure, a non-2xx status
+    /// (including `412 Precondition Failed` on a cursor mismatch and
+    /// `410 Gone` once the session has completed), or an unparseable
+    /// response body.
+    pub async fn get_next_step_expecting(
+        &self,
+        session_id: &str,
+        expected_step: Option<usize>,
+    ) -> Result<ChainResponse, BacktestError> {
+        let url = match expected_step {
+            Some(expected) => format!(
+                "{}/api/v1/chain/step?sessionid={session_id}&expected_step={expected}",
+                self.base_url
+            ),
+            None => format!("{}/api/v1/chain/step?sessionid={session_id}", self.base_url),
+        };
         let response =
             self.client.post(&url).send().await.map_err(|e| {
                 BacktestError::Session(format!("get_next_step request failed: {e}"))
@@ -744,6 +805,460 @@ impl MarketSimulator {
         self.session_id = None;
         self.current_state = None;
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SimulatorFeed — the materialised, validated, immutable session tape (#45)
+// ---------------------------------------------------------------------------
+
+/// Attempts per materialisation request: one initial call plus two bounded
+/// retries. Retrying the step advance is safe because the materialiser always
+/// sends the `expected_step` precondition (see
+/// [`ApiClient::get_next_step_expecting`]); there is no backoff —
+/// materialisation happens once, before the run, and the bound is small.
+const MATERIALISE_ATTEMPTS: u32 = 3;
+
+/// Domain tag prefixed to the canonical tape serialisation, so the tape hash
+/// can never collide with a hash of the same bytes in another role.
+const TAPE_HASH_TAG: &[u8] = b"ironcondor.tape.v1\0";
+
+/// Run one materialisation request with the bounded retry policy: up to
+/// [`MATERIALISE_ATTEMPTS`] attempts, each failure logged, the **last** error
+/// returned when the bound is exhausted. Retry exists only here, at
+/// materialisation time — the replay loop never touches the network.
+///
+/// An ambiguous failure (the request may have reached the server but its
+/// response was lost) can at worst orphan a `create_session` server-side or
+/// turn a re-sent advance into a typed `412` (never a silent double-advance,
+/// because the materialiser sends `expected_step`).
+async fn with_retry<T, F, Fut>(what: &'static str, mut call: F) -> Result<T, BacktestError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, BacktestError>>,
+{
+    let mut last: Option<BacktestError> = None;
+    for attempt in 1..=MATERIALISE_ATTEMPTS {
+        match call().await {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                tracing::warn!(
+                    request = what,
+                    attempt,
+                    max_attempts = MATERIALISE_ATTEMPTS,
+                    error = %error,
+                    "materialisation request failed"
+                );
+                last = Some(error);
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        BacktestError::Session(format!("{what}: retry bound exhausted without an error"))
+    }))
+}
+
+/// Parse one `ChainResponse.timestamp` into a [`SimTime`].
+///
+/// Used **only** to seed the tape anchor `ts_0` before the first snapshot
+/// exists — every stored `ts` still comes from the single conversion boundary
+/// (`src/data/convert.rs`), which parses the same RFC-3339 field with the
+/// same rule.
+fn response_ts(resp: &ChainResponse) -> Result<SimTime, BacktestError> {
+    let ts_dt = chrono::DateTime::parse_from_rfc3339(&resp.timestamp).map_err(|e| {
+        BacktestError::Conversion(format!(
+            "unparseable snapshot timestamp {:?}: {e}",
+            resp.timestamp
+        ))
+    })?;
+    let ts_ns = ts_dt.timestamp_nanos_opt().ok_or_else(|| {
+        BacktestError::Conversion(format!(
+            "snapshot timestamp {:?} is outside the nanosecond range",
+            resp.timestamp
+        ))
+    })?;
+    Ok(SimTime::new(ts_ns))
+}
+
+/// Whether the session has ended, derived from **real** server state: a
+/// terminal wire state (create/replace responses) or the step counters
+/// reaching the total (every response). This is the migrated-bug-free
+/// termination rule — never hardcoded
+/// ([docs/03 §6.2](../../../docs/03-data-layer.md#62-migrated-bug-fixes)).
+fn session_ended(state: SessionState, current_step: usize, total_steps: usize) -> bool {
+    state.is_terminal() || SessionState::from_progress(current_step, total_steps).is_terminal()
+}
+
+/// Compute the tape's pinned data identity: the `sha256` (lowercase hex) of
+/// the canonical serialisation of the ordered, validated snapshots.
+///
+/// The canonical serialisation is a deterministic byte fold over the
+/// **converted** values — never the wire text, so JSON whitespace, field
+/// order, or float formatting cannot perturb the identity. Layout, after the
+/// [`TAPE_HASH_TAG`] domain tag, per snapshot in tape order:
+///
+/// - `ts` (`i64`), `step` (`u32`) — little-endian;
+/// - `underlying` — `u64` length + UTF-8 bytes;
+/// - `underlying_price`, `tick_size_cents` (`u64`),
+///   `contract_multiplier` (`u32`) — little-endian;
+/// - `quotes.len()` (`u64`), then per quote in `BTreeMap` key order: the
+///   canonical `contract_id` (`u64` length + bytes,
+///   [`crate::domain::ContractKey::to_contract_id`]), `bid` / `ask` / `mid`
+///   (`u64`), `bid_size` / `ask_size` (`u32`) — little-endian — and the five
+///   analytics as `rust_decimal::Decimal::serialize` (16 bytes each).
+///
+/// Two sessions whose walks differ in any converted value (or timestamp) get
+/// distinct identities; replaying identical responses yields the identical
+/// identity.
+///
+/// # Errors
+///
+/// Returns [`BacktestError::Conversion`] if a contract key still carries an
+/// unresolved relative expiry (impossible for a converted snapshot, but
+/// propagated rather than unwrapped), or [`BacktestError::ArithmeticOverflow`]
+/// if a length does not fit `u64`.
+#[must_use = "the tape identity must be used"]
+fn tape_sha256(tape: &[ChainSnapshot]) -> Result<String, BacktestError> {
+    let mut hasher = Sha256::new();
+    hasher.update(TAPE_HASH_TAG);
+    for snapshot in tape {
+        hasher.update(snapshot.ts.value().to_le_bytes());
+        hasher.update(snapshot.step.value().to_le_bytes());
+        update_bytes(&mut hasher, snapshot.underlying.as_str().as_bytes())?;
+        hasher.update(snapshot.underlying_price.value().to_le_bytes());
+        hasher.update(snapshot.spec.tick_size_cents.value().to_le_bytes());
+        hasher.update(snapshot.spec.contract_multiplier.to_le_bytes());
+        let quote_count =
+            u64::try_from(snapshot.quotes.len()).map_err(|_| BacktestError::ArithmeticOverflow)?;
+        hasher.update(quote_count.to_le_bytes());
+        for (key, view) in &snapshot.quotes {
+            update_bytes(&mut hasher, key.to_contract_id()?.as_bytes())?;
+            hasher.update(view.bid.value().to_le_bytes());
+            hasher.update(view.ask.value().to_le_bytes());
+            hasher.update(view.mid.value().to_le_bytes());
+            hasher.update(view.bid_size.value().to_le_bytes());
+            hasher.update(view.ask_size.value().to_le_bytes());
+            hasher.update(view.implied_volatility.serialize());
+            hasher.update(view.delta.serialize());
+            hasher.update(view.gamma.serialize());
+            hasher.update(view.theta.serialize());
+            hasher.update(view.vega.serialize());
+        }
+    }
+    Ok(to_hex(&hasher.finalize()))
+}
+
+/// Fold one length-prefixed byte string into the tape hash.
+fn update_bytes(hasher: &mut Sha256, bytes: &[u8]) -> Result<(), BacktestError> {
+    let len = u64::try_from(bytes.len()).map_err(|_| BacktestError::ArithmeticOverflow)?;
+    hasher.update(len.to_le_bytes());
+    hasher.update(bytes);
+    Ok(())
+}
+
+/// The synthetic-session [`DataFeed`] — a materialised, validated, immutable
+/// tape over one OptionChain-Simulator session (issue #45).
+///
+/// Construct with [`SimulatorFeed::open`]; **all** network work happens
+/// there, once, before the loop. [`DataFeed::next`] is a pure in-memory read
+/// that never blocks or `.await`s, and returns `None` exactly at the tape's
+/// last index — end of stream is where the **server** said the session ended,
+/// never a hardcoded count.
+#[derive(Debug)]
+#[must_use = "a SimulatorFeed does nothing unless its snapshots are consumed via DataFeed::next"]
+pub struct SimulatorFeed {
+    /// The validated, strictly `ts`-ordered snapshots (the replay tape).
+    tape: Vec<ChainSnapshot>,
+    /// The next index [`DataFeed::next`] yields.
+    cursor: usize,
+    /// The pinned tape metadata (identity, non-empty, first ts, final step).
+    meta: TapeMeta,
+    /// The manifest provenance: the configured spec with the **effective**
+    /// walk seed and the materialised tape's `sha256` recorded.
+    source: SimulatorSourceSpec,
+}
+
+impl SimulatorFeed {
+    /// Materialise one simulator session into a validated, immutable tape —
+    /// async-once, **before** the loop
+    /// ([docs/03 §6.1](../../../docs/03-data-layer.md#61-materialised-tape--no-blocking-in-the-loop)).
+    ///
+    /// Drives the whole session on a private current-thread tokio runtime:
+    /// `create_session` (sending `spec.data_seed` as the walk seed) →
+    /// `get_next_step` — with the `expected_step` precondition — until the
+    /// server's own `session_info` reports the session ended → each
+    /// `ChainResponse` converted through the single boundary
+    /// ([`chain_response_to_snapshot`]). The wire shape carries neither the
+    /// tick grid nor per-quote depth, so the caller supplies `instrument`
+    /// and `quote_size` ([docs/03 §7](../../../docs/03-data-layer.md#7-chainresponse--optionchain-conversion));
+    /// relative expiries anchor on the tape's first timestamp.
+    ///
+    /// **Ceilings are enforced incrementally while draining** — the first
+    /// crossing aborts immediately (the materialiser does not keep reading):
+    /// `max_contracts_per_snapshot` before each conversion, `max_steps` and
+    /// the running `max_total_bytes` before each push (the same
+    /// `push_checked` accounting the file feeds use). Timestamps must be
+    /// **strictly increasing** (gaps allowed and preserved); an empty
+    /// session fails to construct. Retry and timeout exist **only** here:
+    /// each request gets `timeout` and the bounded `MATERIALISE_ATTEMPTS`
+    /// (3-attempt) retry.
+    ///
+    /// **The server session is deleted on every path** — success, every
+    /// error, and the ceiling cut-off. A failed delete never masks the
+    /// primary error (it is logged via `tracing::warn!` and, on the success
+    /// path, does not fail the open — the tape is already complete and
+    /// validated).
+    ///
+    /// The returned feed's [`DataFeed::meta`] carries the spec with the
+    /// **effective** walk seed the server echoed back (`data_seed` and
+    /// `session.seed` both record it) and the tape identity in
+    /// `tape_sha256`; [`DataFeed::tape_meta`] exposes the same identity as
+    /// [`TapeMeta::data_identity`].
+    ///
+    /// Must not be called from inside an async runtime (the materialiser
+    /// blocks on its own current-thread runtime); doing so is a typed
+    /// [`BacktestError::Session`], never a panic.
+    ///
+    /// # Errors
+    ///
+    /// - [`BacktestError::Session`] — runtime construction, a request that
+    ///   still fails after the bounded retry, a `412` cursor mismatch, or
+    ///   calling from inside an async runtime.
+    /// - [`BacktestError::TapeTooLarge`] — the first crossed `max_steps` /
+    ///   `max_contracts_per_snapshot` / `max_total_bytes` ceiling
+    ///   (`limit` names the field).
+    /// - [`BacktestError::DataOutOfOrder`] — a duplicate or reversed
+    ///   snapshot timestamp.
+    /// - [`BacktestError::Conversion`] — a snapshot that fails the
+    ///   conversion boundary, or an **empty** tape (a session that was
+    ///   already ended at creation).
+    /// - The tick-alignment / crossed-quote / overflow variants the
+    ///   conversion core raises.
+    pub fn open(
+        spec: &SimulatorSourceSpec,
+        instrument: InstrumentSpec,
+        quote_size: Quantity,
+        timeout: Duration,
+        limits: &ResourceLimits,
+    ) -> Result<Self, BacktestError> {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            return Err(BacktestError::Session(
+                "SimulatorFeed::open must not be called from inside an async runtime; \
+                 it blocks on its own current-thread runtime"
+                    .to_string(),
+            ));
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| BacktestError::Session(format!("tokio runtime build failed: {e}")))?;
+        runtime.block_on(Self::open_async(
+            spec, instrument, quote_size, timeout, limits,
+        ))
+    }
+
+    /// The async body of [`Self::open`]: create → drain → **always** delete →
+    /// pin the identity and provenance.
+    async fn open_async(
+        spec: &SimulatorSourceSpec,
+        instrument: InstrumentSpec,
+        quote_size: Quantity,
+        timeout: Duration,
+        limits: &ResourceLimits,
+    ) -> Result<Self, BacktestError> {
+        let client = ApiClient::new(&spec.base_url, timeout)?;
+
+        // Create the session, sending the configured data seed as the walk
+        // seed (the cross-layer contract, docs/03 §6). If this fails there is
+        // no session id to clean up.
+        let mut request = spec.session.clone();
+        request.seed = Some(spec.data_seed);
+        let session =
+            with_retry("create_session", || client.create_session(request.clone())).await?;
+        let session_id = session.id.clone();
+
+        // Drain the session to a tape; then delete the server session on
+        // EVERY path — success, conversion/validation errors, and the
+        // ceiling cut-off alike ([docs/03 §6.1]). A delete failure is
+        // logged, never allowed to mask the primary outcome.
+        let drained = Self::drain(&client, &session, instrument, quote_size, limits).await;
+        let deleted = with_retry("delete_session", || client.delete_session(&session_id)).await;
+        if let Err(delete_error) = &deleted {
+            tracing::warn!(
+                session_id = %session_id,
+                error = %delete_error,
+                materialisation_failed = drained.is_err(),
+                "delete_session failed; the server session may be leaked"
+            );
+        }
+        let tape = drained?;
+        if tape.is_empty() {
+            return Err(BacktestError::Conversion(format!(
+                "simulator session {session_id} produced an empty tape; \
+                 an empty tape fails to construct"
+            )));
+        }
+
+        // Pin the tape identity (the run_id data identity) and validate the
+        // tape shape once more through the shared core.
+        let sha256 = tape_sha256(&tape)?;
+        let meta = TapeMeta::from_tape(sha256.clone(), &tape)?;
+
+        // Record the provenance: the EFFECTIVE walk seed the server echoed
+        // back (equal to the configured seed on a v0.1.0 server; the honest
+        // value either way) and the materialised tape's sha256.
+        let mut source = spec.clone();
+        source.session.seed = Some(spec.data_seed);
+        match session.parameters.seed {
+            Some(effective) => {
+                if effective != spec.data_seed {
+                    tracing::warn!(
+                        configured = spec.data_seed,
+                        effective,
+                        "simulator echoed a different effective walk seed; recording the effective value"
+                    );
+                }
+                source.data_seed = effective;
+                source.session.seed = Some(effective);
+            }
+            None => {
+                tracing::warn!(
+                    configured = spec.data_seed,
+                    "simulator echoed no effective walk seed (pre-v0.1.0 server?); the \
+                     configured data_seed cannot be claimed to have driven the walk"
+                );
+            }
+        }
+        source.tape_sha256 = sha256;
+
+        Ok(Self {
+            tape,
+            cursor: 0,
+            meta,
+            source,
+        })
+    }
+
+    /// Advance the session until the **server** reports it ended, converting
+    /// and validating each response into the tape.
+    ///
+    /// Termination derives from real state only (never hardcoded): the
+    /// create response's wire state and, per advance, the
+    /// `ChainResponse.session_info` counters — the two migrated
+    /// `MarketSimulator` bugs stay fixed here
+    /// ([docs/03 §6.2](../../../docs/03-data-layer.md#62-migrated-bug-fixes)).
+    async fn drain(
+        client: &ApiClient,
+        session: &SessionResponse,
+        instrument: InstrumentSpec,
+        quote_size: Quantity,
+        limits: &ResourceLimits,
+    ) -> Result<Vec<ChainSnapshot>, BacktestError> {
+        let mut tape: Vec<ChainSnapshot> = Vec::new();
+        let mut total_bytes: u64 = 0;
+        let mut anchor_ts: Option<SimTime> = None;
+        let mut prev_ts: Option<SimTime> = None;
+
+        // Initial state from the create response: the REAL wire state plus
+        // the step counters (a session created already-ended yields no steps
+        // and therefore an empty tape, rejected by the caller).
+        let mut ended = session_ended(
+            SessionState::from_wire(&session.state),
+            session.current_step,
+            session.total_steps,
+        );
+        // The cursor the next advance expects — the retry-safe precondition.
+        let mut expected_step = session.current_step;
+
+        while !ended {
+            let resp = with_retry("get_next_step", || {
+                client.get_next_step_expecting(&session.id, Some(expected_step))
+            })
+            .await?;
+
+            // Ceiling: contracts per snapshot, BEFORE the conversion builds
+            // anything (one DTO contract row becomes a call and a put quote).
+            let quote_count = u64::try_from(resp.contracts.len())
+                .map_err(|_| BacktestError::ArithmeticOverflow)?
+                .checked_mul(2)
+                .ok_or(BacktestError::ArithmeticOverflow)?;
+            let contracts_cap = u64::from(limits.max_contracts_per_snapshot);
+            if quote_count > contracts_cap {
+                return Err(BacktestError::TapeTooLarge {
+                    limit: "max_contracts_per_snapshot",
+                    value: quote_count,
+                    cap: contracts_cap,
+                });
+            }
+
+            // The 0-based tape ordinal (bounded by max_steps ≤ 10M, so the
+            // u32 conversion cannot fail before the ceiling fires).
+            let step = StepIndex::new(
+                u32::try_from(tape.len()).map_err(|_| BacktestError::ArithmeticOverflow)?,
+            );
+
+            // The tape anchor ts_0: the FIRST snapshot's own timestamp.
+            let anchor = match anchor_ts {
+                Some(existing) => existing,
+                None => {
+                    let first = response_ts(&resp)?;
+                    anchor_ts = Some(first);
+                    first
+                }
+            };
+
+            // The single conversion boundary — never a second path.
+            let snapshot = chain_response_to_snapshot(&resp, step, instrument, anchor, quote_size)?;
+
+            // Strictly increasing timestamps, checked incrementally so a bad
+            // session is cut off without draining the rest (gaps are allowed
+            // and preserved — never fabricated over).
+            if let Some(prev) = prev_ts
+                && snapshot.ts <= prev
+            {
+                return Err(BacktestError::DataOutOfOrder {
+                    step: step.value(),
+                    ts: snapshot.ts.value(),
+                    prev: prev.value(),
+                });
+            }
+            prev_ts = Some(snapshot.ts);
+
+            // Ceilings: max_steps after this advance BEFORE the push, and the
+            // running max_total_bytes — the shared accounting the file feeds
+            // use, so the first crossing aborts identically.
+            push_checked(&mut tape, snapshot, &mut total_bytes, limits)?;
+
+            // Termination from the server's own counters (bug-fix 2).
+            let info = &resp.session_info;
+            ended = SessionState::from_progress(info.current_step, info.total_steps).is_terminal();
+            expected_step = info.current_step;
+        }
+
+        Ok(tape)
+    }
+}
+
+impl DataFeed for SimulatorFeed {
+    fn next(&mut self) -> Result<Option<ChainSnapshot>, BacktestError> {
+        match self.tape.get(self.cursor) {
+            Some(snapshot) => {
+                // `get` matched, so `cursor < tape.len() <= isize::MAX` — the
+                // increment cannot overflow; plain `+= 1` keeps the codebase's
+                // no-saturating/wrapping convention.
+                self.cursor += 1;
+                Ok(Some(snapshot.clone()))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn meta(&self) -> DataSourceSpec {
+        DataSourceSpec::Simulator(self.source.clone())
+    }
+
+    fn tape_meta(&self) -> &TapeMeta {
+        &self.meta
     }
 }
 
@@ -1052,5 +1567,115 @@ mod tests {
             }
             Err(e) => panic!("a response with an unknown field must parse: {e}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tape_tests {
+    use optionstratlib::{ExpirationDate, OptionStyle};
+
+    use super::{SessionState, session_ended, tape_sha256};
+    use crate::data::convert::{RawQuote, SnapshotMeta, raw_quotes_to_snapshot};
+    use crate::domain::{ChainSnapshot, PriceCents, Quantity, SimTime, StepIndex, Underlying};
+
+    const TS0: i64 = 1_784_073_601_000_000_000;
+
+    /// One validated snapshot at `step`, built through the single conversion
+    /// core (the same path materialisation uses), with `bid` cents at the one
+    /// quoted call.
+    fn snapshot(step: u32, ts_offset_ns: i64, bid: u64) -> ChainSnapshot {
+        let underlying = match Underlying::new("SPX") {
+            Ok(u) => u,
+            Err(e) => panic!("SPX must be a valid underlying: {e}"),
+        };
+        let bid_size = match Quantity::new(10) {
+            Ok(q) => q,
+            Err(e) => panic!("10 must be a valid quantity: {e}"),
+        };
+        let quote = RawQuote {
+            expiration: ExpirationDate::DateTime(chrono::DateTime::from_timestamp_nanos(
+                TS0 + 30 * 86_400_000_000_000,
+            )),
+            strike: PriceCents::new(430_000),
+            style: OptionStyle::Call,
+            bid: PriceCents::new(bid),
+            ask: PriceCents::new(1_250),
+            bid_size,
+            ask_size: bid_size,
+            implied_volatility: 0.19,
+            delta: 0.55,
+            gamma: 0.001,
+            theta: 0.0,
+            vega: 0.0,
+        };
+        let meta = SnapshotMeta {
+            ts: SimTime::new(TS0 + ts_offset_ns),
+            step: StepIndex::new(step),
+            anchor_ts: SimTime::new(TS0),
+            underlying,
+            underlying_price: PriceCents::new(431_025),
+            tick_size_cents: PriceCents::new(5),
+            contract_multiplier: 100,
+        };
+        match raw_quotes_to_snapshot(&meta, &[quote]) {
+            Ok(s) => s,
+            Err(e) => panic!("conversion must succeed: {e}"),
+        }
+    }
+
+    #[test]
+    fn test_tape_sha256_stable_for_identical_tapes() {
+        let tape_a = vec![snapshot(0, 0, 1_200), snapshot(1, 1_000_000_000, 1_205)];
+        let tape_b = vec![snapshot(0, 0, 1_200), snapshot(1, 1_000_000_000, 1_205)];
+        let sha_a = match tape_sha256(&tape_a) {
+            Ok(s) => s,
+            Err(e) => panic!("hashing must succeed: {e}"),
+        };
+        let sha_b = match tape_sha256(&tape_b) {
+            Ok(s) => s,
+            Err(e) => panic!("hashing must succeed: {e}"),
+        };
+        assert_eq!(
+            sha_a, sha_b,
+            "the identical ordered tape hashes identically"
+        );
+        assert_eq!(sha_a.len(), 64, "sha256 is 64 lowercase hex chars");
+        assert!(sha_a.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_tape_sha256_sensitive_to_any_converted_value() {
+        let base = vec![snapshot(0, 0, 1_200), snapshot(1, 1_000_000_000, 1_205)];
+        let bid_changed = vec![snapshot(0, 0, 1_195), snapshot(1, 1_000_000_000, 1_205)];
+        let ts_changed = vec![snapshot(0, 0, 1_200), snapshot(1, 2_000_000_000, 1_205)];
+        let sha = |tape: &[ChainSnapshot]| match tape_sha256(tape) {
+            Ok(s) => s,
+            Err(e) => panic!("hashing must succeed: {e}"),
+        };
+        assert_ne!(
+            sha(&base),
+            sha(&bid_changed),
+            "a differing quoted value must yield a distinct identity"
+        );
+        assert_ne!(
+            sha(&base),
+            sha(&ts_changed),
+            "a differing timestamp must yield a distinct identity"
+        );
+    }
+
+    #[test]
+    fn test_session_ended_derives_from_wire_state_and_counters() {
+        // A fresh session with steps ahead is not ended.
+        assert!(!session_ended(SessionState::Initialized, 0, 3));
+        // The counters end the session even under a non-terminal wire state.
+        assert!(session_ended(SessionState::Initialized, 0, 0));
+        assert!(session_ended(SessionState::InProgress, 3, 3));
+        // A terminal wire state ends it regardless of the counters.
+        assert!(session_ended(SessionState::Completed, 0, 3));
+        assert!(session_ended(SessionState::Error, 0, 3));
+        // An unknown forward-compat state stays non-terminal; the counters
+        // (and the max_steps ceiling) still bound the drain.
+        assert!(!session_ended(SessionState::Unknown, 1, 3));
     }
 }

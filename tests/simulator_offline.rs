@@ -22,8 +22,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ironcondor::{
-    ApiClient, BacktestError, CreateSessionRequest, MarketSimulator, SessionState,
-    UpdateSessionRequest,
+    ApiClient, BacktestError, CreateSessionRequest, DataFeed, DataSourceSpec, InstrumentSpec,
+    MarketSimulator, PriceCents, Quantity, ResourceLimits, SessionState, SimTime, SimulatorFeed,
+    SimulatorSourceSpec, StepIndex, UpdateSessionRequest,
 };
 
 const CREATE_FIXTURE: &str = include_str!("fixtures/simulator/create.json");
@@ -32,7 +33,13 @@ const STEP_FIXTURES: [&str; 3] = [
     include_str!("fixtures/simulator/step_2.json"),
     include_str!("fixtures/simulator/step_3.json"),
 ];
+const STEP_2_OUT_OF_ORDER_FIXTURE: &str =
+    include_str!("fixtures/simulator/step_2_out_of_order.json");
 const ERROR_NOT_FOUND_FIXTURE: &str = include_str!("fixtures/simulator/error_not_found.json");
+
+/// `2026-07-15T00:00:01Z` (the `step_1.json` timestamp) in nanoseconds since
+/// the Unix epoch; the later step fixtures advance by exactly one second.
+const STEP_1_TS_NS: i64 = 1_784_073_601_000_000_000;
 
 /// One scripted HTTP exchange: the response to send to the next connection.
 struct Scripted {
@@ -467,5 +474,457 @@ async fn test_offline_connection_refused_maps_to_session() {
     assert_session_error(
         client.delete_session("sess-1").await,
         &["delete_session request failed"],
+    );
+}
+
+// ---------------------------------------------------------------------------
+// SimulatorFeed materialisation (#45): fixtures → a validated immutable tape,
+// with the session deleted on EVERY path (success, error, ceiling cut-off)
+// ---------------------------------------------------------------------------
+
+/// The provenance spec the feed tests open: the shared request against the
+/// scripted server, with the configured data seed `42` (matching the
+/// effective seed the recorded create fixture echoes back).
+fn feed_spec(server: &ScriptedServer) -> SimulatorSourceSpec {
+    SimulatorSourceSpec {
+        session: create_request(),
+        base_url: server.base_url.clone(),
+        data_seed: 42,
+        tape_sha256: String::new(),
+        simulator_version: None,
+    }
+}
+
+/// The 5-cent / 100x instrument grid the wire shape cannot carry; every
+/// fixture price is 5-cent-aligned.
+fn instrument() -> InstrumentSpec {
+    match InstrumentSpec::new(PriceCents::new(5), 100) {
+        Ok(spec) => spec,
+        Err(e) => panic!("5c tick / 100x multiplier must be a valid spec: {e}"),
+    }
+}
+
+fn quote_size() -> Quantity {
+    match Quantity::new(10) {
+        Ok(q) => q,
+        Err(e) => panic!("10 must be a valid quantity: {e}"),
+    }
+}
+
+fn open_feed(
+    server: &ScriptedServer,
+    limits: &ResourceLimits,
+) -> Result<SimulatorFeed, BacktestError> {
+    SimulatorFeed::open(
+        &feed_spec(server),
+        instrument(),
+        quote_size(),
+        Duration::from_secs(5),
+        limits,
+    )
+}
+
+/// The full recorded session: create → 3 steps → delete.
+fn full_session_script() -> Vec<Scripted> {
+    vec![
+        Scripted::created(CREATE_FIXTURE),
+        Scripted::ok(STEP_FIXTURES[0]),
+        Scripted::ok(STEP_FIXTURES[1]),
+        Scripted::ok(STEP_FIXTURES[2]),
+        Scripted::ok("\"Session deleted\""),
+    ]
+}
+
+#[test]
+fn test_offline_feed_materialises_validated_tape_and_deletes_session() {
+    let server = ScriptedServer::spawn(full_session_script());
+    let mut feed = match open_feed(&server, &ResourceLimits::default()) {
+        Ok(feed) => feed,
+        Err(e) => panic!("materialisation against the recorded fixtures failed: {e}"),
+    };
+
+    // The pinned tape metadata is available before anything is consumed.
+    let meta = feed.tape_meta().clone();
+    assert!(meta.non_empty);
+    assert_eq!(meta.first_ts, SimTime::new(STEP_1_TS_NS));
+    assert_eq!(meta.final_step, StepIndex::new(2));
+    assert_eq!(meta.data_identity.len(), 64, "sha256 is 64 hex chars");
+    assert!(meta.data_identity.chars().all(|c| c.is_ascii_hexdigit()));
+
+    // The provenance records the tape identity and the EFFECTIVE walk seed
+    // the server echoed back (42, per the recorded create fixture).
+    match feed.meta() {
+        DataSourceSpec::Simulator(source) => {
+            assert_eq!(source.tape_sha256, meta.data_identity);
+            assert_eq!(source.data_seed, 42, "the effective seed is recorded");
+            assert_eq!(source.session.seed, Some(42));
+            assert_eq!(source.base_url, server.base_url);
+        }
+        other => panic!("the simulator feed must describe a simulator source, got {other:?}"),
+    }
+
+    // next() is a pure indexed read over the validated tape: three strictly
+    // ts-increasing snapshots (one second apart), 0-based tape steps, one
+    // call + one put quote per fixture contract row, then None forever.
+    for (index, expected_price_cents) in [(0_u32, 431_025_u64), (1, 429_575), (2, 432_150)] {
+        match feed.next() {
+            Ok(Some(snapshot)) => {
+                assert_eq!(snapshot.step, StepIndex::new(index));
+                assert_eq!(
+                    snapshot.ts,
+                    SimTime::new(STEP_1_TS_NS + i64::from(index) * 1_000_000_000)
+                );
+                assert_eq!(snapshot.underlying.as_str(), "SPX");
+                assert_eq!(
+                    snapshot.underlying_price,
+                    PriceCents::new(expected_price_cents)
+                );
+                assert_eq!(snapshot.quotes.len(), 2, "one contract row = call + put");
+            }
+            other => panic!("expected snapshot {index}, got {other:?}"),
+        }
+    }
+    assert!(matches!(feed.next(), Ok(None)));
+    assert!(matches!(feed.next(), Ok(None)), "exhaustion is permanent");
+
+    // The wire trace: the data seed travels on create, every advance carries
+    // the expected_step precondition, and the session is deleted at the end.
+    let requests = server.finish();
+    let targets: Vec<&str> = requests.iter().map(|r| r.target.as_str()).collect();
+    assert_eq!(
+        targets,
+        vec![
+            "POST /api/v1/chain",
+            "POST /api/v1/chain/step?sessionid=sess-1&expected_step=0",
+            "POST /api/v1/chain/step?sessionid=sess-1&expected_step=1",
+            "POST /api/v1/chain/step?sessionid=sess-1&expected_step=2",
+            "DELETE /api/v1/chain?sessionid=sess-1",
+        ]
+    );
+    match requests.first() {
+        Some(create) => assert!(
+            create.body.contains("\"seed\":42"),
+            "the configured data seed must travel on create_session: {}",
+            create.body
+        ),
+        None => panic!("the create request must have been recorded"),
+    }
+}
+
+#[test]
+fn test_offline_feed_out_of_order_ts_rejected_and_session_deleted() {
+    // step 2 repeats step 1's timestamp — a duplicate ts is DataOutOfOrder.
+    let server = ScriptedServer::spawn(vec![
+        Scripted::created(CREATE_FIXTURE),
+        Scripted::ok(STEP_FIXTURES[0]),
+        Scripted::ok(STEP_2_OUT_OF_ORDER_FIXTURE),
+        Scripted::ok("\"Session deleted\""),
+    ]);
+    let result = open_feed(&server, &ResourceLimits::default());
+    assert!(
+        matches!(
+            result,
+            Err(BacktestError::DataOutOfOrder {
+                step: 1,
+                ts: STEP_1_TS_NS,
+                prev: STEP_1_TS_NS,
+            })
+        ),
+        "a duplicate ts must be DataOutOfOrder, got {result:?}"
+    );
+
+    // The violation aborts the drain (no third advance) and the session is
+    // STILL deleted.
+    let requests = server.finish();
+    let targets: Vec<&str> = requests.iter().map(|r| r.target.as_str()).collect();
+    assert_eq!(
+        targets,
+        vec![
+            "POST /api/v1/chain",
+            "POST /api/v1/chain/step?sessionid=sess-1&expected_step=0",
+            "POST /api/v1/chain/step?sessionid=sess-1&expected_step=1",
+            "DELETE /api/v1/chain?sessionid=sess-1",
+        ]
+    );
+}
+
+#[test]
+fn test_offline_feed_max_steps_ceiling_cuts_off_and_deletes() {
+    // 3 canned steps against a 2-step ceiling: the crossing is detected on
+    // the third advance, BEFORE it is pushed, and nothing further is read.
+    let server = ScriptedServer::spawn(full_session_script());
+    let limits = ResourceLimits {
+        max_steps: 2,
+        ..ResourceLimits::default()
+    };
+    let result = open_feed(&server, &limits);
+    assert!(
+        matches!(
+            result,
+            Err(BacktestError::TapeTooLarge {
+                limit: "max_steps",
+                value: 3,
+                cap: 2,
+            })
+        ),
+        "the first crossed ceiling must abort with TapeTooLarge, got {result:?}"
+    );
+
+    let requests = server.finish();
+    let targets: Vec<&str> = requests.iter().map(|r| r.target.as_str()).collect();
+    assert_eq!(
+        targets,
+        vec![
+            "POST /api/v1/chain",
+            "POST /api/v1/chain/step?sessionid=sess-1&expected_step=0",
+            "POST /api/v1/chain/step?sessionid=sess-1&expected_step=1",
+            "POST /api/v1/chain/step?sessionid=sess-1&expected_step=2",
+            "DELETE /api/v1/chain?sessionid=sess-1",
+        ],
+        "no further step request may follow the crossing; only the DELETE"
+    );
+}
+
+#[test]
+fn test_offline_feed_max_contracts_ceiling_cuts_off_and_deletes() {
+    // One fixture contract row = 2 quotes, against a 1-quote ceiling: the
+    // very first snapshot crosses at conversion time.
+    let server = ScriptedServer::spawn(vec![
+        Scripted::created(CREATE_FIXTURE),
+        Scripted::ok(STEP_FIXTURES[0]),
+        Scripted::ok("\"Session deleted\""),
+    ]);
+    let limits = ResourceLimits {
+        max_contracts_per_snapshot: 1,
+        ..ResourceLimits::default()
+    };
+    let result = open_feed(&server, &limits);
+    assert!(
+        matches!(
+            result,
+            Err(BacktestError::TapeTooLarge {
+                limit: "max_contracts_per_snapshot",
+                value: 2,
+                cap: 1,
+            })
+        ),
+        "an oversized snapshot must abort with TapeTooLarge, got {result:?}"
+    );
+
+    let requests = server.finish();
+    let targets: Vec<&str> = requests.iter().map(|r| r.target.as_str()).collect();
+    assert_eq!(
+        targets,
+        vec![
+            "POST /api/v1/chain",
+            "POST /api/v1/chain/step?sessionid=sess-1&expected_step=0",
+            "DELETE /api/v1/chain?sessionid=sess-1",
+        ]
+    );
+}
+
+#[test]
+fn test_offline_feed_max_total_bytes_ceiling_cuts_off_and_deletes() {
+    // A 1-byte tape budget: the first converted snapshot crosses the running
+    // byte total before it is pushed.
+    let server = ScriptedServer::spawn(vec![
+        Scripted::created(CREATE_FIXTURE),
+        Scripted::ok(STEP_FIXTURES[0]),
+        Scripted::ok("\"Session deleted\""),
+    ]);
+    let limits = ResourceLimits {
+        max_total_bytes: 1,
+        ..ResourceLimits::default()
+    };
+    let result = open_feed(&server, &limits);
+    match result {
+        Err(BacktestError::TapeTooLarge {
+            limit: "max_total_bytes",
+            value,
+            cap: 1,
+        }) => assert!(value > 1, "the observed byte total must exceed the cap"),
+        other => panic!("expected the max_total_bytes cut-off, got {other:?}"),
+    }
+
+    let requests = server.finish();
+    let targets: Vec<&str> = requests.iter().map(|r| r.target.as_str()).collect();
+    assert_eq!(
+        targets,
+        vec![
+            "POST /api/v1/chain",
+            "POST /api/v1/chain/step?sessionid=sess-1&expected_step=0",
+            "DELETE /api/v1/chain?sessionid=sess-1",
+        ]
+    );
+}
+
+#[test]
+fn test_offline_feed_same_fixtures_twice_identical_sha256() {
+    // The offline half of the reproducibility claim: replaying the identical
+    // recorded responses through the materialiser twice yields the identical
+    // tape identity — the materialiser itself adds no nondeterminism.
+    let first = ScriptedServer::spawn(full_session_script());
+    let second = ScriptedServer::spawn(full_session_script());
+    let feed_a = match open_feed(&first, &ResourceLimits::default()) {
+        Ok(feed) => feed,
+        Err(e) => panic!("first materialisation failed: {e}"),
+    };
+    let feed_b = match open_feed(&second, &ResourceLimits::default()) {
+        Ok(feed) => feed,
+        Err(e) => panic!("second materialisation failed: {e}"),
+    };
+    assert_eq!(
+        feed_a.tape_meta().data_identity,
+        feed_b.tape_meta().data_identity,
+        "identical canned responses must materialise to the identical tape sha256"
+    );
+    drop(first.finish());
+    drop(second.finish());
+}
+
+#[test]
+fn test_offline_feed_different_fixtures_distinct_sha256() {
+    // Two sessions from the identical request whose walks differ must get
+    // DISTINCT identities (and hence distinct run_ids downstream).
+    let diverged_step = STEP_FIXTURES[0].replace("4310.25", "4390.25");
+    assert_ne!(diverged_step, STEP_FIXTURES[0], "the walk must diverge");
+    let first = ScriptedServer::spawn(full_session_script());
+    let second = ScriptedServer::spawn(vec![
+        Scripted::created(CREATE_FIXTURE),
+        Scripted::ok(&diverged_step),
+        Scripted::ok(STEP_FIXTURES[1]),
+        Scripted::ok(STEP_FIXTURES[2]),
+        Scripted::ok("\"Session deleted\""),
+    ]);
+    let feed_a = match open_feed(&first, &ResourceLimits::default()) {
+        Ok(feed) => feed,
+        Err(e) => panic!("first materialisation failed: {e}"),
+    };
+    let feed_b = match open_feed(&second, &ResourceLimits::default()) {
+        Ok(feed) => feed,
+        Err(e) => panic!("second (diverged) materialisation failed: {e}"),
+    };
+    assert_ne!(
+        feed_a.tape_meta().data_identity,
+        feed_b.tape_meta().data_identity,
+        "differing walks from the identical request must get distinct identities"
+    );
+    drop(first.finish());
+    drop(second.finish());
+}
+
+#[test]
+fn test_offline_feed_empty_session_fails_to_construct_and_deletes() {
+    // A session that is already ended at creation yields no steps: the empty
+    // tape fails to construct — and the session is still deleted.
+    let completed_create =
+        CREATE_FIXTURE.replace("\"state\": \"Initialized\"", "\"state\": \"Completed\"");
+    assert_ne!(
+        completed_create, CREATE_FIXTURE,
+        "the state must be patched"
+    );
+    let server = ScriptedServer::spawn(vec![
+        Scripted::created(&completed_create),
+        Scripted::ok("\"Session deleted\""),
+    ]);
+    let result = open_feed(&server, &ResourceLimits::default());
+    match result {
+        Err(BacktestError::Conversion(msg)) => assert!(
+            msg.contains("empty tape"),
+            "the error must name the empty tape, got: {msg}"
+        ),
+        other => panic!("an empty session must fail construction, got {other:?}"),
+    }
+
+    let requests = server.finish();
+    let targets: Vec<&str> = requests.iter().map(|r| r.target.as_str()).collect();
+    assert_eq!(
+        targets,
+        vec![
+            "POST /api/v1/chain",
+            "DELETE /api/v1/chain?sessionid=sess-1",
+        ],
+        "no advance is attempted on an already-ended session; delete still runs"
+    );
+}
+
+#[test]
+fn test_offline_feed_create_retry_is_bounded_and_recovers() {
+    // The bounded materialisation retry: a transient 500 on create is
+    // retried and the session then materialises normally.
+    let server = ScriptedServer::spawn(vec![
+        Scripted {
+            status: 500,
+            reason: "Internal Server Error",
+            body: "boom".to_string(),
+            delay: None,
+        },
+        Scripted::created(CREATE_FIXTURE),
+        Scripted::ok(STEP_FIXTURES[0]),
+        Scripted::ok(STEP_FIXTURES[1]),
+        Scripted::ok(STEP_FIXTURES[2]),
+        Scripted::ok("\"Session deleted\""),
+    ]);
+    let feed = match open_feed(&server, &ResourceLimits::default()) {
+        Ok(feed) => feed,
+        Err(e) => panic!("materialisation must recover from one transient failure: {e}"),
+    };
+    assert_eq!(feed.tape_meta().final_step, StepIndex::new(2));
+
+    let requests = server.finish();
+    let targets: Vec<&str> = requests.iter().map(|r| r.target.as_str()).collect();
+    assert_eq!(
+        targets.first().copied(),
+        Some("POST /api/v1/chain"),
+        "the failed create comes first"
+    );
+    assert_eq!(
+        targets.get(1).copied(),
+        Some("POST /api/v1/chain"),
+        "the bounded retry re-sends the create"
+    );
+    assert_eq!(targets.len(), 6, "one retry, then the normal session flow");
+}
+
+#[test]
+fn test_offline_feed_step_failure_exhausts_retries_aborts_and_deletes() {
+    // A persistent advance failure: all bounded attempts fail, open aborts
+    // with the typed Session error — and the session is STILL deleted.
+    let step_error = |status: u16, reason: &'static str| Scripted {
+        status,
+        reason,
+        body: ERROR_NOT_FOUND_FIXTURE.to_string(),
+        delay: None,
+    };
+    let server = ScriptedServer::spawn(vec![
+        Scripted::created(CREATE_FIXTURE),
+        Scripted::ok(STEP_FIXTURES[0]),
+        step_error(404, "Not Found"),
+        step_error(404, "Not Found"),
+        step_error(404, "Not Found"),
+        Scripted::ok("\"Session deleted\""),
+    ]);
+    let result = open_feed(&server, &ResourceLimits::default());
+    match result {
+        Err(BacktestError::Session(msg)) => assert!(
+            msg.contains("http 404"),
+            "the last retry error surfaces, got: {msg}"
+        ),
+        other => panic!("a persistent advance failure must abort with Session, got {other:?}"),
+    }
+
+    let requests = server.finish();
+    let targets: Vec<&str> = requests.iter().map(|r| r.target.as_str()).collect();
+    assert_eq!(
+        targets,
+        vec![
+            "POST /api/v1/chain",
+            "POST /api/v1/chain/step?sessionid=sess-1&expected_step=0",
+            "POST /api/v1/chain/step?sessionid=sess-1&expected_step=1",
+            "POST /api/v1/chain/step?sessionid=sess-1&expected_step=1",
+            "POST /api/v1/chain/step?sessionid=sess-1&expected_step=1",
+            "DELETE /api/v1/chain?sessionid=sess-1",
+        ],
+        "three bounded attempts at the same expected_step, then the DELETE"
     );
 }
