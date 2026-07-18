@@ -75,6 +75,7 @@
 #![warn(missing_docs)]
 
 pub mod analytics;
+pub mod batch;
 pub mod bundle;
 pub mod config;
 pub mod data;
@@ -87,6 +88,10 @@ pub mod python;
 pub mod run;
 
 pub use analytics::Metrics;
+pub use batch::{
+    BATCH_INDEX_SCHEMA, BatchIndex, BatchRunEntry, BatchRunOutcome, SimulatorMaterialisation,
+    run_scenario_batch,
+};
 pub use bundle::{
     BUNDLE_SCHEMA, EQUITY_CURVE_SORT_COLUMNS, FILLS_SORT_COLUMNS, GREEKS_ATTRIBUTION_SORT_COLUMNS,
     Manifest, POSITIONS_SORT_COLUMNS, RowCounts, RunId, ValidatedBundle, ValidatedManifest,
@@ -110,7 +115,7 @@ pub use engine::{
     AttributionSubstrate, BacktestEngine, BacktestRun, ChainContext, ConfigOverride, Event,
     FillRecord, Ledger, LegAttributionSample, OptStratAdapter, PositionMark, PositionSnapshot,
     PositionableStrategy, ScenarioParams, ScenarioType, SimClock, StepAttributionScalars, Strategy,
-    UnitGreeks,
+    UnitGreeks, WalkPreset, child_data_seed, child_seed, expand,
 };
 pub use error::BacktestError;
 #[cfg(feature = "orderbook")]

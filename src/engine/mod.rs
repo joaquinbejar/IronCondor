@@ -27,7 +27,9 @@ pub use backtest::{BacktestEngine, BacktestRun};
 pub use bundle_collector::{FillRecord, PositionSnapshot};
 pub use clock::{Event, SimClock};
 pub use ledger::{Ledger, PositionMark, UnitGreeks};
-pub use scenario::{ConfigOverride, ScenarioParams, ScenarioType};
+pub use scenario::{
+    ConfigOverride, ScenarioParams, ScenarioType, WalkPreset, child_data_seed, child_seed, expand,
+};
 pub use strategy::{ChainContext, OptStratAdapter, PositionableStrategy, Strategy};
 pub use substrate::{AttributionSubstrate, LegAttributionSample, StepAttributionScalars};
 pub use tradelog::ClosedTrade;
