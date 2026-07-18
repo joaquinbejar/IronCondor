@@ -820,8 +820,12 @@ impl ExecutionModel for RealisticFill {
     }
 
     #[inline]
-    fn fill_groups(&self) -> &[FillGroup] {
-        &self.fill_groups
+    fn fill_groups(&self) -> Option<&[FillGroup]> {
+        // Realistic mode is the GROUPED correlation contract: one FillGroup per
+        // filling Submit (empty when a step produced no command fills, e.g. a
+        // refresh-only step). `Some` — never `None` — so a surplus refresh fill
+        // is a typed error rather than being consumed one-per-Submit (F31).
+        Some(&self.fill_groups)
     }
 
     #[inline]

@@ -140,15 +140,25 @@ impl MetricsSummary {
 
 /// Read an integer-cents `custom_metrics` value, failing loudly if it is missing
 /// or not an exact integer.
+///
+/// A fractional `Decimal` is **rejected** (not silently truncated): `to_i64`
+/// discards the fractional part, so `1234.5` would otherwise pass as `1234` and
+/// let a real cents divergence slip through the golden. The fractional check runs
+/// **before** the conversion so a non-integer cents value is a loud oracle error.
 fn cents_metric(result: &BacktestResult, key: &str) -> Result<i64, String> {
     let value = result
         .custom_metrics
         .get(key)
         .copied()
         .ok_or_else(|| format!("missing custom metric {key}"))?;
+    if !value.fract().is_zero() {
+        return Err(format!(
+            "{key} is not an integer number of cents: {value} has a fractional part"
+        ));
+    }
     value
         .to_i64()
-        .ok_or_else(|| format!("{key} is not an integer: {value}"))
+        .ok_or_else(|| format!("{key} is not representable as i64 cents: {value}"))
 }
 
 /// A single located divergence: which artifact, which step (if a table row),
@@ -920,9 +930,11 @@ mod tests {
     use rust_decimal::Decimal;
 
     use super::{
-        MetricsSummary, compare_equity_curves, compare_metrics, floats_equal, sorted_by_step,
+        MetricsSummary, cents_metric, compare_equity_curves, compare_metrics, floats_equal,
+        sorted_by_step,
     };
     use ironcondor::EquityPoint;
+    use optionstratlib::backtesting::BacktestResult;
 
     const TS0: i64 = 1_750_291_200_000_000_000;
 
@@ -1052,6 +1064,34 @@ mod tests {
         let produced = metrics(Decimal::new(1_000_000_001, 10), 400);
         let expected = metrics(Decimal::new(1_000_000_000, 10), 400);
         assert!(matches!(compare_metrics(&produced, &expected), Ok(())));
+    }
+
+    #[test]
+    fn test_cents_metric_accepts_integer_rejects_fractional() {
+        // A whole-cent Decimal converts exactly; a fractional one is rejected
+        // rather than silently truncated (1234.5 must NOT read as 1234).
+        let mut result = BacktestResult::default();
+        result
+            .custom_metrics
+            .insert("whole".to_string(), Decimal::from(1_234));
+        // 1234.5 (mantissa 12345, scale 1).
+        result
+            .custom_metrics
+            .insert("frac".to_string(), Decimal::new(12_345, 1));
+
+        assert!(
+            matches!(cents_metric(&result, "whole"), Ok(1_234)),
+            "a whole-cent value converts exactly"
+        );
+        assert!(
+            cents_metric(&result, "frac").is_err(),
+            "a fractional value is a loud oracle error, never truncated"
+        );
+        // A negative whole-cent value also converts exactly.
+        result
+            .custom_metrics
+            .insert("neg".to_string(), Decimal::from(-42));
+        assert!(matches!(cents_metric(&result, "neg"), Ok(-42)));
     }
 
     #[test]

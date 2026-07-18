@@ -136,22 +136,29 @@ pub trait ExecutionModel {
         out_fills: &mut Vec<Fill>,
     ) -> Result<(), BacktestError>;
 
-    /// The fill→order grouping for the **most recent** [`Self::fill`] call — how
-    /// the appended fills map back to the `Submit` commands (see [`FillGroup`]).
+    /// The fill→order correlation for the **most recent** [`Self::fill`] call —
+    /// how the appended fills map back to the `Submit` commands (see
+    /// [`FillGroup`]). The **`Option` itself is the correlation mode**, so the
+    /// two modes are never conflated by a coincidental fill count:
     ///
-    /// The default is **empty**, which the engine reads as the single-shot
-    /// contract: **exactly one fill per `Submit`, in submission order** (naive
-    /// mode, and any model that never multi-fills). A model that produces more
-    /// than one fill for a `Submit` — realistic mode walking price levels —
-    /// overrides this to return one [`FillGroup`] per filling `Submit`, in
-    /// command order, so the engine correlates every level to the one order and
-    /// assigns `fill_seq = 0, 1, …`.
+    /// - **`None`** — the **one-per-`Submit`** contract: exactly one fill per
+    ///   `Submit`, in submission order, and **no** uncorrelated fills (naive
+    ///   mode, and any model that never multi-fills). This is the default.
+    /// - **`Some(groups)`** — the **grouped** contract: each filling `Submit`
+    ///   contributes one [`FillGroup`] (`fill_count` fills), in command order, so
+    ///   the engine correlates every level to the one order and assigns
+    ///   `fill_seq = 0, 1, …`. A model that produces more than one fill for a
+    ///   `Submit` — realistic mode walking price levels — returns this. `Some`
+    ///   with an **empty** slice is a grouped step that produced **no** command
+    ///   fills (e.g. a refresh-only step): any fill present is then a surplus and
+    ///   a typed [`BacktestError::Execution`], never silently consumed by an
+    ///   unrelated `Submit` when the counts happen to coincide.
     ///
     /// Returning a borrow of reusable model scratch keeps this allocation-free
     /// on the per-step path (PB-1); the slice is valid until the next `fill`.
     #[must_use]
-    fn fill_groups(&self) -> &[FillGroup] {
-        &[]
+    fn fill_groups(&self) -> Option<&[FillGroup]> {
+        None
     }
 
     /// Which fill model this is — `Naive` or `Realistic`.

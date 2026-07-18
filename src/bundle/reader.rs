@@ -260,9 +260,19 @@ pub fn read_bundle(
     // (5) referenced-input sha256, where reachable (never a silent divergence).
     verify_referenced_input(&manifest.data_source, limits, false)?;
 
-    // (6) contract_id round-trip / UNDERLYING grammar before it is a join key.
+    // (6) contract_id round-trip / UNDERLYING grammar before it is a join key,
+    //     and every fill's strategy_run_id must equal the manifest run_id — a
+    //     fill stamped with a foreign run_id is a mislabelled or spliced bundle,
+    //     never a fill this run produced.
     for row in &fills {
         verify_fill_contract_id(row)?;
+        if row.strategy_run_id != manifest.run_id {
+            return Err(BacktestError::Bundle(format!(
+                "fills.parquet carries strategy_run_id {:?} but the manifest run_id is {:?} \
+                 (a fill from a different run)",
+                row.strategy_run_id, manifest.run_id
+            )));
+        }
     }
     for row in &positions {
         verify_position_contract_id(row)?;
@@ -277,6 +287,21 @@ pub fn read_bundle(
     positions.sort_by_key(position_sort_key);
     let mut greeks_attribution = greeks_attribution;
     greeks_attribution.sort_by_key(greeks_sort_key);
+
+    // (7) Structural validation on the SORTED tables. Sorting normalises order,
+    //     so a malformed table can no longer be detected by order alone — a
+    //     duplicated sort key, a gapped / duplicated per-step row, or a
+    //     cross-table step drift would otherwise be silently accepted after the
+    //     sort. Each is a typed [`BacktestError::Bundle`]; the `row_counts`
+    //     cross-check (4) only pins counts, not these structural invariants.
+    validate_unique_fill_keys(&fills)?;
+    validate_unique_position_keys(&positions)?;
+    validate_contiguous_steps("equity_curve", equity_curve.iter().map(|p| p.step))?;
+    validate_contiguous_steps(
+        "greeks_attribution",
+        greeks_attribution.iter().map(|r| r.step),
+    )?;
+    validate_cross_table_step_consistency(&fills, &positions, &equity_curve, &greeks_attribution)?;
 
     Ok(ValidatedBundle {
         manifest,
@@ -787,6 +812,110 @@ fn check_count(table: &str, decoded: usize, expected: u64) -> Result<(), Backtes
     if decoded != expected {
         return Err(BacktestError::Bundle(format!(
             "row_counts.{table} = {expected} but {decoded} rows decoded"
+        )));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// (7) Structural validation on the sorted tables (uniqueness / contiguity /
+//     cross-table drift the `row_counts` count check cannot catch)
+// ---------------------------------------------------------------------------
+
+/// Every fill's `(step, order_id, fill_seq)` sort key must be **unique** — the
+/// pinned key is documented unique, and after sorting a duplicated key would be
+/// silently accepted (the equality oracle would treat two fills as one row).
+/// Operates on the sorted slice, so duplicates are adjacent.
+fn validate_unique_fill_keys(fills: &[FillRow]) -> Result<(), BacktestError> {
+    let mut prev: Option<(u32, u64, u32)> = None;
+    for row in fills {
+        let key = fill_sort_key(row);
+        if prev == Some(key) {
+            let (step, order_id, fill_seq) = key;
+            return Err(BacktestError::Bundle(format!(
+                "fills.parquet has a duplicate (step, order_id, fill_seq) key: \
+                 ({step}, {order_id}, {fill_seq})"
+            )));
+        }
+        prev = Some(key);
+    }
+    Ok(())
+}
+
+/// Every position's `(step, position_id)` sort key must be **unique** (≤ 1 row
+/// per leg per step). Operates on the sorted slice, so duplicates are adjacent.
+fn validate_unique_position_keys(positions: &[PositionRow]) -> Result<(), BacktestError> {
+    let mut prev: Option<(u32, u64)> = None;
+    for row in positions {
+        let key = position_sort_key(row);
+        if prev == Some(key) {
+            let (step, position_id) = key;
+            return Err(BacktestError::Bundle(format!(
+                "positions.parquet has a duplicate (step, position_id) key: \
+                 ({step}, {position_id})"
+            )));
+        }
+        prev = Some(key);
+    }
+    Ok(())
+}
+
+/// A per-step table (`equity_curve` / `greeks_attribution`) carries exactly one
+/// row per step, contiguous from step 0 — sorted, its steps must be
+/// `0, 1, 2, …, n-1`. This catches both a gap and a duplicate step (a duplicate
+/// breaks the running `expected` count), which a `row_counts` match alone would
+/// not.
+fn validate_contiguous_steps(
+    table: &str,
+    steps: impl Iterator<Item = u32>,
+) -> Result<(), BacktestError> {
+    for (index, step) in steps.enumerate() {
+        let expected = u32::try_from(index).map_err(|_| BacktestError::ArithmeticOverflow)?;
+        if step != expected {
+            return Err(BacktestError::Bundle(format!(
+                "{table}.parquet steps are not contiguous from 0: expected step {expected}, \
+                 got {step}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Cross-table step consistency: the two per-step tables must span the **same**
+/// number of steps, and no fill / position may reference a step **beyond** that
+/// range (a `step` drift a lying `row_counts` would not catch). The `fills` /
+/// `positions` slices are sorted by `(step, …)`, so the last row carries the max
+/// step.
+fn validate_cross_table_step_consistency(
+    fills: &[FillRow],
+    positions: &[PositionRow],
+    equity_curve: &[EquityPoint],
+    greeks_attribution: &[GreeksAttributionRow],
+) -> Result<(), BacktestError> {
+    if equity_curve.len() != greeks_attribution.len() {
+        return Err(BacktestError::Bundle(format!(
+            "per-step tables disagree on step count: equity_curve has {} rows, \
+             greeks_attribution has {}",
+            equity_curve.len(),
+            greeks_attribution.len()
+        )));
+    }
+    let step_count =
+        u32::try_from(equity_curve.len()).map_err(|_| BacktestError::ArithmeticOverflow)?;
+    if let Some(last) = fills.last()
+        && last.step >= step_count
+    {
+        return Err(BacktestError::Bundle(format!(
+            "fills.parquet references step {} beyond the {step_count}-step run",
+            last.step
+        )));
+    }
+    if let Some(last) = positions.last()
+        && last.step >= step_count
+    {
+        return Err(BacktestError::Bundle(format!(
+            "positions.parquet references step {} beyond the {step_count}-step run",
+            last.step
         )));
     }
     Ok(())

@@ -206,13 +206,52 @@ pub fn write_bundle(
         }
     };
 
-    // Publish atomically: replace an existing SAME-run_id destination (overwrite)
-    // then rename the temp into place.
+    // Publish atomically. A fresh destination is a single rename. An overwrite
+    // must never destroy the existing bundle before the replacement is in place:
+    // the old code removed `dest` and then, on a rename failure, also removed the
+    // temp — losing the ONLY bundle. Instead move the old bundle aside to a
+    // sibling backup, rename the temp into the destination, and only then drop
+    // the backup; if the final rename fails, restore the backup so a complete
+    // bundle always remains on disk (at `dest`, or recoverable from the backup).
     if dest_exists {
-        std::fs::remove_dir_all(&dest)
-            .map_err(|e| bundle_err("remove existing destination", &e))?;
-    }
-    if let Err(error) = std::fs::rename(&temp, &dest) {
+        let backup = output_dir.join(format!(".{}.backup", run_id.as_str()));
+        // Clean any stale backup left by a previously-crashed overwrite.
+        if backup
+            .try_exists()
+            .map_err(|e| bundle_err("stat backup directory", &e))?
+        {
+            std::fs::remove_dir_all(&backup)
+                .map_err(|e| bundle_err("remove stale backup directory", &e))?;
+        }
+        // Move the existing bundle aside (a rename, atomic on one filesystem):
+        // on failure the destination is untouched, so its complete bundle
+        // survives; clean the temp and propagate.
+        if let Err(error) = std::fs::rename(&dest, &backup) {
+            let _ = std::fs::remove_dir_all(&temp);
+            return Err(bundle_err("move existing bundle aside to backup", &error));
+        }
+        // Move the new bundle into place. On failure restore the backup so the
+        // destination keeps its (old) complete bundle rather than being left
+        // empty, then clean the temp and propagate.
+        if let Err(error) = std::fs::rename(&temp, &dest) {
+            let _ = std::fs::rename(&backup, &dest);
+            let _ = std::fs::remove_dir_all(&temp);
+            return Err(bundle_err(
+                "atomic rename into place (existing bundle restored from backup)",
+                &error,
+            ));
+        }
+        // The replacement is published; drop the backup. A leftover backup would
+        // never corrupt the bundle, so a failed cleanup is logged, not fatal.
+        if let Err(error) = std::fs::remove_dir_all(&backup) {
+            tracing::warn!(
+                run_id = run_id.as_str(),
+                backup = %backup.display(),
+                error = %error,
+                "failed to remove the overwrite backup directory; the published bundle is intact"
+            );
+        }
+    } else if let Err(error) = std::fs::rename(&temp, &dest) {
         let _ = std::fs::remove_dir_all(&temp);
         return Err(bundle_err("atomic rename into place", &error));
     }
@@ -994,6 +1033,36 @@ mod tests {
         };
         assert_eq!(first, second, "overwrite targets the same run_id directory");
         assert!(second.join("manifest.json").is_file());
+    }
+
+    #[test]
+    fn test_write_bundle_overwrite_leaves_no_backup_or_temp() {
+        let Ok(dir) = tempfile::tempdir() else {
+            panic!("tempdir");
+        };
+        let run = sample_run(key());
+        // First write (fresh), then overwrite the SAME run_id.
+        let Ok(_first) = write_bundle(&run, &config(dir.path(), false), &strategy()) else {
+            panic!("first write");
+        };
+        let Ok(dest) = write_bundle(&run, &config(dir.path(), true), &strategy()) else {
+            panic!("overwrite write");
+        };
+        // The published bundle is complete after the move-aside overwrite.
+        assert!(dest.join("manifest.json").is_file());
+        // No backup / temp dotfile directory remains after a successful
+        // overwrite — the only leftover under output_dir is the published bundle.
+        let leftovers: Vec<String> = std::fs::read_dir(dir.path())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with('.'))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "no backup/temp directory must remain after overwrite: {leftovers:?}"
+        );
     }
 
     #[test]

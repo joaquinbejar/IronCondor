@@ -21,12 +21,37 @@ use crate::error::BacktestError;
 /// Carried by the feed schema and validated at ingest: a zero tick size or
 /// contract multiplier is rejected, never defaulted — a wrong multiplier
 /// mis-scales cash by a factor.
+///
+/// Deserialisation is routed through [`InstrumentSpec::new`] via the private
+/// [`InstrumentSpecWire`] `try_from` target, so a wire `tick_size_cents` /
+/// `contract_multiplier` of `0` is a typed [`BacktestError::Conversion`] — the
+/// derived-`Deserialize` path would otherwise set the public fields directly and
+/// bypass the zero guard. In-crate construction always goes through
+/// [`InstrumentSpec::new`] (no struct literals exist outside this module).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "InstrumentSpecWire")]
 pub struct InstrumentSpec {
     /// Minimum price increment in integer cents; `> 0`.
     pub tick_size_cents: PriceCents,
     /// Contracts → underlying units (e.g. `100`); `> 0`.
     pub contract_multiplier: u32,
+}
+
+/// The wire mirror of [`InstrumentSpec`], used only as the `try_from`
+/// deserialisation target so every decode is validated through
+/// [`InstrumentSpec::new`] rather than admitted straight into the public fields.
+#[derive(Deserialize)]
+struct InstrumentSpecWire {
+    tick_size_cents: PriceCents,
+    contract_multiplier: u32,
+}
+
+impl TryFrom<InstrumentSpecWire> for InstrumentSpec {
+    type Error = BacktestError;
+
+    fn try_from(wire: InstrumentSpecWire) -> Result<Self, Self::Error> {
+        Self::new(wire.tick_size_cents, wire.contract_multiplier)
+    }
 }
 
 impl InstrumentSpec {
@@ -146,6 +171,31 @@ mod tests {
         assert!(
             matches!(spec, Ok(s) if s.tick_size_cents.value() == 5 && s.contract_multiplier == 100)
         );
+    }
+
+    #[test]
+    fn test_instrument_spec_deserialize_rejects_zero_fields() {
+        // The `try_from` seam routes deserialisation through `new`, so a wire
+        // zero tick / multiplier fails instead of bypassing the guard.
+        let zero_tick: Result<InstrumentSpec, _> =
+            serde_json::from_str(r#"{"tick_size_cents":0,"contract_multiplier":100}"#);
+        assert!(zero_tick.is_err(), "zero tick_size must be rejected");
+        let zero_mult: Result<InstrumentSpec, _> =
+            serde_json::from_str(r#"{"tick_size_cents":5,"contract_multiplier":0}"#);
+        assert!(
+            zero_mult.is_err(),
+            "zero contract_multiplier must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_instrument_spec_serde_round_trips_valid() {
+        let Ok(spec) = InstrumentSpec::new(PriceCents::new(5), 100) else {
+            panic!("valid spec must build");
+        };
+        let json = serde_json::to_string(&spec).unwrap_or_default();
+        let back: Result<InstrumentSpec, _> = serde_json::from_str(&json);
+        assert!(matches!(back, Ok(s) if s == spec));
     }
 
     fn key(strike_cents: u64) -> ContractKey {

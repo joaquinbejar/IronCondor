@@ -119,10 +119,16 @@ fn raw_quotes(n: u32) -> Vec<RawQuote> {
     quotes
 }
 
-/// The p50/p99/p99.9 conversion latency in ns as `f64` (saturating on `u64`).
+/// The p50/p99/p99.9 conversion latency in ns as `f64`.
+///
+/// A raw `u64` → `f64` widening: nanosecond latencies sit far below `f64`'s
+/// exact-integer range (`2^53` ns ≈ 104 days), so this is lossless in practice.
+/// The earlier `u32::try_from` cap silently SATURATED any latency above
+/// `u32::MAX` ns (~4.29 s) to a constant, which could make the cross-size
+/// per-contract ratio (and thus the PB-4 linearity verdict) fail **open** on a
+/// slow/contended machine; recording the value directly removes that.
 fn p_ns(hist: &Histogram<u64>, quantile: f64) -> f64 {
-    let v = hist.value_at_quantile(quantile);
-    u32::try_from(v).map_or(f64::from(u32::MAX), f64::from)
+    hist.value_at_quantile(quantile) as f64
 }
 
 /// Print the per-size summary + the cross-size linear-scaling verdict, plus the

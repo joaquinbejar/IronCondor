@@ -35,18 +35,18 @@ use rand_chacha::ChaCha8Rng;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 
-use optionstratlib::Side;
 use optionstratlib::backtesting::ExitReason;
 use optionstratlib::prelude::Positive;
 use optionstratlib::simulation::{ExitPolicy, check_exit_policy};
 use optionstratlib::strategies::base::{Optimizable, Positionable};
 use optionstratlib::strategies::{IronCondor, ShortStrangle, Strategies};
+use optionstratlib::{ExpirationDate, OptionStyle, Side};
 
 use crate::data::convert::{positive_from_price, snapshot_to_option_chain};
 use crate::domain::{
     ChainSnapshot, ContractKey, IronCondorSpec, OpenPosition, OrderCommand, OrderId, OrderIntent,
-    PendingOrder, PositionAction, PriceCents, Quantity, ShortStrangleSpec, SimTime, StepIndex,
-    StrategySpec, TimeInForce,
+    PendingOrder, PositionAction, PriceCents, Quantity, QuoteView, ShortStrangleSpec, SimTime,
+    StepIndex, StrategySpec, TimeInForce,
 };
 use crate::error::BacktestError;
 
@@ -98,6 +98,13 @@ pub struct ChainContext<'a> {
     /// The strategy's own resting orders, addressable for cancel/replace by
     /// their stable [`OrderId`] handles.
     pub pending: &'a [PendingOrder],
+    /// The ledger's last-known per-contract mark (carried forward from the most
+    /// recently settled step), keyed by [`ContractKey`]. A stale-quote exit
+    /// decision reads this carry-forward value instead of snapping back to the
+    /// entry premium (see [`Strategy::exits`] / `current_premium`). Empty before
+    /// the first settle (step 0), where a still-unmarked leg falls back to its
+    /// entry premium. Borrowed by reference — no per-step allocation (PB-1).
+    pub marks: &'a std::collections::BTreeMap<ContractKey, PriceCents>,
     /// The run's sole randomness source, seeded from `config.seed`.
     pub rng: &'a mut ChaCha8Rng,
     /// The 0-based ordinal of the current step.
@@ -291,8 +298,21 @@ impl<S: PositionableStrategy> OptStratAdapter<S> {
     }
 
     /// Build the opening intents (one `Submit(Open)` per upstream leg), matched
-    /// to `snapshot` quotes by strike and style. Guarded by `entered`, so it is
-    /// a no-op after the first successful entry.
+    /// to `snapshot` quotes by the leg's **full contract identity** (underlying,
+    /// expiration, strike, style). Guarded by `entered`, so it is a no-op after
+    /// the first successful entry.
+    ///
+    /// # Expiration matching
+    ///
+    /// A leg is matched by strike+style when the snapshot quotes exactly one such
+    /// contract (the single-expiry case — byte-identical to the earlier match,
+    /// and it works whether the leg's `expiration_date` is relative `Days` or a
+    /// resolved `DateTime`). When several **expirations** quote the same
+    /// strike/style (a multi-expiry snapshot), the leg is disambiguated by its
+    /// OWN expiration through the exact [`ContractKey`] identity — never
+    /// whichever expiry sorts first in the map. A leg whose (unresolved `Days`)
+    /// expiration cannot be matched exactly in that ambiguous case is a
+    /// [`BacktestError::Execution`] rather than a silent wrong-expiry pick.
     fn open_entries(
         &mut self,
         snapshot: &ChainSnapshot,
@@ -310,16 +330,7 @@ impl<S: PositionableStrategy> OptStratAdapter<S> {
             let opt = &leg.option;
             let strike = PriceCents::from_decimal_dollars(opt.strike_price.to_dec())?;
             let style = opt.option_style;
-            let quote = snapshot
-                .quotes
-                .values()
-                .find(|q| q.contract.strike == strike && q.contract.style == style)
-                .ok_or_else(|| {
-                    BacktestError::Execution(format!(
-                        "no snapshot quote for leg strike {} style {style:?}",
-                        strike.value()
-                    ))
-                })?;
+            let quote = select_leg_quote(snapshot, strike, style, opt.expiration_date)?;
             out.push(OrderCommand::Submit(OrderIntent {
                 contract: quote.contract.clone(),
                 action: PositionAction::Open,
@@ -336,11 +347,47 @@ impl<S: PositionableStrategy> OptStratAdapter<S> {
         Ok(())
     }
 
-    /// Append a `Close` command for every open leg (closing commands only).
-    fn close_all(open: &[OpenPosition], snapshot: &ChainSnapshot, out: &mut Vec<OrderCommand>) {
+    /// Append a `Close` for every open leg **not already fully scheduled for
+    /// close** by an earlier phase this step (the exit policy, or an in-step
+    /// adjustment), flattening a partially-closed leg for its remaining size.
+    ///
+    /// On the terminal step the exit phase and `on_end` append into the **same**
+    /// buffer. A leg the exit policy already closed must not be closed again:
+    /// `apply_step_fills` removes a fully-closed leg from the inventory, and a
+    /// second `Close` of the now-absent leg aborts the run in `reduce_leg` (F11).
+    /// This reconciles against the commands already in `out` so each leg is
+    /// closed exactly once.
+    ///
+    /// It scans the already-appended commands rather than allocating a scratch
+    /// set: `on_end` runs once, at the terminal step (off the warm-step path), so
+    /// the `O(legs × commands)` scan allocates nothing (PB-1).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BacktestError::ArithmeticOverflow`] if the scheduled-quantity sum
+    /// or the remainder overflows, and [`BacktestError::InvalidQuantity`] never
+    /// (the remainder is guarded strictly positive before it becomes a `Quantity`).
+    fn close_all(
+        open: &[OpenPosition],
+        snapshot: &ChainSnapshot,
+        out: &mut Vec<OrderCommand>,
+    ) -> Result<(), BacktestError> {
         for leg in open {
-            out.push(close_command(snapshot, leg));
+            let open_qty = leg.quantity.value();
+            let scheduled = scheduled_close_qty(out, leg.position_id)?;
+            if scheduled >= open_qty {
+                // Already fully closed this step — appending another close would
+                // duplicate it and abort the run in reduce_leg.
+                continue;
+            }
+            // `scheduled < open_qty`, so the remainder is strictly positive.
+            let remaining = open_qty
+                .checked_sub(scheduled)
+                .ok_or(BacktestError::ArithmeticOverflow)?;
+            let quantity = Quantity::new(remaining)?;
+            out.push(close_command_qty(snapshot, leg, quantity));
         }
+        Ok(())
     }
 
     /// Reprice `inner` from `snapshot` so a Greek-driven exit policy can read
@@ -634,7 +681,7 @@ impl<S: PositionableStrategy> Strategy for OptStratAdapter<S> {
             let days_left = days_to_expiry(&leg.contract, snapshot.ts)?;
             let is_long = matches!(leg.side, Side::Long);
             let initial = leg.entry_premium.to_decimal_dollars();
-            let current = current_premium(snapshot, leg);
+            let current = current_premium(snapshot, ctx.marks, leg);
             if policy_triggered(
                 &self.exit, initial, current, step, days_left, underlying, is_long,
             ) {
@@ -659,8 +706,8 @@ impl<S: PositionableStrategy> Strategy for OptStratAdapter<S> {
         out: &mut Vec<OrderCommand>,
     ) -> Result<(), BacktestError> {
         // Closing commands only — the loop rejects a Submit(Open) from on_end.
-        Self::close_all(ctx.open, ctx.snapshot, out);
-        Ok(())
+        // close_all skips legs the exit phase already closed this step (F11).
+        Self::close_all(ctx.open, ctx.snapshot, out)
     }
 
     fn exit_reason(&self) -> ExitReason {
@@ -672,7 +719,12 @@ impl<S: PositionableStrategy> Strategy for OptStratAdapter<S> {
 /// policy-triggered leg close ([docs/05 §4](../../../docs/05-analytics-and-reporting.md#4-summary-metrics)).
 ///
 /// Profit-side policies map to [`ExitReason::TargetReached`], loss-side to
-/// [`ExitReason::StopLoss`], expiration/time to [`ExitReason::Expiration`]; an
+/// [`ExitReason::StopLoss`], and genuine expiration policies
+/// ([`ExitPolicy::Expiration`], [`ExitPolicy::DaysToExpiration`]) to
+/// [`ExitReason::Expiration`]. A step-count hold
+/// ([`ExitPolicy::TimeSteps`]) is **not** an options expiry — it maps to the
+/// truthful [`ExitReason::Other`]`("time_steps")` (upstream has no dedicated
+/// holding-period variant, so recording `Expiration` would misattribute it). An
 /// ambiguous or composite policy (whose specific triggering leaf the engine
 /// cannot disambiguate) maps to a descriptive [`ExitReason::Other`] rather than
 /// a fabricated specific reason. The mapping is a **pure** function of the
@@ -682,9 +734,10 @@ fn exit_policy_to_reason(policy: &ExitPolicy) -> ExitReason {
     match policy {
         ExitPolicy::ProfitPercent(_) => ExitReason::TargetReached,
         ExitPolicy::LossPercent(_) => ExitReason::StopLoss,
-        ExitPolicy::Expiration | ExitPolicy::TimeSteps(_) | ExitPolicy::DaysToExpiration(_) => {
-            ExitReason::Expiration
-        }
+        ExitPolicy::Expiration | ExitPolicy::DaysToExpiration(_) => ExitReason::Expiration,
+        // A step-count hold is a holding-period exit, not a contract expiry:
+        // record it honestly rather than as Expiration.
+        ExitPolicy::TimeSteps(_) => ExitReason::Other("time_steps".to_string()),
         ExitPolicy::MinPrice(_) => ExitReason::StopLoss,
         ExitPolicy::MaxPrice(_) | ExitPolicy::FixedPrice(_) => ExitReason::TargetReached,
         // A composite (or any variant whose triggering leaf is not
@@ -708,22 +761,101 @@ fn quantity_from_positive(value: Positive) -> Result<Quantity, BacktestError> {
     Quantity::new(count)
 }
 
-/// The current mark of a leg in dollars: the snapshot mid of its contract, or
-/// the leg's entry premium when the contract is absent this step (`stale_mark`,
-/// [docs/01 §6](../../../docs/01-domain-model.md#6-market-data)).
-#[must_use]
-fn current_premium(snapshot: &ChainSnapshot, leg: &OpenPosition) -> Decimal {
-    snapshot.quotes.get(&leg.contract).map_or_else(
-        || leg.entry_premium.to_decimal_dollars(),
-        |q| q.mid.to_decimal_dollars(),
-    )
+/// Select the snapshot quote for a strategy leg by its **full contract
+/// identity** (underlying, expiration, strike, style).
+///
+/// When exactly one quote matches the leg's strike+style — the single-expiry
+/// case — that quote is returned directly, byte-identical to the earlier
+/// strike+style match and agnostic to whether the leg's `expiration` is a
+/// relative `Days` or a resolved `DateTime`. When several **expirations** quote
+/// the same strike/style, the leg is disambiguated by its own `expiration`
+/// through the exact [`ContractKey`] identity (the per-underlying key is
+/// `snapshot.underlying`, which every quote in the snapshot shares), never
+/// whichever expiry sorts first in the map.
+///
+/// # Errors
+///
+/// Returns [`BacktestError::Execution`] when no quote matches the leg's
+/// strike/style, or — in a multi-expiry snapshot — none matches its full
+/// identity (e.g. an unresolved `Days` expiration against resolved quotes).
+fn select_leg_quote(
+    snapshot: &ChainSnapshot,
+    strike: PriceCents,
+    style: OptionStyle,
+    expiration: ExpirationDate,
+) -> Result<&QuoteView, BacktestError> {
+    let mut candidates = snapshot
+        .quotes
+        .values()
+        .filter(|q| q.contract.strike == strike && q.contract.style == style);
+    let first = candidates.next().ok_or_else(|| {
+        BacktestError::Execution(format!(
+            "no snapshot quote for leg strike {} style {style:?}",
+            strike.value()
+        ))
+    })?;
+    if candidates.next().is_none() {
+        // Exactly one strike+style quote: single-expiry — the historical match.
+        return Ok(first);
+    }
+    // Several expirations quote this strike/style: match the leg's OWN
+    // expiration exactly (never the first in map order).
+    let contract = ContractKey {
+        underlying: snapshot.underlying.clone(),
+        expiration,
+        strike,
+        style,
+    };
+    snapshot.quotes.get(&contract).ok_or_else(|| {
+        BacktestError::Execution(format!(
+            "no snapshot quote for leg strike {} style {style:?} at expiration \
+             {expiration:?} in a multi-expiry snapshot",
+            strike.value()
+        ))
+    })
 }
 
-/// Build the closing `Submit` for one open leg: the opposite trade side
-/// flattens it, priced against the snapshot mid (falling back to entry premium
-/// if the contract is stale).
+/// The current mark of a leg in dollars: the snapshot mid of its contract, the
+/// last-known carried-forward mark when the contract is absent this step
+/// (`stale_mark`), or the leg's entry premium only when it was never marked
+/// ([docs/01 §6](../../../docs/01-domain-model.md#6-market-data)).
+#[must_use]
+fn current_premium(
+    snapshot: &ChainSnapshot,
+    marks: &std::collections::BTreeMap<ContractKey, PriceCents>,
+    leg: &OpenPosition,
+) -> Decimal {
+    // Quote present this step → its mid. Absent (a stale quote) → the ledger's
+    // last-known carried-forward mark, so the exit decision sees the position's
+    // prior movement rather than snapping back to the entry premium. Entry
+    // premium only when the contract has never been marked (no mark exists yet).
+    let cents = snapshot
+        .quotes
+        .get(&leg.contract)
+        .map(|q| q.mid)
+        .or_else(|| marks.get(&leg.contract).copied())
+        .unwrap_or(leg.entry_premium);
+    cents.to_decimal_dollars()
+}
+
+/// Build the closing `Submit` for one open leg's **full** open quantity: the
+/// opposite trade side flattens it, priced against the snapshot mid (falling back
+/// to entry premium if the contract is stale).
 #[must_use]
 fn close_command(snapshot: &ChainSnapshot, leg: &OpenPosition) -> OrderCommand {
+    close_command_qty(snapshot, leg, leg.quantity)
+}
+
+/// Build the closing `Submit` for a specific `quantity` of one open leg — the
+/// opposite trade side flattens it, priced against the snapshot mid (falling back
+/// to entry premium if the contract is stale). Used to flatten the **remaining**
+/// size of a partially-closed leg from `close_all`.
+#[must_use]
+fn close_command_qty(
+    snapshot: &ChainSnapshot,
+    leg: &OpenPosition,
+    quantity: Quantity,
+) -> OrderCommand {
     let decision_mid = snapshot
         .quotes
         .get(&leg.contract)
@@ -732,11 +864,41 @@ fn close_command(snapshot: &ChainSnapshot, leg: &OpenPosition) -> OrderCommand {
         contract: leg.contract.clone(),
         action: PositionAction::Close(leg.position_id),
         side: flip_side(leg.side),
-        quantity: leg.quantity,
+        quantity,
         limit: None,
         tif: TimeInForce::Ioc,
         decision_mid,
     })
+}
+
+/// Total contracts already scheduled for close of `position_id` in `out` — the
+/// checked sum over every `Submit(Close(position_id))` already appended this
+/// step. Lets [`OptStratAdapter::close_all`] flatten only a leg's remaining size
+/// (or skip a fully-closed leg) so the terminal step never double-closes (F11).
+///
+/// # Errors
+///
+/// Returns [`BacktestError::ArithmeticOverflow`] if the scheduled-quantity sum
+/// overflows `u32`.
+fn scheduled_close_qty(
+    out: &[OrderCommand],
+    position_id: crate::domain::PositionId,
+) -> Result<u32, BacktestError> {
+    let mut total: u32 = 0;
+    for cmd in out {
+        if let OrderCommand::Submit(OrderIntent {
+            action: PositionAction::Close(pid),
+            quantity,
+            ..
+        }) = cmd
+            && *pid == position_id
+        {
+            total = total
+                .checked_add(quantity.value())
+                .ok_or(BacktestError::ArithmeticOverflow)?;
+        }
+    }
+    Ok(total)
 }
 
 /// The trade side that flattens a leg opened on `side` (`Long` closed by a
@@ -876,6 +1038,11 @@ mod tests {
     };
     use crate::error::BacktestError;
 
+    /// A shared empty last-known-marks map for context fixtures that do not
+    /// exercise stale-quote carry-forward (F9); the stale-quote test builds its
+    /// own populated map.
+    static NO_MARKS: BTreeMap<ContractKey, PriceCents> = BTreeMap::new();
+
     /// Instantiable only for a type satisfying the full bound; referencing it
     /// with a concrete strategy forces the compiler to prove the bound holds.
     fn assert_positionable_strategy<S: PositionableStrategy>() {}
@@ -938,6 +1105,35 @@ mod tests {
         debug_assert!(mid_cents >= 10, "quote fixtures use a mid of at least 10c");
         QuoteView {
             contract: key(strike_cents, style),
+            bid: PriceCents::new(mid_cents - 10),
+            ask: PriceCents::new(mid_cents + 10),
+            mid: PriceCents::new(mid_cents),
+            bid_size: qty(50),
+            ask_size: qty(50),
+            implied_volatility: dec!(0.20),
+            delta: dec!(0.30),
+            gamma: dec!(0.01),
+            theta: dec!(-0.05),
+            vega: dec!(0.10),
+        }
+    }
+
+    /// A contract key at an explicit expiration (ns) — the multi-expiry fixture
+    /// for the full-identity match test.
+    fn key_at(strike_cents: u64, style: OptionStyle, exp_ns: i64) -> ContractKey {
+        ContractKey {
+            underlying: und(),
+            expiration: ExpirationDate::DateTime(DateTime::from_timestamp_nanos(exp_ns)),
+            strike: PriceCents::new(strike_cents),
+            style,
+        }
+    }
+
+    /// A quote at an explicit expiration (ns) — the multi-expiry fixture.
+    fn quote_at(strike_cents: u64, style: OptionStyle, mid_cents: u64, exp_ns: i64) -> QuoteView {
+        debug_assert!(mid_cents >= 10, "quote fixtures use a mid of at least 10c");
+        QuoteView {
+            contract: key_at(strike_cents, style, exp_ns),
             bid: PriceCents::new(mid_cents - 10),
             ask: PriceCents::new(mid_cents + 10),
             mid: PriceCents::new(mid_cents),
@@ -1186,6 +1382,7 @@ mod tests {
             snapshot: &snap,
             open: &[],
             pending: &[],
+            marks: &NO_MARKS,
             rng: &mut rng,
             step: StepIndex::new(0),
         };
@@ -1205,6 +1402,7 @@ mod tests {
             snapshot: &snap,
             open: &[],
             pending: &[],
+            marks: &NO_MARKS,
             rng: &mut rng,
             step: StepIndex::new(0),
         };
@@ -1229,6 +1427,7 @@ mod tests {
             snapshot: &snap,
             open: &[],
             pending: &[],
+            marks: &NO_MARKS,
             rng: &mut rng,
             step: StepIndex::new(0),
         };
@@ -1250,6 +1449,7 @@ mod tests {
             snapshot: &snap,
             open: &[],
             pending: &[],
+            marks: &NO_MARKS,
             rng: &mut rng,
             step: StepIndex::new(0),
         };
@@ -1272,6 +1472,7 @@ mod tests {
             snapshot: &snap,
             open: &legs,
             pending: &[],
+            marks: &NO_MARKS,
             rng: &mut rng,
             step: StepIndex::new(7),
         };
@@ -1300,6 +1501,7 @@ mod tests {
             snapshot: &snap,
             open: &legs,
             pending: &[],
+            marks: &NO_MARKS,
             rng: &mut rng,
             step: StepIndex::new(11),
         };
@@ -1330,6 +1532,7 @@ mod tests {
             snapshot: &snap,
             open: &[],
             pending: &[],
+            marks: &NO_MARKS,
             rng: &mut rng,
             step: StepIndex::new(0),
         };
@@ -1400,6 +1603,7 @@ mod tests {
             snapshot: &snap,
             open: &[],
             pending: &[],
+            marks: &NO_MARKS,
             rng: &mut rng,
             step: StepIndex::new(0),
         };
@@ -1430,6 +1634,64 @@ mod tests {
     }
 
     #[test]
+    fn test_open_entries_picks_the_legs_expiration_in_a_multi_expiry_snapshot() {
+        // A snapshot quotes each condor strike/style at TWO expirations: the
+        // leg's own EXP_NS and a decoy later one. open_entries must match the
+        // FULL contract identity and emit opens at EXP_NS — never the decoy that
+        // merely shares strike+style (and would win a strike+style-only match).
+        const EXP2_NS: i64 = EXP_NS + 7 * super::NANOS_PER_DAY as i64;
+        let mut quotes = BTreeMap::new();
+        for (strike, style, mid) in [
+            (490_000u64, OptionStyle::Put, 1_800u64),
+            (480_000, OptionStyle::Put, 700),
+            (510_000, OptionStyle::Call, 2_000),
+            (520_000, OptionStyle::Call, 800),
+        ] {
+            // Insert the decoy expiration FIRST (it sorts earlier in the map's
+            // key order for a strike+style-only `find`), then the leg's own.
+            for exp_ns in [EXP_NS, EXP2_NS] {
+                let q = quote_at(strike, style, mid, exp_ns);
+                quotes.insert(q.contract.clone(), q);
+            }
+        }
+        let Ok(spec) = InstrumentSpec::new(PriceCents::new(5), 100) else {
+            panic!("valid instrument spec");
+        };
+        let snap = ChainSnapshot {
+            ts: SimTime::new(TS_NS),
+            step: StepIndex::new(0),
+            underlying: und(),
+            underlying_price: PriceCents::new(500_000),
+            spec,
+            quotes,
+        };
+        let mut rng = ChaCha8Rng::seed_from_u64(50);
+        let mut ctx = ChainContext {
+            snapshot: &snap,
+            open: &[],
+            pending: &[],
+            marks: &NO_MARKS,
+            rng: &mut rng,
+            step: StepIndex::new(0),
+        };
+        // `iron_condor()` (and `adapter`) is built at EXP_NS.
+        let mut adapter = adapter(ExitPolicy::Expiration);
+        let mut out = Vec::new();
+        assert!(matches!(adapter.on_snapshot(&mut ctx, &mut out), Ok(())));
+        assert_eq!(out.len(), 4, "the four condor legs emit four opens");
+        for cmd in &out {
+            let OrderCommand::Submit(intent) = cmd else {
+                panic!("entry emits Submit intents");
+            };
+            assert_eq!(
+                intent.contract.expiration_ns().ok(),
+                Some(EXP_NS),
+                "each leg targets its own expiration, never the decoy EXP2_NS"
+            );
+        }
+    }
+
+    #[test]
     fn test_iron_condor_from_spec_exits_emits_closes_when_policy_triggers() {
         let mut rng = ChaCha8Rng::seed_from_u64(21);
         let snap = snapshot(7);
@@ -1438,6 +1700,7 @@ mod tests {
             snapshot: &snap,
             open: &legs,
             pending: &[],
+            marks: &NO_MARKS,
             rng: &mut rng,
             step: StepIndex::new(7),
         };
@@ -1475,6 +1738,7 @@ mod tests {
             snapshot: &snap,
             open: &[],
             pending: &[],
+            marks: &NO_MARKS,
             rng: &mut rng,
             step: StepIndex::new(0),
         };
@@ -1501,6 +1765,7 @@ mod tests {
             snapshot: &snap,
             open: &legs,
             pending: &[],
+            marks: &NO_MARKS,
             rng: &mut rng,
             step: StepIndex::new(7),
         };
@@ -1529,6 +1794,7 @@ mod tests {
             snapshot: &snap,
             open: &legs,
             pending: &[],
+            marks: &NO_MARKS,
             rng: &mut rng,
             step: StepIndex::new(0),
         };
@@ -1547,6 +1813,7 @@ mod tests {
             snapshot: &snap,
             open: &[],
             pending: &[],
+            marks: &NO_MARKS,
             rng: &mut rng,
             step: StepIndex::new(3),
         };
@@ -1554,6 +1821,75 @@ mod tests {
         let mut out = Vec::new();
         assert!(matches!(adapter.exits(&ctx, &mut out), Ok(())));
         assert!(out.is_empty(), "no open legs: nothing to reprice or close");
+    }
+
+    #[test]
+    fn test_exits_stale_quote_reads_carried_mark_not_entry_premium() {
+        // A leg whose contract is ABSENT this step must have its exit decision
+        // read the ledger's carried last-known mark, not snap back to the entry
+        // premium. Short leg, entry 2000c; carried mark 500c is a 75% premium
+        // decay, so ProfitPercent(0.5) fires — whereas the entry-premium fallback
+        // (0% decay) would not.
+        let Ok(spec) = InstrumentSpec::new(PriceCents::new(5), 100) else {
+            panic!("valid instrument spec");
+        };
+        // The leg's contract is NOT quoted this step (a stale quote).
+        let snap = ChainSnapshot {
+            ts: SimTime::new(TS_NS),
+            step: StepIndex::new(5),
+            underlying: und(),
+            underlying_price: PriceCents::new(500_000),
+            spec,
+            quotes: BTreeMap::new(),
+        };
+        let legs = vec![OpenPosition {
+            position_id: PositionId::new(1),
+            contract: key(510_000, OptionStyle::Call),
+            side: Side::Short,
+            quantity: qty(1),
+            entry_premium: PriceCents::new(2_000),
+        }];
+        // The ledger carries a last-known mark of 500c for that contract.
+        let mut carried = BTreeMap::new();
+        carried.insert(key(510_000, OptionStyle::Call), PriceCents::new(500));
+
+        // With the carried mark, ProfitPercent(0.5) fires (75% decay > 50%).
+        let mut rng = ChaCha8Rng::seed_from_u64(60);
+        let ctx = ChainContext {
+            snapshot: &snap,
+            open: &legs,
+            pending: &[],
+            marks: &carried,
+            rng: &mut rng,
+            step: StepIndex::new(5),
+        };
+        let mut marked_adapter = adapter(ExitPolicy::ProfitPercent(dec!(0.5)));
+        let mut out = Vec::new();
+        assert!(matches!(marked_adapter.exits(&ctx, &mut out), Ok(())));
+        assert_eq!(out.len(), 1, "the carried 75% profit fires the exit");
+        assert!(out.iter().all(is_close), "exits appends closes only");
+
+        // Control: with NO carried mark the decision falls back to the entry
+        // premium (0% decay) and the same policy does NOT fire.
+        let mut rng2 = ChaCha8Rng::seed_from_u64(61);
+        let ctx_no_mark = ChainContext {
+            snapshot: &snap,
+            open: &legs,
+            pending: &[],
+            marks: &NO_MARKS,
+            rng: &mut rng2,
+            step: StepIndex::new(5),
+        };
+        let mut unmarked_adapter = adapter(ExitPolicy::ProfitPercent(dec!(0.5)));
+        let mut out2 = Vec::new();
+        assert!(matches!(
+            unmarked_adapter.exits(&ctx_no_mark, &mut out2),
+            Ok(())
+        ));
+        assert!(
+            out2.is_empty(),
+            "no carried mark → entry premium → no profit → no close"
+        );
     }
 
     // --- combined ordering: closes strictly before entries ------------------
@@ -1573,6 +1909,7 @@ mod tests {
                 snapshot: &snap,
                 open: &legs,
                 pending: &[],
+                marks: &NO_MARKS,
                 rng: &mut rng,
                 step: StepIndex::new(9),
             };
@@ -1582,6 +1919,7 @@ mod tests {
             snapshot: &snap,
             open: &legs,
             pending: &[],
+            marks: &NO_MARKS,
             rng: &mut rng,
             step: StepIndex::new(9),
         };
@@ -1605,6 +1943,7 @@ mod tests {
             snapshot: &snap,
             open: &legs,
             pending: &[],
+            marks: &NO_MARKS,
             rng: &mut rng,
             step: StepIndex::new(11),
         };
@@ -1614,6 +1953,98 @@ mod tests {
         assert_eq!(out.len(), 4);
         assert!(out.iter().all(is_close), "on_end closes only");
         assert!(!out.iter().any(is_open), "on_end never opens");
+    }
+
+    #[test]
+    fn test_on_end_after_exits_produces_one_close_per_leg() {
+        // On the terminal step BOTH the exit phase (policy fires) and on_end
+        // append into the SAME buffer. on_end must skip legs the policy already
+        // closed, so each leg gets exactly ONE close — a duplicate would abort
+        // the run in reduce_leg once apply_step_fills removed the leg (F11).
+        let mut rng = ChaCha8Rng::seed_from_u64(70);
+        let snap = snapshot(9);
+        let legs = open_legs();
+        // TimeSteps(0) fires at step 9 ⇒ the exit phase closes all four legs.
+        let mut adapter = adapter(ExitPolicy::TimeSteps(0));
+        let mut out = Vec::new();
+        {
+            let ctx = ChainContext {
+                snapshot: &snap,
+                open: &legs,
+                pending: &[],
+                marks: &NO_MARKS,
+                rng: &mut rng,
+                step: StepIndex::new(9),
+            };
+            assert!(matches!(adapter.exits(&ctx, &mut out), Ok(())));
+        }
+        assert_eq!(out.len(), 4, "the policy closes all four legs");
+        // on_end into the SAME buffer must NOT re-close them.
+        {
+            let mut ctx = ChainContext {
+                snapshot: &snap,
+                open: &legs,
+                pending: &[],
+                marks: &NO_MARKS,
+                rng: &mut rng,
+                step: StepIndex::new(9),
+            };
+            assert!(matches!(adapter.on_end(&mut ctx, &mut out), Ok(())));
+        }
+        assert_eq!(out.len(), 4, "on_end appended no duplicate closes");
+        // Exactly one close per position_id (1..=4).
+        for pid in [1u64, 2, 3, 4] {
+            let count = out
+                .iter()
+                .filter(|c| {
+                    matches!(
+                        c,
+                        OrderCommand::Submit(OrderIntent {
+                            action: PositionAction::Close(p),
+                            ..
+                        }) if p.value() == pid
+                    )
+                })
+                .count();
+            assert_eq!(count, 1, "exactly one close for position {pid}");
+        }
+    }
+
+    #[test]
+    fn test_on_end_closes_a_leg_the_exit_phase_left_open() {
+        // A leg the exit phase did NOT close is still flattened by on_end at the
+        // terminal step — the reconciliation skips only already-scheduled legs.
+        let mut rng = ChaCha8Rng::seed_from_u64(71);
+        let snap = snapshot(9);
+        let legs = open_legs();
+        // A non-firing policy: the exit phase appends nothing.
+        let mut adapter = adapter(ExitPolicy::TimeSteps(1_000));
+        let mut out = Vec::new();
+        {
+            let ctx = ChainContext {
+                snapshot: &snap,
+                open: &legs,
+                pending: &[],
+                marks: &NO_MARKS,
+                rng: &mut rng,
+                step: StepIndex::new(9),
+            };
+            assert!(matches!(adapter.exits(&ctx, &mut out), Ok(())));
+        }
+        assert!(out.is_empty(), "the policy did not fire");
+        {
+            let mut ctx = ChainContext {
+                snapshot: &snap,
+                open: &legs,
+                pending: &[],
+                marks: &NO_MARKS,
+                rng: &mut rng,
+                step: StepIndex::new(9),
+            };
+            assert!(matches!(adapter.on_end(&mut ctx, &mut out), Ok(())));
+        }
+        assert_eq!(out.len(), 4, "on_end flattens every still-open leg");
+        assert!(out.iter().all(is_close));
     }
 
     // --- pending-order control ---------------------------------------------
@@ -1626,6 +2057,7 @@ mod tests {
             snapshot: &snap,
             open: &[],
             pending: &[], // no resting strategy orders
+            marks: &NO_MARKS,
             rng: &mut rng,
             step: StepIndex::new(0),
         };
@@ -1656,6 +2088,7 @@ mod tests {
             snapshot: &snap,
             open: &[],
             pending: &resting,
+            marks: &NO_MARKS,
             rng: &mut rng,
             step: StepIndex::new(0),
         };
@@ -1676,6 +2109,7 @@ mod tests {
             snapshot: &snap,
             open: &[],
             pending: &[],
+            marks: &NO_MARKS,
             rng: &mut rng,
             step: StepIndex::new(0),
         };
@@ -1798,7 +2232,8 @@ mod tests {
 
         // The trade log's ExitReason is taken from the applied ExitPolicy: a
         // profit target maps to TargetReached, a loss cap to StopLoss, and a
-        // time/expiration policy to Expiration.
+        // genuine expiration policy to Expiration. A step-count hold is NOT an
+        // expiry — it records a truthful Other("time_steps").
         assert_eq!(
             adapter(ExitPolicy::ProfitPercent(dec!(50))).exit_reason(),
             ExitReason::TargetReached
@@ -1809,7 +2244,7 @@ mod tests {
         );
         assert_eq!(
             adapter(ExitPolicy::TimeSteps(5)).exit_reason(),
-            ExitReason::Expiration
+            ExitReason::Other("time_steps".to_string())
         );
         assert_eq!(
             adapter(ExitPolicy::Expiration).exit_reason(),

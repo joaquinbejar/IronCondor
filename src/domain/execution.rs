@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::domain::contract::ContractKey;
 use crate::domain::money::{Cents, PriceCents, Quantity};
 use crate::domain::time::{SimTime, StepIndex};
+use crate::error::BacktestError;
 
 /// Which fill model executes a run's order intents.
 ///
@@ -118,7 +119,14 @@ pub enum TimeInForce {
 }
 
 /// One order the strategy wants executed.
+///
+/// Deserialisation is routed through [`OrderIntent::try_from`] so the
+/// marketable-order invariant (`limit == None ⇒ tif == Ioc`) is **enforced**,
+/// not merely documented: an intent decoded from JSON with `limit = null` and
+/// `tif = "gtc"` is a typed [`BacktestError::Execution`], never a resting market
+/// order the fill models cannot represent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "OrderIntentWire")]
 pub struct OrderIntent {
     /// The contract to trade.
     pub contract: ContractKey,
@@ -134,6 +142,86 @@ pub struct OrderIntent {
     pub tif: TimeInForce,
     /// The mid at decision time — the slippage reference.
     pub decision_mid: PriceCents,
+}
+
+impl OrderIntent {
+    /// Build a validated order intent, **enforcing** the marketable-order
+    /// invariant so a resting market order can never be constructed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BacktestError::Execution`] when `limit` is `None` (a
+    /// marketable intent) and `tif` is [`TimeInForce::Gtc`] — a market order
+    /// is always immediate-or-cancel; it cannot rest in the book.
+    pub fn new(
+        contract: ContractKey,
+        action: PositionAction,
+        side: Side,
+        quantity: Quantity,
+        limit: Option<PriceCents>,
+        tif: TimeInForce,
+        decision_mid: PriceCents,
+    ) -> Result<Self, BacktestError> {
+        let intent = Self {
+            contract,
+            action,
+            side,
+            quantity,
+            limit,
+            tif,
+            decision_mid,
+        };
+        intent.validate()?;
+        Ok(intent)
+    }
+
+    /// Check the marketable-order invariant: a marketable intent
+    /// (`limit == None`) must be IOC.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BacktestError::Execution`] for a resting market order
+    /// (`limit == None && tif == Gtc`).
+    pub fn validate(&self) -> Result<(), BacktestError> {
+        if self.limit.is_none() && matches!(self.tif, TimeInForce::Gtc) {
+            return Err(BacktestError::Execution(
+                "marketable order intent (limit = None) must be IOC, not GTC; \
+                 a market order cannot rest in the book"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The wire mirror of [`OrderIntent`], used only as the `try_from`
+/// deserialisation target so every decoded intent is validated through
+/// [`OrderIntent::new`]'s marketable-order invariant.
+#[derive(Deserialize)]
+struct OrderIntentWire {
+    contract: ContractKey,
+    action: PositionAction,
+    side: Side,
+    quantity: Quantity,
+    limit: Option<PriceCents>,
+    tif: TimeInForce,
+    decision_mid: PriceCents,
+}
+
+impl TryFrom<OrderIntentWire> for OrderIntent {
+    type Error = BacktestError;
+
+    fn try_from(wire: OrderIntentWire) -> Result<Self, Self::Error> {
+        Self::new(
+            wire.contract,
+            wire.action,
+            wire.side,
+            wire.quantity,
+            wire.limit,
+            wire.tif,
+            wire.decision_mid,
+        )
+    }
 }
 
 /// The strategy's per-step output — one deterministic ordered channel for
@@ -295,16 +383,116 @@ pub mod sign_convention {
 
 #[cfg(test)]
 mod tests {
-    use optionstratlib::Side;
+    use chrono::DateTime;
+    use optionstratlib::{ExpirationDate, OptionStyle, Side};
 
     use super::sign_convention::{side_sign, slippage_cents, spread_capture_cents};
+    use super::{OrderIntent, PositionAction, TimeInForce};
+    use crate::domain::contract::{ContractKey, Underlying};
     use crate::domain::money::{Cents, PriceCents, Quantity};
+    use crate::error::BacktestError;
 
     fn qty(n: u32) -> Quantity {
         let Ok(q) = Quantity::new(n) else {
             panic!("{n} is a valid quantity");
         };
         q
+    }
+
+    fn contract_key() -> ContractKey {
+        let Ok(underlying) = Underlying::new("SPX") else {
+            panic!("SPX is a valid underlying");
+        };
+        ContractKey {
+            underlying,
+            expiration: ExpirationDate::DateTime(DateTime::from_timestamp_nanos(
+                1_750_291_200_000_000_000,
+            )),
+            strike: PriceCents::new(510_000),
+            style: OptionStyle::Call,
+        }
+    }
+
+    #[test]
+    fn test_order_intent_new_enforces_marketable_ioc_invariant() {
+        // marketable (limit None) + Gtc is a resting market order — rejected.
+        let resting_market = OrderIntent::new(
+            contract_key(),
+            PositionAction::Open,
+            Side::Short,
+            qty(1),
+            None,
+            TimeInForce::Gtc,
+            PriceCents::new(150),
+        );
+        assert!(matches!(resting_market, Err(BacktestError::Execution(_))));
+
+        // marketable (limit None) + Ioc is accepted.
+        assert!(
+            OrderIntent::new(
+                contract_key(),
+                PositionAction::Open,
+                Side::Short,
+                qty(1),
+                None,
+                TimeInForce::Ioc,
+                PriceCents::new(150),
+            )
+            .is_ok()
+        );
+
+        // a resting limit (limit Some) + Gtc is accepted.
+        assert!(
+            OrderIntent::new(
+                contract_key(),
+                PositionAction::Open,
+                Side::Short,
+                qty(1),
+                Some(PriceCents::new(148)),
+                TimeInForce::Gtc,
+                PriceCents::new(150),
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_order_intent_deserialize_rejects_resting_market_order() {
+        let Ok(valid) = OrderIntent::new(
+            contract_key(),
+            PositionAction::Open,
+            Side::Short,
+            qty(1),
+            None,
+            TimeInForce::Ioc,
+            PriceCents::new(150),
+        ) else {
+            panic!("a marketable IOC intent must build");
+        };
+        let json = serde_json::to_string(&valid).unwrap_or_default();
+        // A marketable IOC intent round-trips.
+        let back: Result<OrderIntent, _> = serde_json::from_str(&json);
+        assert!(back.is_ok(), "marketable IOC intent must round-trip");
+
+        // Flip tif to gtc while limit stays null → a resting market order,
+        // rejected on deserialize by the `try_from` invariant.
+        let mut value: serde_json::Value = match serde_json::from_str(&json) {
+            Ok(value) => value,
+            Err(e) => panic!("intent json must parse: {e}"),
+        };
+        let Some(obj) = value.as_object_mut() else {
+            panic!("intent json must be an object");
+        };
+        obj.insert("limit".to_string(), serde_json::Value::Null);
+        obj.insert(
+            "tif".to_string(),
+            serde_json::Value::String("gtc".to_string()),
+        );
+        let bad: Result<OrderIntent, _> = serde_json::from_value(value);
+        assert!(
+            bad.is_err(),
+            "a resting (gtc) market order must fail to deserialize"
+        );
     }
 
     #[test]

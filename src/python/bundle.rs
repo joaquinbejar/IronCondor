@@ -32,7 +32,8 @@
 //! hostile directory fails typed **before** a handle is returned; the accessors
 //! then still read lazily from disk.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use pyo3::exceptions::PyImportError;
 use pyo3::prelude::*;
@@ -127,11 +128,14 @@ impl Bundle {
     /// unreadable, not JSON, or carries no `metrics` object.
     fn metrics<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         guard_boundary(|| {
-            let manifest_path = self.dir.join("manifest.json");
-            let text = std::fs::read_to_string(&manifest_path).map_err(|e| {
-                bundle_err(py, format!("cannot read {}: {e}", manifest_path.display()))
-            })?;
-            let value: serde_json::Value = serde_json::from_str(&text)
+            // Re-read the manifest bounded by the default resource ceiling. The
+            // handle retains only its directory, not the `ResourceLimits` used
+            // at load, so a directory swapped under a live handle after load
+            // cannot force an unbounded allocation here (F34) — the filesystem
+            // size is rejected before the read, then `Read::take` caps it.
+            let limits = ResourceLimits::default();
+            let buf = self.read_manifest_bounded(py, &limits)?;
+            let value: serde_json::Value = serde_json::from_slice(&buf)
                 .map_err(|e| bundle_err(py, format!("manifest.json is not valid JSON: {e}")))?;
             let metrics = value
                 .get("metrics")
@@ -166,51 +170,160 @@ impl Bundle {
             )?;
 
             let dest = PathBuf::from(&dir);
+
+            // Refuse to copy a bundle onto itself, or into a directory that
+            // CONTAINS it: canonicalise both and reject BEFORE any deletion. The
+            // old path deleted the destination then copied from `self.dir`, so
+            // `dest == bundle.path` (or an ancestor) irreversibly destroyed the
+            // very bundle the copy was meant to preserve (F35).
+            let source = self.dir.canonicalize().map_err(|e| {
+                bundle_err(
+                    py,
+                    format!("cannot resolve bundle {}: {e}", self.dir.display()),
+                )
+            })?;
+            if let Some(dest_canon) = canonicalize_dest(&dest)
+                && source.starts_with(&dest_canon)
+            {
+                return Err(bundle_err(
+                    py,
+                    format!(
+                        "refusing to write bundle onto itself: destination {dir} resolves to the \
+                         source bundle {} (or a directory containing it)",
+                        self.dir.display()
+                    ),
+                ));
+            }
+
             let dest_exists = dest
                 .try_exists()
                 .map_err(|e| bundle_err(py, format!("cannot stat {dir}: {e}")))?;
-            if dest_exists {
-                if !overwrite {
-                    return Err(bundle_err(
-                        py,
-                        format!(
-                            "destination {dir} already exists (pass overwrite=True to replace it)"
-                        ),
-                    ));
-                }
-                std::fs::remove_dir_all(&dest)
-                    .map_err(|e| bundle_err(py, format!("cannot replace {dir}: {e}")))?;
+            if dest_exists && !overwrite {
+                return Err(bundle_err(
+                    py,
+                    format!("destination {dir} already exists (pass overwrite=True to replace it)"),
+                ));
             }
-            std::fs::create_dir_all(&dest)
-                .map_err(|e| bundle_err(py, format!("cannot create {dir}: {e}")))?;
 
-            // Copy every regular file in the finalized bundle directory (manifest
-            // + the four Parquet tables) — a flat directory, no subdirectories.
-            let entries = std::fs::read_dir(&self.dir).map_err(|e| {
+            // Stage the copy into a sibling temp directory, then publish it with
+            // an atomic rename — a reader never sees a half-populated
+            // destination, and the copy reads only the source, never a live
+            // destination (mirrors the Rust writer's atomic publish).
+            let parent = dest
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+            std::fs::create_dir_all(&parent)
+                .map_err(|e| bundle_err(py, format!("cannot create {}: {e}", parent.display())))?;
+            let staging = unique_sibling(&parent, &dest, "stage");
+            std::fs::create_dir(&staging).map_err(|e| {
                 bundle_err(
                     py,
-                    format!("cannot read bundle {}: {e}", self.dir.display()),
+                    format!("cannot create staging dir {}: {e}", staging.display()),
                 )
             })?;
-            for entry in entries {
-                let entry =
-                    entry.map_err(|e| bundle_err(py, format!("cannot read bundle entry: {e}")))?;
-                let file_type = entry
-                    .file_type()
-                    .map_err(|e| bundle_err(py, format!("cannot stat bundle entry: {e}")))?;
-                if file_type.is_file() {
-                    let target = dest.join(entry.file_name());
-                    std::fs::copy(entry.path(), &target).map_err(|e| {
-                        bundle_err(py, format!("cannot copy {:?}: {e}", entry.file_name()))
-                    })?;
-                }
+            if let Err(err) = self.copy_files_into(py, &staging) {
+                let _ = std::fs::remove_dir_all(&staging);
+                return Err(err);
             }
+
+            // Publish atomically. On overwrite, move the existing destination
+            // aside to a sibling backup first, swap, then drop the backup — a
+            // failure leaves either the old or the new bundle, never a partial
+            // one; on failure the source (untouched throughout) always survives.
+            if dest_exists {
+                let backup = unique_sibling(&parent, &dest, "backup");
+                if let Err(e) = std::fs::rename(&dest, &backup) {
+                    let _ = std::fs::remove_dir_all(&staging);
+                    return Err(bundle_err(py, format!("cannot replace {dir}: {e}")));
+                }
+                if let Err(e) = std::fs::rename(&staging, &dest) {
+                    let _ = std::fs::rename(&backup, &dest);
+                    let _ = std::fs::remove_dir_all(&staging);
+                    return Err(bundle_err(py, format!("cannot publish copy to {dir}: {e}")));
+                }
+                let _ = std::fs::remove_dir_all(&backup);
+            } else if let Err(e) = std::fs::rename(&staging, &dest) {
+                let _ = std::fs::remove_dir_all(&staging);
+                return Err(bundle_err(py, format!("cannot publish copy to {dir}: {e}")));
+            }
+
             Ok(Self::from_dir(dest))
         })
     }
 }
 
 impl Bundle {
+    /// Read `manifest.json` into memory, **bounded by** `limits.max_manifest_bytes`.
+    ///
+    /// The filesystem size is rejected before a byte is read, then the read
+    /// itself is capped with [`std::io::Read::take`], so a directory swapped
+    /// under a live handle after load cannot drive an unbounded allocation
+    /// (F34). Mirrors the hardened reader's `read_manifest` bounded read
+    /// (`src/bundle/reader.rs`).
+    ///
+    /// A crossed ceiling is a [`BacktestError::TapeTooLarge`] (→ `ic.DataError`),
+    /// consistent with the read-back gate; any other I/O failure is
+    /// `ic.BundleError`.
+    fn read_manifest_bounded(&self, py: Python<'_>, limits: &ResourceLimits) -> PyResult<Vec<u8>> {
+        use std::io::Read as _;
+        let path = self.dir.join("manifest.json");
+        let meta = std::fs::metadata(&path)
+            .map_err(|e| bundle_err(py, format!("cannot stat {}: {e}", path.display())))?;
+        if !meta.is_file() {
+            return Err(bundle_err(
+                py,
+                format!("{} is not a regular file", path.display()),
+            ));
+        }
+        let len = meta.len();
+        if len > limits.max_manifest_bytes {
+            return Err(to_pyerr(
+                py,
+                BacktestError::TapeTooLarge {
+                    limit: "max_manifest_bytes",
+                    value: len,
+                    cap: limits.max_manifest_bytes,
+                },
+            ));
+        }
+        let file = std::fs::File::open(&path)
+            .map_err(|e| bundle_err(py, format!("cannot open {}: {e}", path.display())))?;
+        let cap = usize::try_from(len).unwrap_or(0);
+        let mut buf = Vec::with_capacity(cap);
+        file.take(limits.max_manifest_bytes)
+            .read_to_end(&mut buf)
+            .map_err(|e| bundle_err(py, format!("cannot read {}: {e}", path.display())))?;
+        Ok(buf)
+    }
+
+    /// Copy every regular file in the finalized bundle directory into `dest_dir`
+    /// (a flat directory — manifest + the four Parquet tables, no
+    /// subdirectories). Reads only `self.dir`; never touches `dest_dir`'s
+    /// siblings.
+    fn copy_files_into(&self, py: Python<'_>, dest_dir: &Path) -> PyResult<()> {
+        let entries = std::fs::read_dir(&self.dir).map_err(|e| {
+            bundle_err(
+                py,
+                format!("cannot read bundle {}: {e}", self.dir.display()),
+            )
+        })?;
+        for entry in entries {
+            let entry =
+                entry.map_err(|e| bundle_err(py, format!("cannot read bundle entry: {e}")))?;
+            let file_type = entry
+                .file_type()
+                .map_err(|e| bundle_err(py, format!("cannot stat bundle entry: {e}")))?;
+            if file_type.is_file() {
+                let target = dest_dir.join(entry.file_name());
+                std::fs::copy(entry.path(), &target).map_err(|e| {
+                    bundle_err(py, format!("cannot copy {:?}: {e}", entry.file_name()))
+                })?;
+            }
+        }
+        Ok(())
+    }
+
     /// Read one bundle table into a `pandas.DataFrame` via `pandas.read_parquet`.
     ///
     /// Shared by the four table accessors; wrapped in [`guard_boundary`] so an
@@ -279,6 +392,38 @@ fn import_pandas(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
              Parquet + JSON at bundle.path, so polars / pyarrow can read it directly instead.",
         )
     })
+}
+
+/// Resolve `dest` to a canonical path for the same-path identity check (F35),
+/// tolerating a not-yet-existing destination by canonicalising its existing
+/// parent and re-joining the final component. Returns `None` when neither `dest`
+/// nor its parent resolves — then it cannot alias the always-existing source.
+fn canonicalize_dest(dest: &Path) -> Option<PathBuf> {
+    if let Ok(canon) = dest.canonicalize() {
+        return Some(canon);
+    }
+    let parent = dest.parent()?;
+    let name = dest.file_name()?;
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    Some(parent.canonicalize().ok()?.join(name))
+}
+
+/// A unique hidden sibling path under `parent` for atomic staging / backup
+/// (F35). The process id plus a monotonic counter keep concurrent `write()`
+/// calls collision-free without reading a wall clock.
+fn unique_sibling(parent: &Path, dest: &Path, tag: &str) -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let base = dest
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("bundle");
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    parent.join(format!(".{base}.{tag}.{pid}.{n}.tmp"))
 }
 
 /// Emit a Python `DeprecationWarning` with `message`.

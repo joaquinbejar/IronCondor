@@ -295,6 +295,23 @@ pub fn run_condor(path: &Path, seed: u64) -> Result<BacktestRun, String> {
     BacktestEngine::run(&config, feed, execution, adapter, "iron_condor").map_err(|e| e.to_string())
 }
 
+/// Open `path` as a `ParquetFeed`, wrap the iron condor with the given
+/// `exit` policy, and run to completion — the exit-policy-parameterised
+/// analogue of [`run_condor`], used by the F11 terminal-step regression (an exit
+/// policy firing on the final step must not double-close via `on_end`).
+pub fn run_condor_with_exit(
+    path: &Path,
+    seed: u64,
+    exit: ExitPolicy,
+) -> Result<BacktestRun, String> {
+    let config = condor_config(path, seed);
+    let feed = ParquetFeed::open(path, &ResourceLimits::default()).map_err(|e| e.to_string())?;
+    let adapter = OptStratAdapter::<IronCondor>::from_spec(&iron_condor_spec(), exit)
+        .map_err(|e| e.to_string())?;
+    let execution = NaiveFill::new(config.slippage.clone(), config.fees);
+    BacktestEngine::run(&config, feed, execution, adapter, "iron_condor").map_err(|e| e.to_string())
+}
+
 /// Open `dir` as a [`CsvFeed`] (records a `DataSourceSpec::Csv` provenance),
 /// wrap the iron condor with a non-triggering exit policy, and run to
 /// completion — the CSV analogue of [`run_condor`].
