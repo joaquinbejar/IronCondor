@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 70c2a587ce6706a515e142d63290fe6cfa5ddde5d1f134f77a365a34d9ef25c4 # shrinks to step = 0, ts_ns = 0, run_id = "", trade_id = 0, position_id = 0, order_id = 0, fill_seq = 0, underlying = "", expiration_ns = 0, contract_id = "", strike_cents = 0, style = "", side = "", quantity = 0, price_cents = 0, fees_cents = 0, slippage_cents = 0, mode = "", drawdown = -967.1437082288163, cash_cents = 0, position_value_cents = 0, equity_cents = 0, avg_price_cents = 0, mark_cents = 1315511014516, unrealized_cents = -8538481490376409094, stale_mark = false, exit_reason = Some("&\u{94c6d}"), open_at_end = true, theta = -4254333645337505166, delta = 5659861991582459144, vega = 3613268934930765068, spread_capture = -2842089870509547364, residual = 639633809418304158

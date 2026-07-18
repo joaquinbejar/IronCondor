@@ -85,6 +85,12 @@ pub mod execution;
 pub mod python;
 pub mod run;
 
+pub use analytics::Metrics;
+pub use bundle::{
+    BUNDLE_SCHEMA, EQUITY_CURVE_SORT_COLUMNS, FILLS_SORT_COLUMNS, GREEKS_ATTRIBUTION_SORT_COLUMNS,
+    Manifest, POSITIONS_SORT_COLUMNS, RowCounts, RunId, equity_sort_key, fill_sort_key,
+    greeks_sort_key, position_sort_key,
+};
 pub use config::{
     BacktestConfig, FeeSchedule, LiquidityProfile, ResourceLimits, SlippageModel, TouchSize,
 };
@@ -93,10 +99,11 @@ pub use data::{
     feed_catalogue, raw_quotes_to_snapshot, snapshot_to_option_chain,
 };
 pub use domain::{
-    Cents, ChainSnapshot, ContractKey, EquityPoint, ExecutionMode, Fill, GreeksAttributionRow,
-    InstrumentSpec, IronCondorSpec, OpenPosition, OrderCommand, OrderId, OrderIntent, PendingOrder,
-    PositionAction, PositionId, PriceCents, Quantity, QuoteView, ShortStrangleSpec, SimTime,
-    StepIndex, StrategySpec, Ticks, TimeInForce, TradeId, Underlying,
+    Cents, ChainSnapshot, ContractKey, EquityPoint, ExecutionMode, Fill, FillRow,
+    GreeksAttributionRow, InstrumentSpec, IronCondorSpec, OpenPosition, OrderCommand, OrderId,
+    OrderIntent, PendingOrder, PositionAction, PositionId, PositionRow, PriceCents, Quantity,
+    QuoteView, ShortStrangleSpec, SimTime, StepIndex, StrategySpec, Ticks, TimeInForce, TradeId,
+    Underlying,
 };
 pub use engine::{
     AttributionSubstrate, BacktestEngine, BacktestRun, ChainContext, ConfigOverride, Event, Ledger,

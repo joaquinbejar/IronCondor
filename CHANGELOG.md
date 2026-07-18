@@ -10,6 +10,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Result-bundle record types + `manifest.json` schema — the typed shape of the
+  frozen `ironcondor.bundle.v1` contract ChainView consumes (#33). The two
+  remaining bundle rows land next to the existing pair in `src/domain/result.rs`:
+  `FillRow` (one executed fill, the wire projection of `Fill` plus the
+  `trade_id`/`position_id`/`order_id`/`fill_seq` lifecycle ids) and `PositionRow`
+  (a leg's per-step state); `exit_reason` is the **only** nullable column in the
+  whole bundle, every money column is integer cents, and the only float column is
+  `drawdown` on `EquityPoint`. `src/bundle/schema.rs` adds the schema tag
+  constant `BUNDLE_SCHEMA` (`"ironcondor.bundle.v1"`), the pinned per-table sort
+  keys (`fills` by `(step, order_id, fill_seq)` unique; `positions` by
+  `(step, position_id)`; `equity_curve`/`greeks_attribution` by `step`), the
+  `RunId` hex-string newtype with a deterministic `RunId::derive` over the
+  reproducibility tuple (seed + semantic config + strategy + tape identity +
+  build identity — **excluding** the operational `overwrite`/output-path
+  controls), the `RowCounts` per-table integrity struct, and the single
+  serialization-source `Manifest` carrying exactly the docs/05 §6 fields (no
+  `currency` field — USD is fixed by the tag). Types only; the Parquet encoding
+  (#34), read-back (#35), and the golden freeze (#36) follow.
+
 - Queue position and market impact in realistic mode (`src/execution/realistic.rs`,
   feature `orderbook`) — both **emergent** from routing through the seeded book,
   not configured knobs. A marketable order larger than the touch walks the
