@@ -3,7 +3,7 @@
 # The working v0.4 surface (#39): the `BacktestConfig` integer-cents builder,
 # `run`, and the `Bundle` handle with lazy DataFrame accessors. Shipped in the
 # wheel (PEP 561, via `py.typed`) so editors and type-checkers see the surface.
-# The typed exception hierarchy lands in #40.
+# The typed exception hierarchy rooted at `IronCondorError` lands in #40.
 #
 # Money crosses as INTEGER CENTS everywhere (names say `*_cents`); the only
 # floats are the documented analytic exception — implied volatility, the two
@@ -16,6 +16,40 @@
 from typing import Any
 
 __version__: str
+
+# --- Exception hierarchy (#40) ---------------------------------------------
+# Every engine exception descends from `IronCondorError`, so `except
+# IronCondorError` catches them all. `ConfigError` is also a `ValueError`;
+# `DataError` and `BundleError` are also `OSError` (Python-3 `IOError`), so the
+# idiomatic builtin `except` clauses keep working. The `BacktestError` → class
+# mapping lives in `src/python/errors.rs`.
+
+class IronCondorError(Exception):
+    """Common base for every exception the engine raises."""
+
+class ConfigError(IronCondorError, ValueError):
+    """Invalid configuration or input value (also a `ValueError`)."""
+
+class DataError(IronCondorError, OSError):
+    """Data-source, conversion, tape, or session failure (also an `OSError`)."""
+
+class ExecutionError(IronCondorError):
+    """Fill-model or order-book execution failure."""
+
+class StrategyError(IronCondorError):
+    """Strategy-adapter failure surfaced from optionstratlib."""
+
+class BundleError(IronCondorError, OSError):
+    """Result-bundle write or read-back failure (also an `OSError`)."""
+
+class EngineError(IronCondorError):
+    """Arithmetic overflow, or an unexpected internal panic caught at the
+    FFI boundary (no panic ever crosses into the interpreter)."""
+
+def _panic_for_test(message: str) -> None:
+    """Internal test hook: induces a Rust panic to prove it surfaces as
+    `EngineError`, never an aborted interpreter. Not part of the public API."""
+    ...
 
 class BacktestConfig:
     """Chainable, integer-cents builder over the Rust `BacktestConfig`.
