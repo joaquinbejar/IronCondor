@@ -10,6 +10,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Mark-to-market ledger enrichment (`src/engine/ledger.rs`): `stale_mark`
+  tracking via the engine-owned `PositionMark { position_id, mark, stale }`
+  scratch (a held leg absent from a step carries its last-known mark and is
+  flagged stale), exposed through `Ledger::position_marks()` for the v0.3
+  position rows; and the expiry-settlement rule — a held leg missing at or
+  after its own expiry instant is `BacktestError::DataOutOfOrder` (a
+  settlement mark is mandatory then), while a merely sparse chain before
+  expiry is tolerated by carry-forward. Property tests pin the two distinct
+  invariants — cash changes only by fills and fees, and equity reconciles to
+  `cash + Σ(mark × quantity × contract_multiplier × side_sign)` every step —
+  plus the unclamped drawdown definition at zero and negative equity (#15).
+
 - `BacktestEngine::run<F: DataFeed, X: ExecutionModel, S: Strategy>`
   (`src/engine/backtest.rs`) — the synchronous, single-threaded, monomorphised
   replay loop implementing the normative state machine: startup (materialise

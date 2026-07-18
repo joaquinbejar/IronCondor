@@ -4,9 +4,9 @@ use std::collections::BTreeMap;
 
 use ironcondor::{
     BacktestError, Cents, ChainSnapshot, ContractKey, ExecutionMode, ExecutionModel, FeeSchedule,
-    Fill, InstrumentSpec, NaiveFill, OrderCommand, OrderIntent, PositionAction, PriceCents,
-    Quantity, QuoteView, RawQuote, SimClock, SimTime, SlippageModel, SnapshotMeta, StepIndex,
-    Ticks, TimeInForce, Underlying, raw_quotes_to_snapshot,
+    Fill, InstrumentSpec, Ledger, NaiveFill, OpenPosition, OrderCommand, OrderIntent,
+    PositionAction, PositionId, PriceCents, Quantity, QuoteView, RawQuote, SimClock, SimTime,
+    SlippageModel, SnapshotMeta, StepIndex, Ticks, TimeInForce, Underlying, raw_quotes_to_snapshot,
 };
 use optionstratlib::prelude::Positive;
 use optionstratlib::{ExpirationDate, OptionStyle, Side};
@@ -622,4 +622,234 @@ fn test_same_seed_same_result_iron_condor_and_rng_strategy() {
     let d = run_rng_probe(&path, 271);
     assert_eq!(c.equity_curve, d.equity_curve);
     assert_eq!(c.open_at_end, d.open_at_end);
+}
+
+// --- mark-to-market ledger properties (issue #15) --------------------------
+
+/// The fixed contract multiplier of the ledger-property snapshots
+/// ([`naive_snapshot`] builds a 100x spec).
+const LEDGER_MULT: i128 = 100;
+
+/// A resolved contract keyed at `strike`, expiring 365 days after `TS0` — far
+/// beyond the `TS0` property snapshots, so a carry-forward is always pre-expiry
+/// and the settlement-rejection path never trips these revaluation properties.
+fn ledger_contract(strike: u64) -> Option<ContractKey> {
+    let underlying = Underlying::new("SPX").ok()?;
+    Some(ContractKey {
+        underlying,
+        expiration: ExpirationDate::DateTime(chrono::DateTime::from_timestamp_nanos(
+            TS0 + 365 * NANOS_PER_DAY,
+        )),
+        strike: PriceCents::new(strike),
+        style: OptionStyle::Call,
+    })
+}
+
+/// One open leg on `contract`.
+fn ledger_leg(contract: &ContractKey, side: Side, quantity: Quantity, entry: u64) -> OpenPosition {
+    OpenPosition {
+        position_id: PositionId::new(1),
+        contract: contract.clone(),
+        side,
+        quantity,
+        entry_premium: PriceCents::new(entry),
+    }
+}
+
+/// A single naive fill on `contract` at `price` (zero slippage).
+fn ledger_fill(
+    contract: &ContractKey,
+    side: Side,
+    quantity: Quantity,
+    price: u64,
+    fees: i64,
+) -> Fill {
+    Fill {
+        ts: SimTime::new(TS0),
+        step: StepIndex::new(0),
+        contract: contract.clone(),
+        side,
+        quantity,
+        price: PriceCents::new(price),
+        fees: Cents::new(fees),
+        slippage: Cents::new(0),
+        mode: ExecutionMode::Naive,
+    }
+}
+
+proptest! {
+    /// Cash-flow invariant: `cash` changes **only** through fills and fees.
+    /// Revaluation-only settle steps (before and after a fill) never move cash;
+    /// the single fill moves it by **exactly** `−side_sign·price·qty·mult −
+    /// fees` — the two-invariants rule ([docs/02 §6](../../docs/02-engine-architecture.md)).
+    #[test]
+    fn cash_changes_only_by_fills_and_fees(
+        initial in 1i64..=1_000_000_000_000,
+        price in 1u64..=100_000,
+        quantity in 1u32..=100,
+        fees in 0i64..=1_000_000,
+        is_long in any::<bool>(),
+        pre_mids in prop::collection::vec(1u64..=100_000, 0..8),
+        post_mids in prop::collection::vec(1u64..=100_000, 0..8),
+    ) {
+        let contract = ledger_contract(510_000);
+        prop_assert!(contract.is_some());
+        let Some(contract) = contract else { return Ok(()); };
+        let quantity_q = Quantity::new(quantity);
+        prop_assert!(quantity_q.is_ok());
+        let Ok(quantity_q) = quantity_q else { return Ok(()); };
+        let side = if is_long { Side::Long } else { Side::Short };
+        let leg = ledger_leg(&contract, side, quantity_q, price);
+        let mut ledger = Ledger::new(Cents::new(initial));
+
+        // (1) revaluation-only steps BEFORE any fill leave cash == initial.
+        for &mid in &pre_mids {
+            let snap = naive_snapshot(&contract, mid);
+            prop_assert!(snap.is_some());
+            let Some(snap) = snap else { return Ok(()); };
+            let point = ledger.settle(StepIndex::new(0), snap.ts, std::slice::from_ref(&leg), &snap);
+            prop_assert!(point.is_ok());
+            prop_assert_eq!(ledger.cash().value(), initial);
+            if let Ok(point) = point {
+                prop_assert_eq!(point.cash_cents, initial);
+            }
+        }
+
+        // (2) one fill moves cash by EXACTLY -side_sign*price*qty*mult - fees.
+        let side_sign: i128 = if is_long { 1 } else { -1 };
+        let gross = i128::from(price) * i128::from(quantity) * LEDGER_MULT;
+        let expected_cash = i128::from(initial) - side_sign * gross - i128::from(fees);
+        prop_assert!(
+            expected_cash >= i128::from(i64::MIN) && expected_cash <= i128::from(i64::MAX)
+        );
+        let applied = ledger.apply_fill(&ledger_fill(&contract, side, quantity_q, price, fees), 100);
+        prop_assert!(applied.is_ok());
+        prop_assert_eq!(i128::from(ledger.cash().value()), expected_cash);
+
+        // (3) revaluation-only steps AFTER the fill leave cash at that value.
+        let settled_cash = ledger.cash().value();
+        for &mid in &post_mids {
+            let snap = naive_snapshot(&contract, mid);
+            prop_assert!(snap.is_some());
+            let Some(snap) = snap else { return Ok(()); };
+            let point = ledger.settle(StepIndex::new(0), snap.ts, std::slice::from_ref(&leg), &snap);
+            prop_assert!(point.is_ok());
+            prop_assert_eq!(ledger.cash().value(), settled_cash);
+        }
+    }
+
+    /// Valuation invariant: every step `equity == cash + Σ(mark × qty × mult ×
+    /// side_sign)`. Checked against an independent integer oracle for the leg
+    /// value, and cash reads back unchanged by revaluation.
+    #[test]
+    fn equity_reconciles_cash_plus_position_value(
+        initial in 1i64..=1_000_000_000_000,
+        price in 1u64..=100_000,
+        quantity in 1u32..=100,
+        fees in 0i64..=1_000_000,
+        is_long in any::<bool>(),
+        mids in prop::collection::vec(1u64..=100_000, 1..8),
+    ) {
+        let contract = ledger_contract(510_000);
+        prop_assert!(contract.is_some());
+        let Some(contract) = contract else { return Ok(()); };
+        let quantity_q = Quantity::new(quantity);
+        prop_assert!(quantity_q.is_ok());
+        let Ok(quantity_q) = quantity_q else { return Ok(()); };
+        let side = if is_long { Side::Long } else { Side::Short };
+        let leg = ledger_leg(&contract, side, quantity_q, price);
+        let side_sign: i128 = if is_long { 1 } else { -1 };
+
+        let mut ledger = Ledger::new(Cents::new(initial));
+        let applied = ledger.apply_fill(&ledger_fill(&contract, side, quantity_q, price, fees), 100);
+        prop_assert!(applied.is_ok());
+
+        for &mid in &mids {
+            let snap = naive_snapshot(&contract, mid);
+            prop_assert!(snap.is_some());
+            let Some(snap) = snap else { return Ok(()); };
+            let point = ledger.settle(StepIndex::new(0), snap.ts, std::slice::from_ref(&leg), &snap);
+            prop_assert!(point.is_ok());
+            let Ok(point) = point else { return Ok(()); };
+            // Independent oracle for the marked leg value.
+            let expected_pv = side_sign * i128::from(mid) * i128::from(quantity) * LEDGER_MULT;
+            prop_assert_eq!(i128::from(point.position_value_cents), expected_pv);
+            // The valuation identity, both as emitted and against cash + oracle.
+            prop_assert_eq!(point.equity_cents, point.cash_cents + point.position_value_cents);
+            prop_assert_eq!(
+                i128::from(point.equity_cents),
+                i128::from(point.cash_cents) + expected_pv
+            );
+            // Revaluation did not move cash.
+            prop_assert_eq!(point.cash_cents, ledger.cash().value());
+        }
+    }
+
+    /// Drawdown is defined and never clamped across the whole range: `0` at a
+    /// fresh peak, exactly `−1` at zero equity, and strictly below `−1` on
+    /// negative equity (the [docs/01 §9](../../docs/01-domain-model.md) rule).
+    #[test]
+    fn drawdown_defined_at_zero_and_negative_equity(
+        capital in 1i64..=1_000_000_000_000,
+        mid in 1u64..=100_000,
+    ) {
+        let contract = ledger_contract(510_000);
+        prop_assert!(contract.is_some());
+        let Some(contract) = contract else { return Ok(()); };
+        let one = Quantity::new(1);
+        prop_assert!(one.is_ok());
+        let Ok(one) = one else { return Ok(()); };
+
+        // (a) fresh peak: an empty book → equity == capital == peak → 0.
+        {
+            let mut ledger = Ledger::new(Cents::new(capital));
+            let snap = naive_snapshot(&contract, mid);
+            prop_assert!(snap.is_some());
+            let Some(snap) = snap else { return Ok(()); };
+            let point = ledger.settle(StepIndex::new(0), snap.ts, &[], &snap);
+            prop_assert!(point.is_ok());
+            let Ok(point) = point else { return Ok(()); };
+            prop_assert_eq!(point.equity_cents, capital);
+            prop_assert!((point.drawdown - 0.0).abs() < f64::EPSILON);
+        }
+
+        // (b) zero equity: peak = mid*100, one short leg marked at mid →
+        //     equity 0 → drawdown exactly -1 (not clamped away).
+        {
+            let peak = i64::try_from(i128::from(mid) * LEDGER_MULT).ok();
+            prop_assert!(peak.is_some());
+            let Some(peak) = peak else { return Ok(()); };
+            let short = ledger_leg(&contract, Side::Short, one, mid);
+            let mut ledger = Ledger::new(Cents::new(peak));
+            let snap = naive_snapshot(&contract, mid);
+            prop_assert!(snap.is_some());
+            let Some(snap) = snap else { return Ok(()); };
+            let point =
+                ledger.settle(StepIndex::new(0), snap.ts, std::slice::from_ref(&short), &snap);
+            prop_assert!(point.is_ok());
+            let Ok(point) = point else { return Ok(()); };
+            prop_assert_eq!(point.equity_cents, 0);
+            prop_assert!((point.drawdown - (-1.0)).abs() < 1e-12);
+        }
+
+        // (c) negative equity: capital one cent below the liability → equity < 0
+        //     → drawdown strictly below -1, reported as-is.
+        {
+            let liability = i128::from(mid) * LEDGER_MULT; // >= 100
+            let cap = i64::try_from(liability - 1).ok();
+            prop_assert!(cap.is_some());
+            let Some(cap) = cap else { return Ok(()); };
+            let short = ledger_leg(&contract, Side::Short, one, mid);
+            let mut ledger = Ledger::new(Cents::new(cap));
+            let snap = naive_snapshot(&contract, mid);
+            prop_assert!(snap.is_some());
+            let Some(snap) = snap else { return Ok(()); };
+            let point =
+                ledger.settle(StepIndex::new(0), snap.ts, std::slice::from_ref(&short), &snap);
+            prop_assert!(point.is_ok());
+            let Ok(point) = point else { return Ok(()); };
+            prop_assert!(point.equity_cents < 0);
+            prop_assert!(point.drawdown < -1.0);
+        }
+    }
 }
