@@ -10,6 +10,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The naive fill model (`src/execution/naive.rs`, `NaiveFill`) — the fast v0.1
+  execution mode and criterion throughput baseline. A pure function of the
+  snapshot and config with no book, state, or randomness: it fills every
+  `Submit` intent single-shot at the full quantity, reference price = the
+  quote mid, with the configured `SlippageModel` (`None` / `FixedCents` /
+  `SpreadFraction` / `SizeProportional`, all integer-cents and deterministic)
+  applied on the adverse side (a buy crosses toward the ask, a sell toward the
+  bid), and emits the shared `Fill` shape via the `assemble_fill` seam. A sell
+  whose adverse offset exceeds the reference floors at a zero premium (an
+  explicit clamp, never `saturating_sub`); `Cancel`/`Replace` produce no fills
+  (naive keeps no resting book) (#13).
+
 - The `ExecutionModel` seam (`src/execution/mod.rs`): the command→fill trait
   (`fill` appends into a caller-owned `&mut Vec<Fill>` so PB-1 is satisfiable
   by the signature; `mode()`), and the shared `assemble_fill` helper — the

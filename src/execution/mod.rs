@@ -29,6 +29,10 @@
 //! `option-chain-orderbook`** — the whole seam is integer cents and `u128`
 //! ticks. Nothing of that mapping lives here.
 
+pub mod naive;
+
+pub use naive::NaiveFill;
+
 use crate::config::FeeSchedule;
 use crate::domain::execution::sign_convention;
 use crate::domain::{
@@ -102,16 +106,18 @@ pub trait ExecutionModel {
 /// domain type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
-#[allow(
-    dead_code,
-    reason = "consumed by NaiveFill (#13); exercised by this module's tests now"
-)]
 pub(crate) enum FeeCharge {
     /// The order's first fill: charge `per_contract_cents × quantity` **plus**
     /// the once-per-order `per_order_cents`.
     FirstFill = 0,
     /// A later fill of the same order: charge `per_contract_cents × quantity`
-    /// only — the per-order fee already sat on the first fill.
+    /// only — the per-order fee already sat on the first fill. Naive mode is
+    /// single-shot and never emits it; the first constructor is realistic
+    /// mode's multi-level walk (v0.2).
+    #[allow(
+        dead_code,
+        reason = "constructed by realistic mode's multi-level walk (v0.2); NaiveFill is single-shot"
+    )]
     LaterFill = 1,
 }
 
@@ -120,10 +126,6 @@ pub(crate) enum FeeCharge {
 /// `fees`. Grouping them keeps the assembler to a small, testable signature and
 /// guarantees both modes route through exactly the same construction.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(
-    dead_code,
-    reason = "consumed by NaiveFill (#13); exercised by this module's tests now"
-)]
 pub(crate) struct FillDraft {
     /// The snapshot timestamp the fill executed against.
     pub ts: SimTime,
@@ -155,10 +157,6 @@ pub(crate) struct FillDraft {
 /// quantity`, the added `per_order_cents`, or the narrowing to signed
 /// [`Cents`] exceeds range.
 #[must_use = "the computed fee must be recorded on the fill"]
-#[allow(
-    dead_code,
-    reason = "consumed by NaiveFill (#13); exercised by this module's tests now"
-)]
 pub(crate) fn fee_for_fill(
     schedule: &FeeSchedule,
     quantity: Quantity,
@@ -195,10 +193,6 @@ pub(crate) fn fee_for_fill(
 /// Returns [`BacktestError::ArithmeticOverflow`] when the slippage or fee
 /// computation exceeds integer-cents range.
 #[must_use = "the assembled fill must be recorded"]
-#[allow(
-    dead_code,
-    reason = "consumed by NaiveFill (#13); exercised by this module's tests now"
-)]
 pub(crate) fn assemble_fill(
     draft: FillDraft,
     mode: ExecutionMode,
