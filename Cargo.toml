@@ -208,6 +208,17 @@ required-features = ["orderbook"]
 name = "bundle_write"
 harness = false
 
+# The conversion-boundary scaling bench (#51, PB-4): `raw_quotes_to_snapshot`
+# (the O(contracts) DTO-independent validation core in `src/data/convert.rs`)
+# timed over snapshots of growing contract count (512 / 2 048 / 8 192, a 16x
+# sweep), proving the per-contract cost stays ~flat so a super-linear regression
+# is caught. The core is in the default build (every feed reuses it), so NO
+# `required-features`; `harness = false` for the same reason as the other
+# benches. Read-only: the bench only calls the public conversion API.
+[[bench]]
+name = "conversion"
+harness = false
+
 # The PyO3 boundary marshalling bench (#43, PB-6): the Rust-side per-call
 # marshalling cost of the binding with the engine elided — the config builder
 # chain (marshal-in path) + a single-crossing floor — driven through the real

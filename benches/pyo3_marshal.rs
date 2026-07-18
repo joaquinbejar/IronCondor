@@ -275,7 +275,39 @@ fn bench_pyo3_marshal(c: &mut Criterion) {
             "each sample is the MEAN over an inner batch of 512 crossings \
              (lifted above Instant::now resolution); batch-mean percentiles",
         );
+        report_ratio(&hist_full.borrow(), &hist_single.borrow());
     });
+}
+
+/// Print the dimensionless **full-config / single-crossing** marshalling ratio
+/// plus the machine-readable lines the H5 CI gate (`scripts/pyo3_gate.sh`, #51)
+/// and `BENCH.md` parse.
+///
+/// The gate tracks this ratio — not an absolute nanosecond count — because both
+/// numbers are measured in the **same** bench, same embedded interpreter, same
+/// process, so a uniform hardware clock-speed factor cancels (the same
+/// portability argument as `scripts/bench_gate.sh`'s realistic/naive ratio). The
+/// ratio only moves when the heavy `strategy_iron_condor` marshal regresses
+/// **relative** to the trivial `.seed(u64)` crossing floor — a real boundary
+/// regression — not when the runner is merely slow.
+fn report_ratio(full: &Histogram<u64>, single: &Histogram<u64>) {
+    let full_p50 = full.value_at_quantile(0.50);
+    let single_p50 = single.value_at_quantile(0.50);
+    let ratio = if single_p50 == 0 {
+        f64::INFINITY
+    } else {
+        full_p50 as f64 / single_p50 as f64
+    };
+    println!("\n=== pyo3_marshal — full/single ratio (PB-6, docs/07 §6) ===");
+    println!(
+        "marshal_full_config p50 = {full_p50} ns  |  marshal_single_call p50 = {single_p50} ns"
+    );
+    println!("full/single crossing ratio: p50 = {ratio:.2}x");
+    // Machine-readable lines — the CI gate greps MARSHAL_RATIO_P50; BENCH.md records all.
+    println!("MARSHAL_FULL_NS_P50={full_p50}");
+    println!("MARSHAL_SINGLE_NS_P50={single_p50}");
+    println!("MARSHAL_RATIO_P50={ratio:.4}");
+    println!("==========================================================\n");
 }
 
 criterion_group!(benches, bench_pyo3_marshal);
