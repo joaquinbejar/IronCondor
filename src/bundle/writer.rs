@@ -66,12 +66,19 @@
 //!
 //! # Streaming (PB-5)
 //!
-//! Each table is encoded in fixed-size row-group batches
-//! ([`WRITE_BATCH_ROWS`]), so the encode is a single O(rows) pass with peak
-//! memory bounded by one batch, not the run length
-//! ([docs/07 §3](../../../docs/07-performance-and-security.md#3-budgets-design-targets--pending-the-v01-bench-suite),
-//! measured in #37). The writer is termination-phase, **outside** the PB-1
-//! zero-alloc boundary — free to allocate.
+//! Each table is encoded in a single O(rows) pass: its wire rows are sorted
+//! through the pinned sort-key helpers, then streamed to Parquet in fixed-size
+//! row-group batches ([`WRITE_BATCH_ROWS`]). Two footprints, kept distinct: the
+//! **per-batch Arrow encode buffer** is bounded by one batch
+//! ([`WRITE_BATCH_ROWS`]) independent of run length, but each table is first
+//! materialised and sorted into a `Vec` of wire rows, so the writer's **total
+//! peak is O(rows) — linear, not quadratic** (measured #37,
+//! [docs/07 §3](../../../docs/07-performance-and-security.md#3-budgets-design-targets--pending-the-v01-bench-suite)).
+//! That linear footprint is the appropriate bar for a **termination-phase**
+//! component: the writer is **outside** the PB-1 zero-alloc boundary and free
+//! to allocate O(rows). Making the *total* peak row-group-bounded would need a
+//! streaming external sort or a pre-sorted-input contract (a future #34
+//! change); PB-5's "linear, not quadratic" clause is what is met and gated.
 //!
 //! # Errors
 //!
@@ -107,8 +114,11 @@ use crate::domain::{
 use crate::engine::{BacktestRun, FillRecord, PositionSnapshot};
 use crate::error::BacktestError;
 
-/// Rows encoded per Parquet row-group batch — bounds the writer's peak memory
-/// independently of the run length (PB-5).
+/// Rows per streamed Parquet row-group batch — bounds the **per-batch Arrow
+/// encode buffer** independently of run length. (It does **not** bound the
+/// writer's total peak, which is O(rows): each table is materialised and sorted
+/// into a `Vec` of wire rows before streaming — the appropriate linear
+/// termination-phase footprint, measured #37, PB-5.)
 const WRITE_BATCH_ROWS: usize = 8_192;
 
 /// The pinned Parquet `created_by` string — fixed so the file bytes do not vary
