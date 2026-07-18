@@ -184,7 +184,7 @@ jobs:
       # DataFrame accessors need; installed from the index (the wheel below is
       # installed --no-index, so its optional deps are staged here first).
       - name: Install maturin + pytest + the pandas extra
-        run: python -m pip install --upgrade "maturin>=1.7,<2.0" pytest pandas pyarrow
+        run: python -m pip install --upgrade "maturin>=1.7,<2.0" pytest pandas pyarrow numpy
       # Builds the wheel from `python/pyproject.toml` (manifest-path points at the
       # root crate). `--features "python orderbook simulator"` mirrors the
       # pyproject `[tool.maturin] features` — the PUBLISHED wheel is a
