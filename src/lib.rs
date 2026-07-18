@@ -89,7 +89,7 @@ pub use analytics::Metrics;
 pub use bundle::{
     BUNDLE_SCHEMA, EQUITY_CURVE_SORT_COLUMNS, FILLS_SORT_COLUMNS, GREEKS_ATTRIBUTION_SORT_COLUMNS,
     Manifest, POSITIONS_SORT_COLUMNS, RowCounts, RunId, equity_sort_key, fill_sort_key,
-    greeks_sort_key, position_sort_key,
+    greeks_sort_key, position_sort_key, write_bundle,
 };
 pub use config::{
     BacktestConfig, FeeSchedule, LiquidityProfile, ResourceLimits, SlippageModel, TouchSize,
@@ -106,9 +106,10 @@ pub use domain::{
     Underlying,
 };
 pub use engine::{
-    AttributionSubstrate, BacktestEngine, BacktestRun, ChainContext, ConfigOverride, Event, Ledger,
-    LegAttributionSample, OptStratAdapter, PositionMark, PositionableStrategy, ScenarioParams,
-    ScenarioType, SimClock, StepAttributionScalars, Strategy, UnitGreeks,
+    AttributionSubstrate, BacktestEngine, BacktestRun, ChainContext, ConfigOverride, Event,
+    FillRecord, Ledger, LegAttributionSample, OptStratAdapter, PositionMark, PositionSnapshot,
+    PositionableStrategy, ScenarioParams, ScenarioType, SimClock, StepAttributionScalars, Strategy,
+    UnitGreeks,
 };
 pub use error::BacktestError;
 #[cfg(feature = "orderbook")]
