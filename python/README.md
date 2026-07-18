@@ -63,14 +63,33 @@ because the bundle is plain Parquet + JSON, `polars` / `pyarrow` can read
 ## Building locally
 
 Wheels are built with [maturin](https://www.maturin.rs/) using the `abi3`
-stable ABI, so one `cp310-abi3` wheel per platform serves Python 3.10+:
+stable ABI, so one `cp310-abi3` wheel per platform serves Python 3.10+. The
+published wheel is a self-contained backtester — `python` (bindings) plus
+`orderbook` (realistic execution) plus `simulator` (the synthetic-chain feed):
 
 ```bash
 # from this directory (python/)
-maturin build --release --features "python orderbook"
+maturin build --release --features "python orderbook simulator"
 # or, for an editable install into the current interpreter:
-maturin develop --features "python orderbook"
+maturin develop --features "python orderbook simulator"
 ```
 
 The crate manifest lives at the repository root; `pyproject.toml` points maturin
-at it via `manifest-path = "../Cargo.toml"`.
+at it via `manifest-path = "../Cargo.toml"`, and its `[tool.maturin] features`
+already lists the same set (plus `pyo3/extension-module`), so a bare
+`maturin build --release` produces the same wheel.
+
+## Releases and PyPI status
+
+`ironcondor` is **not published on PyPI yet** — the distribution name is
+**unregistered**, and publishing is a deliberate, owner-approved action
+(docs/06 §8, CLAUDE.md).
+
+- **On every pipeline**, CI (`.github/workflows/ci.yml`, job `python-wheels`)
+  builds and `pytest`-runs a `cp310-abi3` wheel on Linux + macOS.
+- **On a `v*` tag**, the release workflow (`.github/workflows/release.yml`)
+  builds release-grade wheels — Linux (manylinux) + macOS x86_64 + macOS arm64 —
+  plus an sdist, then publishes to PyPI via **trusted publishing (OIDC, no
+  token)** — but only behind a manually-approved GitHub `pypi` environment, and
+  only once the owner has registered the name and its trusted publisher. Windows
+  wheels are a deferred wishlist item, not a v0.4 target.

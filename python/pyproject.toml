@@ -51,16 +51,31 @@ Repository = "https://github.com/joaquinbejar/IronCondor"
 [tool.maturin]
 # The crate manifest lives at the repository root, one level up.
 manifest-path = "../Cargo.toml"
-# Enable the binding code (`python`) plus `orderbook` (so the wheel is a
-# self-contained naive+realistic backtester, docs/06 §7 — `execution_realistic`
-# genuinely runs in the wheel) plus `pyo3/extension-module` for the wheel build
-# ONLY. extension-module suppresses the libpython link (correct for the
-# importable cdylib); keeping it out of the `python` cargo feature is what lets
-# `cargo test --all-features` still link and run (see Cargo.toml). abi3 is
-# inferred from the crate's `pyo3` `abi3-py310` feature → a `cp310-abi3` wheel.
-# `orderbook` adds no new lockfile entry (its deps are already resolved), so the
-# `lockfile_sha256` build identity — and the goldens — are unaffected.
-features = ["python", "orderbook", "pyo3/extension-module"]
+# Enable the binding code (`python`) plus the execution + feed features that make
+# the PUBLISHED wheel a self-contained backtester (docs/06 §7, the architect
+# follow-up from the #38 re-validation), plus `pyo3/extension-module` for the
+# wheel build ONLY:
+#   - `orderbook`  — realistic execution via option-chain-orderbook, so
+#                    `execution_realistic` genuinely runs in the wheel, not a stub.
+#   - `simulator`  — the OptionChain-Simulator synthetic-chain feed, so the wheel
+#                    is a self-contained backtester (feeds included), not just a
+#                    file-fed one. It pulls reqwest/tokio (rustls TLS), but every
+#                    licence in that stack is ALREADY on the `deny.toml`
+#                    allow-list (ISC / CDLA-Permissive-2.0 / BSD — see the #38
+#                    audit notes there) and already resolved in `Cargo.lock`, so
+#                    it adds NO new lockfile entry and NO new licence: the
+#                    `lockfile_sha256` build identity and the goldens are
+#                    unaffected, and `cargo deny --all-features check` stays green.
+#   - `pyo3/extension-module` — suppresses the libpython link (correct for the
+#                    importable cdylib). Kept OUT of the `python` cargo feature so
+#                    `cargo test --all-features` still links and runs (see
+#                    Cargo.toml); maturin injects it here for the wheel build only.
+#                    maturin MERGES these with any `--features` passed on the CLI,
+#                    so the CI build args (`python orderbook simulator`) union with
+#                    this list — extension-module is always present in the wheel.
+# abi3 is inferred from the crate's `pyo3` `abi3-py310` feature → a `cp310-abi3`
+# wheel.
+features = ["python", "orderbook", "simulator", "pyo3/extension-module"]
 # The importable module name; matches the crate `[lib] name` and the
 # `#[pymodule] fn ironcondor` entry point.
 module-name = "ironcondor"
