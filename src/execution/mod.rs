@@ -30,8 +30,12 @@
 //! ticks. Nothing of that mapping lives here.
 
 pub mod naive;
+#[cfg(feature = "orderbook")]
+pub mod realistic;
 
 pub use naive::NaiveFill;
+#[cfg(feature = "orderbook")]
+pub use realistic::RealisticFill;
 
 use crate::config::FeeSchedule;
 use crate::domain::execution::sign_convention;

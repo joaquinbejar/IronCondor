@@ -189,6 +189,7 @@ pub fn condor_config(path: &Path, seed: u64) -> BacktestConfig {
             per_order_cents: 100,
         },
         slippage: SlippageModel::None,
+        marketable_cap_ticks: 10,
         limits: ResourceLimits::default(),
         output_dir: "runs/out".into(),
         overwrite: false,

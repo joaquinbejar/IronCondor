@@ -10,6 +10,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The `option-chain-orderbook` adapter for realistic fills
+  (`src/execution/realistic.rs`, `RealisticFill`, feature `orderbook`) — the
+  foundation of realistic mode. It navigates to the leaf `OptionOrderBook`,
+  mints deterministic `OrderId`s from seeded `Id::Sequential` counters with
+  disjoint strategy/seeded-maker ranges, scales integer-cents prices to the
+  book's `u128` ticks via `InstrumentSpec.tick_size_cents` (a non-aligned
+  price is `PriceNotTickAligned`), maps `optionstratlib::Side` + the
+  `PositionAction` to the book's Buy/Sell (a close-long is a Sell), routes a
+  `Submit` through `add_limit_order_full`, and emits one shared `Fill` per
+  price level (byte-shape-identical to the naive model, `mode = Realistic`)
+  with the `FeeCharge::FirstFill`/`LaterFill` fee split. A marketable intent
+  becomes a tick-aligned aggressive limit off the touch capped at
+  `marketable_cap_ticks`, with the unfilled remainder cancelled, not chased.
+  Entirely feature-gated — the default build carries no orderbook dependency
+  (#22).
+- `BacktestConfig.marketable_cap_ticks` (serde default 10, validated `> 0`):
+  the tick cap for converting a marketable intent to an aggressive limit (#22).
+
 - Adversarial-input hardening for the Parquet feed (`tests/security.rs`, the
   `security` CI job): 11 committed deterministic adversarial-fixture
   generators (crossed quote, negative strike, NaN analytic, out-of-order and

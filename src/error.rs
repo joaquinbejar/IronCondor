@@ -104,6 +104,18 @@ pub enum BacktestError {
     ArithmeticOverflow,
 }
 
+/// Convert an `option_chain_orderbook` failure into [`BacktestError::OrderBook`]
+/// at the shared boundary — the realistic-execution seam
+/// (`src/execution/realistic.rs`) uses `?` and no orderbook error type crosses a
+/// public signature elsewhere. Feature-gated because the matching crate only
+/// compiles under `orderbook`; the rest of `error.rs` stays unconditional.
+#[cfg(feature = "orderbook")]
+impl From<option_chain_orderbook::Error> for BacktestError {
+    fn from(err: option_chain_orderbook::Error) -> Self {
+        Self::OrderBook(err.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::BacktestError;

@@ -853,3 +853,123 @@ proptest! {
         }
     }
 }
+
+// --- realistic-mode cents↔tick scaling (feature `orderbook`, #22) -------------
+
+/// A resolved call contract at `TS0 + 30 days` for the realistic-scaling
+/// properties.
+#[cfg(feature = "orderbook")]
+fn ob_contract() -> ContractKey {
+    let underlying = match Underlying::new("SPX") {
+        Ok(u) => u,
+        Err(e) => unreachable!("SPX is valid: {e}"),
+    };
+    ContractKey {
+        underlying,
+        expiration: ExpirationDate::DateTime(chrono::DateTime::from_timestamp_nanos(
+            TS0 + 30 * NANOS_PER_DAY,
+        )),
+        strike: PriceCents::new(510_000),
+        style: OptionStyle::Call,
+    }
+}
+
+/// A one-contract snapshot for [`ob_contract`] with the given tick and touch.
+#[cfg(feature = "orderbook")]
+fn ob_snapshot(tick: u64, bid: u64, ask: u64) -> Option<ChainSnapshot> {
+    let underlying = Underlying::new("SPX").ok()?;
+    let spec = InstrumentSpec::new(PriceCents::new(tick), 100).ok()?;
+    let size = Quantity::new(10).ok()?;
+    let quote = QuoteView {
+        contract: ob_contract(),
+        bid: PriceCents::new(bid),
+        ask: PriceCents::new(ask),
+        mid: PriceCents::new((bid + ask) / 2),
+        bid_size: size,
+        ask_size: size,
+        implied_volatility: Decimal::ZERO,
+        delta: Decimal::ZERO,
+        gamma: Decimal::ZERO,
+        theta: Decimal::ZERO,
+        vega: Decimal::ZERO,
+    };
+    let mut quotes = BTreeMap::new();
+    quotes.insert(ob_contract(), quote);
+    Some(ChainSnapshot {
+        ts: SimTime::new(TS0),
+        step: StepIndex::new(0),
+        underlying,
+        underlying_price: PriceCents::new(510_000),
+        spec,
+        quotes,
+    })
+}
+
+#[cfg(feature = "orderbook")]
+proptest! {
+    /// A tick-aligned executed price survives the cents→tick→cents round-trip:
+    /// seed an ask at a tick-aligned `price`, cross it with a marketable buy,
+    /// and the resulting `Fill.price` is exactly `price` — the scaling is
+    /// lossless for any tick the book executes at.
+    #[test]
+    fn realistic_price_to_tick_roundtrip(tick_idx in 0usize..5, ticks_count in 1u64..1000) {
+        let tick = [1u64, 5, 10, 25, 100][tick_idx];
+        let price = ticks_count * tick; // tick-aligned by construction
+        let one = match Quantity::new(1) { Ok(q) => q, Err(_) => return Ok(()) };
+        let fees = FeeSchedule { per_contract_cents: 0, per_order_cents: 0 };
+        let mut model = ironcondor::RealisticFill::new(fees, 10, 7);
+        let seeded = model.seed_maker_limit(
+            &ob_contract(), true, PriceCents::new(price), one, PriceCents::new(tick),
+        );
+        prop_assert!(seeded.is_ok());
+        let Some(snap) = ob_snapshot(tick, price, price) else { return Ok(()); };
+        let buy = OrderCommand::Submit(OrderIntent {
+            contract: ob_contract(),
+            action: PositionAction::Open,
+            side: Side::Long,
+            quantity: one,
+            limit: None,
+            tif: TimeInForce::Ioc,
+            decision_mid: PriceCents::new(price),
+        });
+        let mut out: Vec<Fill> = Vec::new();
+        prop_assert!(model.fill(&[buy], &snap, &mut out).is_ok());
+        prop_assert_eq!(out.len(), 1);
+        let Some(fill) = out.first() else { return Ok(()); };
+        prop_assert_eq!(fill.price.value(), price);
+    }
+
+    /// A strategy limit off the tick grid is rejected with
+    /// [`BacktestError::PriceNotTickAligned`], carrying the offending price and
+    /// tick, before any book operation.
+    #[test]
+    fn realistic_price_rejected_when_not_tick_aligned(tick_idx in 0usize..4, base in 1u64..1000, off_raw in 0u64..1_000_000) {
+        let tick = [5u64, 10, 25, 100][tick_idx];
+        let off = 1 + (off_raw % (tick - 1)); // 1..=tick-1 ⇒ never a multiple
+        let price = base * tick + off;
+        let one = match Quantity::new(1) { Ok(q) => q, Err(_) => return Ok(()) };
+        let fees = FeeSchedule { per_contract_cents: 0, per_order_cents: 0 };
+        let mut model = ironcondor::RealisticFill::new(fees, 10, 7);
+        let Some(snap) = ob_snapshot(tick, 0, price + tick) else { return Ok(()); };
+        let submit = OrderCommand::Submit(OrderIntent {
+            contract: ob_contract(),
+            action: PositionAction::Open,
+            side: Side::Long,
+            quantity: one,
+            limit: Some(PriceCents::new(price)),
+            tif: TimeInForce::Ioc,
+            decision_mid: PriceCents::new(price),
+        });
+        let mut out: Vec<Fill> = Vec::new();
+        let result = model.fill(&[submit], &snap, &mut out);
+        // Bind the match to a bool first: `prop_assert!` stringifies its
+        // condition into a format string, and `{ price: p }` braces would be
+        // read as format placeholders.
+        let rejected = match result {
+            Err(BacktestError::PriceNotTickAligned { price: p, tick: t }) => p == price && t == tick,
+            _ => false,
+        };
+        prop_assert!(rejected);
+        prop_assert!(out.is_empty());
+    }
+}

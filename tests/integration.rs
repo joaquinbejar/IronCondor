@@ -306,3 +306,117 @@ fn test_iron_condor_run_is_byte_identical_across_two_runs() {
     assert_eq!(first.result.final_capital, second.result.final_capital);
     assert_eq!(first.result.initial_capital, second.result.initial_capital);
 }
+
+/// Realistic-mode adapter (feature `orderbook`, #22): submit → capture → `Fill`
+/// round-trip against a **hand-seeded leaf book**. Seeds a two-level ask ladder
+/// through the public [`ironcondor::RealisticFill::seed_maker_limit`] primitive,
+/// routes a marketable buy through [`ironcondor::ExecutionModel::fill`], and
+/// asserts the two per-level fills come back at the seeded prices with the
+/// once-per-order fee only on the first — all through the public API, with no
+/// `option_chain_orderbook` type crossing the seam.
+#[cfg(feature = "orderbook")]
+#[test]
+fn test_realistic_marketable_buy_round_trips_two_seeded_levels() {
+    use ironcondor::{
+        ChainSnapshot, ContractKey, ExecutionMode, ExecutionModel, FeeSchedule, Fill,
+        InstrumentSpec, OrderCommand, OrderIntent, PositionAction, PriceCents, Quantity, QuoteView,
+        RealisticFill, SimTime, StepIndex, TimeInForce, Underlying,
+    };
+    use optionstratlib::{ExpirationDate, OptionStyle, Side};
+    use std::collections::BTreeMap;
+
+    const TICK: u64 = 5;
+
+    let underlying = match Underlying::new("SPX") {
+        Ok(u) => u,
+        Err(e) => panic!("SPX is valid: {e}"),
+    };
+    let contract = ContractKey {
+        underlying: underlying.clone(),
+        expiration: ExpirationDate::DateTime(chrono::DateTime::from_timestamp_nanos(EXPIRY)),
+        strike: PriceCents::new(510_000),
+        style: OptionStyle::Call,
+    };
+    let (Ok(spec), Ok(three), Ok(two), Ok(size)) = (
+        InstrumentSpec::new(PriceCents::new(TICK), 100),
+        Quantity::new(3),
+        Quantity::new(2),
+        Quantity::new(10),
+    ) else {
+        panic!("fixture spec/quantities must be valid");
+    };
+
+    let mut model = RealisticFill::new(
+        FeeSchedule {
+            per_contract_cents: 65,
+            per_order_cents: 100,
+        },
+        10,
+        7,
+    );
+    // Hand-seed a two-level ask ladder: 3 @ 500, 2 @ 505.
+    for (price, qty) in [(500u64, three), (505u64, two)] {
+        let seeded = model.seed_maker_limit(
+            &contract,
+            true,
+            PriceCents::new(price),
+            qty,
+            PriceCents::new(TICK),
+        );
+        assert!(matches!(seeded, Ok(())), "the maker ladder must rest");
+    }
+
+    let quote = QuoteView {
+        contract: contract.clone(),
+        bid: PriceCents::new(490),
+        ask: PriceCents::new(500),
+        mid: PriceCents::new(495),
+        bid_size: size,
+        ask_size: size,
+        implied_volatility: rust_decimal::Decimal::ZERO,
+        delta: rust_decimal::Decimal::ZERO,
+        gamma: rust_decimal::Decimal::ZERO,
+        theta: rust_decimal::Decimal::ZERO,
+        vega: rust_decimal::Decimal::ZERO,
+    };
+    let mut quotes = BTreeMap::new();
+    quotes.insert(contract.clone(), quote);
+    let snap = ChainSnapshot {
+        ts: SimTime::new(TS0),
+        step: StepIndex::new(0),
+        underlying,
+        underlying_price: PriceCents::new(510_000),
+        spec,
+        quotes,
+    };
+
+    // Marketable buy for 5 (= 3 + 2), captured back as two fills.
+    let buy = OrderCommand::Submit(OrderIntent {
+        contract: contract.clone(),
+        action: PositionAction::Open,
+        side: Side::Long,
+        quantity: match Quantity::new(5) {
+            Ok(q) => q,
+            Err(e) => panic!("5 is a valid quantity: {e}"),
+        },
+        limit: None,
+        tif: TimeInForce::Ioc,
+        decision_mid: PriceCents::new(500),
+    });
+    let mut out: Vec<Fill> = Vec::new();
+    let result = model.fill(&[buy], &snap, &mut out);
+    assert!(matches!(result, Ok(())), "the marketable buy must route");
+    assert_eq!(out.len(), 2, "the order walks two seeded levels");
+
+    let (Some(first), Some(second)) = (out.first(), out.get(1)) else {
+        panic!("two fills expected");
+    };
+    assert_eq!(first.price.value(), 500);
+    assert_eq!(first.quantity.value(), 3);
+    assert_eq!(first.fees.value(), 3 * 65 + 100); // per-contract + once-per-order
+    assert_eq!(first.mode, ExecutionMode::Realistic);
+    assert_eq!(second.price.value(), 505);
+    assert_eq!(second.quantity.value(), 2);
+    assert_eq!(second.fees.value(), 2 * 65); // per-contract only (later fill)
+    assert_eq!(first.contract, second.contract);
+}
