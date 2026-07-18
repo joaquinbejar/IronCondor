@@ -684,3 +684,193 @@ fn test_realistic_ignores_slippage_model_config() {
     );
     assert_eq!(none.open_at_end, fixed.open_at_end);
 }
+
+/// #025 consecutive-snapshot refresh (feature `orderbook`): a resting strategy
+/// limit fills **exactly** when a later snapshot's quotes cross it — via a
+/// refresh-generated fill on reseed — its price-time priority preserved across
+/// refreshes, and earlier seeded depth never leaking into a later step. Driven
+/// through the public `RealisticFill` + `ExecutionModel` API over four
+/// consecutive snapshots, the normative between-snapshot transition
+/// ([docs/04 §6.1](../docs/04-execution-models.md)).
+#[cfg(feature = "orderbook")]
+#[test]
+fn test_realistic_resting_limit_fills_when_consecutive_snapshot_crosses() {
+    use ironcondor::{
+        ChainSnapshot, ContractKey, ExecutionMode, ExecutionModel, FeeSchedule, Fill,
+        InstrumentSpec, LiquidityProfile, OrderCommand, OrderIntent, PositionAction, PriceCents,
+        Quantity, QuoteView, RealisticFill, SimTime, StepIndex, TimeInForce, TouchSize, Underlying,
+    };
+    use optionstratlib::{ExpirationDate, OptionStyle, Side};
+    use std::collections::BTreeMap;
+
+    const TICK: u64 = 5;
+
+    let underlying = match Underlying::new("SPX") {
+        Ok(u) => u,
+        Err(e) => panic!("SPX is valid: {e}"),
+    };
+    let contract = ContractKey {
+        underlying: underlying.clone(),
+        expiration: ExpirationDate::DateTime(chrono::DateTime::from_timestamp_nanos(EXPIRY)),
+        strike: PriceCents::new(510_000),
+        style: OptionStyle::Call,
+    };
+
+    // A stepped, per-side-sized single-contract snapshot builder.
+    let snap = |step: u32, bid: u64, ask: u64, bid_size: u32, ask_size: u32| -> ChainSnapshot {
+        let (spec, bq, aq) = match (
+            InstrumentSpec::new(PriceCents::new(TICK), 100),
+            Quantity::new(bid_size),
+            Quantity::new(ask_size),
+        ) {
+            (Ok(s), Ok(b), Ok(a)) => (s, b, a),
+            _ => panic!("spec/sizes must be valid"),
+        };
+        let quote = QuoteView {
+            contract: contract.clone(),
+            bid: PriceCents::new(bid),
+            ask: PriceCents::new(ask),
+            mid: PriceCents::new((bid + ask) / 2),
+            bid_size: bq,
+            ask_size: aq,
+            implied_volatility: rust_decimal::Decimal::ZERO,
+            delta: rust_decimal::Decimal::ZERO,
+            gamma: rust_decimal::Decimal::ZERO,
+            theta: rust_decimal::Decimal::ZERO,
+            vega: rust_decimal::Decimal::ZERO,
+        };
+        let mut quotes = BTreeMap::new();
+        quotes.insert(contract.clone(), quote);
+        ChainSnapshot {
+            ts: SimTime::new(TS0 + i64::from(step)),
+            step: StepIndex::new(step),
+            underlying: underlying.clone(),
+            underlying_price: PriceCents::new(510_000),
+            spec,
+            quotes,
+        }
+    };
+
+    // QuotedSize touch, L = 0 — one resting level per side at the quoted touch.
+    let profile = LiquidityProfile {
+        touch_size: TouchSize::QuotedSize,
+        depth_levels: 0,
+        decay: rust_decimal::Decimal::new(5, 1),
+    };
+    let mut model = RealisticFill::with_liquidity_profile(
+        FeeSchedule {
+            per_contract_cents: 65,
+            per_order_cents: 100,
+        },
+        10,
+        7,
+        profile,
+    );
+
+    // A resting GTC strategy buy limit at 500 for 1 (decision mid 550).
+    let one = match Quantity::new(1) {
+        Ok(q) => q,
+        Err(e) => panic!("1 is a valid quantity: {e}"),
+    };
+    let buy = OrderCommand::Submit(OrderIntent {
+        contract: contract.clone(),
+        action: PositionAction::Open,
+        side: Side::Long,
+        quantity: one,
+        limit: Some(PriceCents::new(500)),
+        tif: TimeInForce::Gtc,
+        decision_mid: PriceCents::new(550),
+    });
+
+    let mut out: Vec<Fill> = Vec::new();
+
+    // snap0: wide ask 600, DEEP size 100. The buy rests below the ask — no fill.
+    // This deep seed must NOT leak into later steps.
+    match model.fill(&[buy], &snap(0, 490, 600, 100, 100), &mut out) {
+        Ok(()) => {}
+        Err(e) => panic!("snap0 must route: {e}"),
+    }
+    assert!(
+        out.is_empty(),
+        "the buy at 500 does not cross the 600 ask (no fill yet)"
+    );
+
+    // snap1: ask narrows to 540 but stays above 500 — the refresh cancels the
+    // deep snap0 seed and reseeds thin depth; the strategy order survives,
+    // unfilled, its aged priority intact (never cancelled or reinserted).
+    out.clear();
+    match model.fill(&[], &snap(1, 490, 540, 4, 4), &mut out) {
+        Ok(()) => {}
+        Err(e) => panic!("snap1 must refresh: {e}"),
+    }
+    assert!(
+        out.is_empty(),
+        "the resting strategy order survives the refresh unfilled"
+    );
+
+    // snap2: ask crosses at 500 — the resting buy fills via a refresh-generated
+    // fill, at its own limit price (aged priority), tagged to the crossing step.
+    out.clear();
+    match model.fill(&[], &snap(2, 490, 500, 4, 4), &mut out) {
+        Ok(()) => {}
+        Err(e) => panic!("snap2 must refresh: {e}"),
+    }
+    assert_eq!(
+        out.len(),
+        1,
+        "exactly one refresh fill when the market crosses"
+    );
+    let Some(fill) = out.first() else {
+        panic!("one refresh fill expected");
+    };
+    assert_eq!(fill.side, Side::Long);
+    assert_eq!(
+        fill.price.value(),
+        500,
+        "fills at the resting limit's own price"
+    );
+    assert_eq!(fill.quantity.value(), 1);
+    assert_eq!(
+        fill.step.value(),
+        2,
+        "the fill belongs to the crossing step"
+    );
+    assert_eq!(fill.mode, ExecutionMode::Realistic);
+    // decision mid 550, bought at 500 (below mid) ⇒ favourable: negative slippage.
+    assert_eq!(fill.slippage.value(), -50);
+
+    // No leak: at snap2 the reseed ask (4 @ 500) crossed the buy (1), leaving 3
+    // resting. snap3 must cancel that stale 3 and reseed a fresh 4 @ 500. A
+    // marketable buy for 10 then fills EXACTLY 4 — were the stale 3 still resting
+    // it would fill 7.
+    let ten = match Quantity::new(10) {
+        Ok(q) => q,
+        Err(e) => panic!("10 is a valid quantity: {e}"),
+    };
+    out.clear();
+    match model.fill(
+        &[OrderCommand::Submit(OrderIntent {
+            contract: contract.clone(),
+            action: PositionAction::Open,
+            side: Side::Long,
+            quantity: ten,
+            limit: None,
+            tif: TimeInForce::Ioc,
+            decision_mid: PriceCents::new(500),
+        })],
+        &snap(3, 490, 500, 4, 4),
+        &mut out,
+    ) {
+        Ok(()) => {}
+        Err(e) => panic!("snap3 must route: {e}"),
+    }
+    let matched: u32 = out.iter().map(|f| f.quantity.value()).sum();
+    assert_eq!(
+        matched, 4,
+        "only snap3's fresh 4 @ 500 fills — no earlier seed leaked"
+    );
+    assert!(
+        out.iter().all(|f| f.price.value() == 500),
+        "every fill at the fresh touch, none at a stale level"
+    );
+}

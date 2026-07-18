@@ -1039,3 +1039,125 @@ proptest! {
         }
     }
 }
+
+// --- realistic between-snapshot refresh determinism (feature `orderbook`, #25)
+
+/// A stepped, per-side-sized snapshot for [`ob_contract`] — the multi-snapshot
+/// refresh determinism fixture (#025).
+#[cfg(feature = "orderbook")]
+fn ob_snapshot_full(
+    step: u32,
+    bid: u64,
+    ask: u64,
+    bid_size: u32,
+    ask_size: u32,
+) -> Option<ChainSnapshot> {
+    let underlying = Underlying::new("SPX").ok()?;
+    let spec = InstrumentSpec::new(PriceCents::new(5), 100).ok()?;
+    let bq = Quantity::new(bid_size).ok()?;
+    let aq = Quantity::new(ask_size).ok()?;
+    let quote = QuoteView {
+        contract: ob_contract(),
+        bid: PriceCents::new(bid),
+        ask: PriceCents::new(ask),
+        mid: PriceCents::new((bid + ask) / 2),
+        bid_size: bq,
+        ask_size: aq,
+        implied_volatility: Decimal::ZERO,
+        delta: Decimal::ZERO,
+        gamma: Decimal::ZERO,
+        theta: Decimal::ZERO,
+        vega: Decimal::ZERO,
+    };
+    let mut quotes = BTreeMap::new();
+    quotes.insert(ob_contract(), quote);
+    Some(ChainSnapshot {
+        ts: SimTime::new(TS0 + i64::from(step)),
+        step: StepIndex::new(step),
+        underlying,
+        underlying_price: PriceCents::new(510_000),
+        spec,
+        quotes,
+    })
+}
+
+/// #025 determinism: `same_seed_same_result` over a **multi-snapshot realistic
+/// run** exercising the between-snapshot refresh. Two runs over the same three
+/// consecutive snapshots — a resting strategy limit the reseed crosses on the
+/// final snapshot — produce byte-identical fill sequences (step, price, size,
+/// fees, slippage). The refresh (cancel stale seed → reseed in fixed order →
+/// capture) draws no wall clock and no unseeded RNG, so the tape fully pins the
+/// output.
+#[cfg(feature = "orderbook")]
+#[test]
+fn test_same_seed_same_result_realistic_multi_snapshot_refresh() {
+    let run = || -> Vec<(u32, u64, u32, i64, i64)> {
+        let profile = ironcondor::LiquidityProfile {
+            touch_size: ironcondor::TouchSize::QuotedSize,
+            depth_levels: 0,
+            decay: Decimal::new(5, 1),
+        };
+        let fees = FeeSchedule {
+            per_contract_cents: 65,
+            per_order_cents: 100,
+        };
+        let mut model = ironcondor::RealisticFill::with_liquidity_profile(fees, 10, 7, profile);
+        let one = match Quantity::new(1) {
+            Ok(q) => q,
+            Err(e) => panic!("1 is a valid quantity: {e}"),
+        };
+        // A GTC strategy buy at 500: rests at snap0, untouched at snap1, crossed
+        // by the reseed at snap2 (a refresh-generated fill).
+        let buy = OrderCommand::Submit(OrderIntent {
+            contract: ob_contract(),
+            action: PositionAction::Open,
+            side: Side::Long,
+            quantity: one,
+            limit: Some(PriceCents::new(500)),
+            tif: TimeInForce::Gtc,
+            decision_mid: PriceCents::new(550),
+        });
+        let snaps = [
+            ob_snapshot_full(0, 490, 600, 20, 20),
+            ob_snapshot_full(1, 490, 540, 20, 20),
+            ob_snapshot_full(2, 490, 500, 20, 20),
+        ];
+        let mut fills: Vec<(u32, u64, u32, i64, i64)> = Vec::new();
+        let mut out: Vec<Fill> = Vec::new();
+        for (i, snap) in snaps.iter().enumerate() {
+            let Some(snap) = snap else {
+                panic!("every refresh snapshot must build");
+            };
+            out.clear();
+            let cmds: Vec<OrderCommand> = if i == 0 {
+                vec![buy.clone()]
+            } else {
+                Vec::new()
+            };
+            match model.fill(&cmds, snap, &mut out) {
+                Ok(()) => {}
+                Err(e) => panic!("the multi-snapshot refresh run must succeed: {e}"),
+            }
+            for f in &out {
+                fills.push((
+                    f.step.value(),
+                    f.price.value(),
+                    f.quantity.value(),
+                    f.fees.value(),
+                    f.slippage.value(),
+                ));
+            }
+        }
+        fills
+    };
+    let a = run();
+    let b = run();
+    assert!(
+        !a.is_empty(),
+        "the resting buy fills on the crossing snapshot"
+    );
+    assert_eq!(
+        a, b,
+        "same (seed, config, data) ⇒ byte-identical refresh fills"
+    );
+}
