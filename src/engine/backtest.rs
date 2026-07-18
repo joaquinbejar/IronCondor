@@ -53,7 +53,7 @@ use rand_chacha::ChaCha8Rng;
 use rand_chacha::rand_core::SeedableRng;
 use rust_decimal::Decimal;
 
-use optionstratlib::backtesting::BacktestResult;
+use optionstratlib::backtesting::{BacktestResult, ExitReason};
 
 use crate::config::BacktestConfig;
 use crate::data::DataFeed;
@@ -65,6 +65,7 @@ use crate::engine::clock::SimClock;
 use crate::engine::ledger::Ledger;
 use crate::engine::strategy::{ChainContext, Strategy};
 use crate::engine::substrate::{AttributionCollector, AttributionSubstrate};
+use crate::engine::tradelog::{ClosedTrade, TradeLogCollector};
 use crate::error::BacktestError;
 use crate::execution::ExecutionModel;
 
@@ -157,6 +158,12 @@ pub struct BacktestRun {
     /// The legs still open when the feed exhausted (`open_at_end = true`),
     /// marked-to-last at `S_last` mid — never force-closed.
     pub open_at_end: Vec<OpenPosition>,
+    /// One [`ClosedTrade`] per realised leg close, in close order — the owned
+    /// per-trade log the post-run metrics pass ([`crate::analytics::metrics`],
+    /// #32) reads for per-leg realised P&L and [`ExitReason`]. The engine
+    /// **collects** it (it cannot import `analytics`); the composition root runs
+    /// the metrics pass over it, exactly as for [`Self::attribution_substrate`].
+    pub trade_log: Vec<ClosedTrade>,
     /// The per-step, per-leg **attribution substrate** the loop collected — the
     /// owned inputs the post-run P&L-attribution pass consumes
     /// ([`crate::engine::substrate`], #31).
@@ -244,6 +251,7 @@ impl BacktestEngine {
             fills: Vec::with_capacity(16),
             equity_curve: Vec::with_capacity(capacity),
             attribution: AttributionCollector::with_capacity(capacity),
+            trade_log: TradeLogCollector::with_capacity(16),
         };
 
         // Peek S0: the feed has no `peek`, so pull it and hold it as the
@@ -266,6 +274,11 @@ impl BacktestEngine {
         state
             .attribution
             .reserve_legs(capacity, state.inventory.len());
+        // Each opening leg closes at most once, so the trade log is bounded by
+        // the opening leg count for a hold-to-close run; reserving here keeps a
+        // close an amortised push (a run that opens more later grows amortised at
+        // that transient, never on a warm step). PB-1-safe.
+        state.trade_log.reserve(state.inventory.len());
 
         // --- Per-step loop (§3.2) + termination (§3.3) ----------------------
         // `last_ts` is assigned exactly once, at the terminal-step break — the
@@ -304,12 +317,14 @@ impl BacktestEngine {
             equity_curve,
             inventory,
             attribution,
+            trade_log,
             ..
         } = state;
         Ok(BacktestRun {
             result,
             equity_curve,
             open_at_end: inventory,
+            trade_log: trade_log.into_log(),
             attribution_substrate: attribution.into_substrate(),
             // Empty by design — analytics fills it post-run (see the type docs).
             greeks_attribution: Vec::new(),
@@ -336,6 +351,10 @@ struct RunState<S: Strategy, X: ExecutionModel> {
     /// analytics pass consumes (#31). Sized at `on_start`, pushed amortised each
     /// step — PB-1-safe, never a per-step allocation on a constant-leg run.
     attribution: AttributionCollector,
+    /// Collects one [`ClosedTrade`] per realised leg close the post-run metrics
+    /// pass consumes (#32). Reserved at `on_start`; a close is an amortised push
+    /// and a warm step touches it not at all — PB-1-safe.
+    trade_log: TradeLogCollector,
 }
 
 impl<S: Strategy, X: ExecutionModel> RunState<S, X> {
@@ -352,6 +371,7 @@ impl<S: Strategy, X: ExecutionModel> RunState<S, X> {
             inventory,
             cmds,
             fills,
+            trade_log,
             ..
         } = self;
         cmds.clear();
@@ -367,6 +387,13 @@ impl<S: Strategy, X: ExecutionModel> RunState<S, X> {
         }
         fills.clear();
         execution.fill(cmds.as_slice(), snapshot, fills)?;
+        // Startup emits opening intents only, so no close reason is consulted;
+        // the ranges make every `Close` (were one ever emitted) a ManualClose.
+        let reasons = CloseReasons {
+            exits_end: 0,
+            on_end_start: cmds.len(),
+            policy_reason: ExitReason::ManualClose,
+        };
         apply_step_fills(
             cmds.as_slice(),
             fills.as_slice(),
@@ -374,6 +401,8 @@ impl<S: Strategy, X: ExecutionModel> RunState<S, X> {
             inventory,
             ids,
             ledger,
+            trade_log,
+            &reasons,
         )?;
         Ok(())
     }
@@ -393,6 +422,7 @@ impl<S: Strategy, X: ExecutionModel> RunState<S, X> {
             fills,
             equity_curve,
             attribution,
+            trade_log,
         } = self;
 
         // a. advance the clock (rejects a non-increasing ts as DataOutOfOrder).
@@ -410,6 +440,10 @@ impl<S: Strategy, X: ExecutionModel> RunState<S, X> {
             };
             strategy.exits(&ctx, cmds)?;
         }
+        // Closes in `cmds[0..exits_end)` are the exit-policy phase's — their
+        // trade-log ExitReason is the applied policy's (queried once, and ONLY
+        // when the phase produced a close, so it is off the warm-step path).
+        let exits_end = cmds.len();
         // d. entries/adjustments appended AFTER the exits.
         {
             let mut ctx = ChainContext {
@@ -422,8 +456,9 @@ impl<S: Strategy, X: ExecutionModel> RunState<S, X> {
             strategy.on_snapshot(&mut ctx, cmds)?;
         }
         // §3.3: on_end runs INSIDE the final step; it may append closes only.
+        // Closes at or after `on_end_start` are the terminal end-of-data closes.
+        let on_end_start = cmds.len();
         if is_last {
-            let len_before = cmds.len();
             {
                 let mut ctx = ChainContext {
                     snapshot,
@@ -434,15 +469,30 @@ impl<S: Strategy, X: ExecutionModel> RunState<S, X> {
                 };
                 strategy.on_end(&mut ctx, cmds)?;
             }
-            reject_non_close(cmds.get(len_before..).unwrap_or(&[]))?;
+            reject_non_close(cmds.get(on_end_start..).unwrap_or(&[]))?;
         }
+
+        // The exit-policy reason is queried only when the exits phase produced a
+        // close (a real policy trigger) — never on a warm step, so it is off the
+        // PB-1 step path. A no-close step uses a non-allocating placeholder.
+        let policy_reason = if exits_end > 0 {
+            strategy.exit_reason()
+        } else {
+            ExitReason::ManualClose
+        };
+        let reasons = CloseReasons {
+            exits_end,
+            on_end_start,
+            policy_reason,
+        };
 
         // e. the single execution phase (naive = e2 only; realistic e1 is v0.2).
         fills.clear();
         execution.fill(cmds.as_slice(), snapshot, fills)?;
 
         // Mint ids + update the inventory + move cash (close validation lives in
-        // apply_step_fills, which fails an unknown/oversized close as Execution).
+        // apply_step_fills, which fails an unknown/oversized close as Execution),
+        // and record the per-leg trade log on opens and closes.
         apply_step_fills(
             cmds.as_slice(),
             fills.as_slice(),
@@ -450,6 +500,8 @@ impl<S: Strategy, X: ExecutionModel> RunState<S, X> {
             inventory,
             ids,
             ledger,
+            trade_log,
+            &reasons,
         )?;
 
         // f. the ONE ledger mutation for the step ⇒ the step's single point.
@@ -494,28 +546,68 @@ fn reject_non_close(on_end_cmds: &[OrderCommand]) -> Result<(), BacktestError> {
     Ok(())
 }
 
+/// The per-step close-phase ranges the loop hands [`apply_step_fills`] so it can
+/// attribute each `Close`'s [`ExitReason`] to the phase that emitted it: the
+/// exit-policy phase (`cmds[0..exits_end)`), the terminal end-of-data phase
+/// (`cmds[on_end_start..)`), or an in-step strategy adjustment (in between).
+struct CloseReasons {
+    /// One past the last exit-policy close index — closes below it are the
+    /// applied [`ExitPolicy`]'s.
+    exits_end: usize,
+    /// The first `on_end` (terminal) close index — closes at or after it are
+    /// end-of-data closes. Equal to `cmds.len()` on a non-terminal step.
+    on_end_start: usize,
+    /// The reason for the exit-policy closes (the applied policy's), queried
+    /// once per step and only when the exits phase produced a close.
+    policy_reason: ExitReason,
+}
+
+impl CloseReasons {
+    /// The [`ExitReason`] for the `Close` at command index `idx`.
+    fn reason_for(&self, idx: usize) -> ExitReason {
+        if idx < self.exits_end {
+            self.policy_reason.clone()
+        } else if idx >= self.on_end_start {
+            // The feed exhausted and `on_end` flattened the leg — not an
+            // options-expiry, not a policy trigger. Recorded honestly as an
+            // end-of-data close (no dedicated upstream variant exists for it).
+            ExitReason::Other("end_of_data".to_string())
+        } else {
+            // A close a strategy emitted from `on_snapshot` (an adjustment).
+            ExitReason::ManualClose
+        }
+    }
+}
+
 /// Correlate the step's fills back to its commands to mint lifecycle ids,
-/// update the position inventory, and move the ledger cash.
+/// update the position inventory, move the ledger cash, and record the per-leg
+/// trade log on opens and closes.
 ///
 /// Naive mode fills every `Submit` single-shot and in submission order, and
 /// produces no fill for a `Cancel` / `Replace`, so the fills line up with the
 /// `Submit`s one-to-one. Each `Submit` mints one [`OrderId`]; a group of `Open`s
 /// in one step shares one freshly minted [`TradeId`]; each `Open` mints a
-/// [`PositionId`] and pushes an inventory leg; each `Close` reduces (partial) or
-/// removes (full) its leg after validating the quantity. Cash moves through the
-/// ledger for every fill.
+/// [`PositionId`], pushes an inventory leg, and records the leg's open in the
+/// trade log; each `Close` reduces (partial) or removes (full) its leg after
+/// validating the quantity, and records a realised [`ClosedTrade`] with the
+/// phase's [`ExitReason`]. Cash moves through the ledger for every fill.
 ///
-/// The `OrderId` / `TradeId` are minted (advancing the seeded counters
-/// deterministically) but not surfaced by #14: the bundle rows that carry them
-/// (`FillRow` / `PositionRow`) land at v0.3, so the ids are computed in the
-/// correct pattern now and become stable outputs then.
+/// The `OrderId` is minted (advancing the seeded counter deterministically) but
+/// not surfaced by #14: the bundle row that carries it (`FillRow`) lands at
+/// v0.3, so the id is computed in the correct pattern now and becomes a stable
+/// output then.
 ///
 /// # Errors
 ///
 /// - [`BacktestError::Execution`] if a `Close` names an unknown leg or an
 ///   oversized quantity, or if the fill count does not match the submit count
 ///   (multi-level / refresh fills are a v0.2 realistic-mode concern).
-/// - [`BacktestError::ArithmeticOverflow`] from id minting or the ledger.
+/// - [`BacktestError::ArithmeticOverflow`] from id minting, the ledger, or the
+///   trade log's realised-P&L arithmetic.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the correlation step threads the loop's per-step buffers, id counters, ledger, trade log, and close-phase ranges; splitting it would fragment the single fill-correlation pass"
+)]
 fn apply_step_fills(
     cmds: &[OrderCommand],
     fills: &[Fill],
@@ -523,12 +615,15 @@ fn apply_step_fills(
     inventory: &mut Vec<OpenPosition>,
     ids: &mut IdCounters,
     ledger: &mut Ledger,
+    trade_log: &mut TradeLogCollector,
+    reasons: &CloseReasons,
 ) -> Result<(), BacktestError> {
     let multiplier = snapshot.spec.contract_multiplier;
+    let ts_ns = snapshot.ts.value();
     let mut fills_iter = fills.iter();
     // One trade_id per step's group of Open intents.
     let mut step_trade: Option<TradeId> = None;
-    for cmd in cmds {
+    for (idx, cmd) in cmds.iter().enumerate() {
         match cmd {
             OrderCommand::Submit(intent) => {
                 let _order_id = ids.mint_order()?; // v0.3 FillRow.order_id
@@ -544,7 +639,7 @@ fn apply_step_fills(
                 );
                 match intent.action {
                     PositionAction::Open => {
-                        let _trade_id = match step_trade {
+                        let trade_id = match step_trade {
                             Some(existing) => existing,
                             None => {
                                 let minted = ids.mint_trade()?;
@@ -560,9 +655,28 @@ fn apply_step_fills(
                             quantity: fill.quantity,
                             entry_premium: fill.price,
                         });
+                        trade_log.record_open(
+                            position_id,
+                            trade_id,
+                            fill.contract.clone(),
+                            fill.side,
+                            fill.quantity,
+                            fill.price,
+                            ts_ns,
+                        );
                     }
                     PositionAction::Close(position_id) => {
                         reduce_leg(inventory, position_id, fill.quantity)?;
+                        trade_log.record_close(
+                            position_id,
+                            fill.price,
+                            fill.fees,
+                            fill.slippage,
+                            ts_ns,
+                            fill.quantity,
+                            multiplier,
+                            reasons.reason_for(idx),
+                        )?;
                     }
                 }
                 ledger.apply_fill(fill, multiplier)?;

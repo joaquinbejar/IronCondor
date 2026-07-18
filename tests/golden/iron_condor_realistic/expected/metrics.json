@@ -1,8 +1,17 @@
 {
   "sharpe_ratio": "-0.4082482904638630172300395315",
+  "sortino_ratio": "-0.3779644730092272530974639721",
   "volatility": "0.0000931053762558448235169689",
   "total_return": "-0.000532",
   "max_drawdown": "0.0005320000000000000292890712",
   "max_drawdown_ratio": "-0.0005320000000000000292890712",
-  "max_drawdown_cents": 5320
+  "max_drawdown_cents": 5320,
+  "number_of_trades": 4,
+  "winners": 0,
+  "losers": 4,
+  "win_rate": "0",
+  "realized_pnl_cents": -4660,
+  "short_legs_realized_cents": -2330,
+  "long_legs_realized_cents": -2330,
+  "net_premium_cents": 2280
 }
