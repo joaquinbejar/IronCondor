@@ -557,6 +557,224 @@ This is the **v0.3 bundle-writer baseline** the future gate builds on:
   baseline**. This issue lands the **measurement**; #051 wraps it in the gate
   ([docs/07 §6](docs/07-performance-and-security.md#6-regression-gates-in-ci-before-v10)).
 
+---
+
+## H5 / PB-6 — PyO3 per-call overhead vs the batch path (v0.4 baseline, #43)
+
+Two complementary measurements, one on each side of the boundary:
+
+- **Bench (Rust side, marshalling cost):** `benches/pyo3_marshal.rs`
+  (`PYO3_PYTHON=python3.12 cargo bench --features python --bench pyo3_marshal`)
+  — `criterion` + `hdrhistogram`, driving the **real** registered `#[pymodule]`
+  in an embedded interpreter (`append_to_inittab!` + `Python::initialize`, the
+  same in-process mechanism as `tests/python_parity.rs`).
+- **Script (Python side, per-call vs batch):** `python/benches/pyo3_overhead.py`
+  — a **standalone, manually-run** script (deliberately **not** a `pytest`: the
+  filename is not `test_*` and it lives under `python/benches/`, so the <30 s test
+  gate never collects it). Run it against a **release** module:
+  ```bash
+  # from python/, into a 3.12 venv with maturin + pyarrow
+  maturin develop --release --features "python orderbook simulator"
+  python python/benches/pyo3_overhead.py           # --steps/--iters/--batch/--threads
+  ```
+- **Date measured:** 2026-07-16
+
+### What each measures — the honest isolation
+
+- **`marshal_full_config` (Rust):** building one fully-populated `BacktestConfig`
+  through the chainable builders — `BacktestConfig(seed, capital)` +
+  `.data_parquet` + `.strategy_iron_condor` + `.exit_time_steps` +
+  `.execution_naive` + `.fees` + `.output_dir` — i.e. the **marshal-in path**, the
+  seven Python→Rust trampoline crossings a caller performs *before* `ic.run()`
+  reaches the engine. **INSIDE** the timed region: the seven crossings, PyO3
+  argument extraction of every field (`int`→`u64`, `str`→`String`, `float`→`f64`,
+  the 17-key kwargs dict → the typed `IronCondorSpec` args), the Rust construction
+  each builder does — notably `strategy_iron_condor`'s `Underlying::new` grammar
+  check, `Quantity::new`, three `Decimal::try_from` conversions and its
+  `guard_boundary` `catch_unwind` — and the `#[pyclass]` allocation of the new
+  config. **OUTSIDE:** the input kwargs / fees `PyDict`s (pre-built once and
+  reused, so the timed cost is the *marshalling*, not Python-side dict
+  construction), the GIL acquire (held across the whole measurement — the
+  marshal-in path runs under the GIL in a real caller too, the GIL being *released*
+  only later inside `run()` around the engine), and the entire engine + writer.
+- **`marshal_single_call` (Rust):** one `.seed(u64)` builder crossing — the
+  **fixed per-boundary-call floor**: a single trampoline + one `u64` extract + the
+  `PyRefMut` self-return. Each timed sample runs an inner batch of **512**
+  crossings and records the **mean** per crossing (to lift the signal above
+  `Instant::now` resolution), so its percentiles are batch-mean percentiles.
+- **Documented gap (Rust):** `PyBacktestConfig::to_rust()` — the final marshal of
+  the wrapper into the real `BacktestConfig` + `StrategySpec` + `ExitPolicy` plus
+  `validate()` — is `pub(crate)` and **not reachable via the Python object
+  protocol**; it runs *inside* `run()` immediately before the (GIL-released)
+  engine, so it cannot be timed in isolation from the engine on the public
+  surface. `marshal_full_config` measures the builder marshal-in a caller pays
+  explicitly; the `to_rust()` finalisation is a bounded one-time extra folded into
+  `run()` (the same field copies + one `validate()` the builders already
+  exercise). The bench does **not** widen the binding's public surface to reach it.
+- **`ic.run()` single-call + batch (Python):** end-to-end wall time of one
+  `ic.run(cfg)` over a small fixed scenario (marshal-in under the GIL → the
+  **GIL-released** engine + bundle writer → the handle-out), then a fixed batch of
+  runs fanned across `ThreadPoolExecutor` worker threads for `N = 1, 2, 4, 8, 12,
+  16`. Because `run()` releases the GIL for the whole engine + writer
+  (`py.detach`, `src/python/run.rs`), the N Rust engines execute concurrently, so
+  the per-run wall time falls as N grows — the across-run parallelism the engine
+  is built for ([docs/06 §3](docs/06-python-bindings.md#3-gil-strategy),
+  [docs/02 §9](docs/02-engine-architecture.md#9-scenario-orchestration)). Only
+  `ic.run(cfg)` is inside the single-call timer; the config build is excluded (it
+  is the `marshal_full_config` quantity above).
+
+- **Workload / scale:** the same canonical four-leg iron condor as PB-2/PB-3
+  (short call 510000 / long call 520000 / short put 490000 / long put 480000,
+  tick-aligned to 5c, mids 2000/800/1800/700, seed `42`, non-triggering
+  `ExitPolicy::TimeSteps`). The Rust marshalling benches marshal that config with
+  **no engine run** (a dummy chain path that is never opened). The Python script
+  runs a **512-step** tape (4 legs, naive mode) per `ic.run()` — small enough to
+  keep the script quick, large enough that the GIL-released engine + writer give
+  the batch fan-out real work to overlap.
+- **Samples:** Rust `marshal_full_config` **8 022 203** recorded marshals; Rust
+  `marshal_single_call` **257 321** recorded batch-means (each the mean over 512
+  crossings). Python single-call **400** sequential `ic.run()` calls after a
+  30-run warmup; each batch point is **one** batch-wall sample (96 runs) after a
+  2-batch warmup.
+
+### Measured — Rust marshalling cost (`criterion` `bench` profile, hdrhistogram)
+
+| Rust boundary quantity | p50 | p99 | p99.9 | p99.99 | max |
+|------------------------|-----|-----|-------|--------|-----|
+| **`marshal_full_config`** (7 crossings, full strategy marshal) | **1250 ns (1.25 µs)** | 1584 ns | 1708 ns | 3667 ns | 61 183 ns |
+| **`marshal_single_call`** (one `.seed(u64)` crossing, batch-mean) | **78 ns** | 94 ns | 107 ns | 191 ns | 2375 ns |
+
+- **Per-crossing:** the trivial-crossing **floor is ≈ 78 ns** (trampoline + one
+  `u64` extract + self-return, GIL already held). The full 7-crossing config
+  marshal averages **≈ 179 ns/crossing** (1250 / 7) — higher than the floor
+  because it is dominated by the one heavy `strategy_iron_condor` crossing (17-arg
+  extract + `Underlying`/`Quantity`/three `Decimal::try_from` + `catch_unwind`),
+  not because a crossing is intrinsically expensive.
+- **criterion cross-check** (its own mean estimate, for sanity):
+  `marshal_full_config` `[1.2473 µs 1.2507 µs 1.2538 µs]`; `marshal_single_call`
+  `[40.287 µs 40.408 µs 40.543 µs]` **per 512-crossing batch** ⇒ 78.7–79.2
+  ns/crossing — both consistent with the hdrhistogram p50s, which validates the
+  measurement.
+
+### Measured — Python `ic.run()` per-call + batch (release module, warm)
+
+Single-call wall time (512-step scenario, closed-loop, 400 samples after warmup):
+
+| Python `ic.run()` (512 steps) | p50 | p90 | p99 | p99.9 | min | max |
+|-------------------------------|-----|-----|-----|-------|-----|-----|
+| **Wall / call** | **2.99 ms** | 3.10 ms | 3.28 ms | 3.36 ms | 2.88 ms | 3.36 ms |
+
+Batch amortisation — a fixed batch of **96** runs fanned across N worker threads,
+per-run = batch-wall / 96, speedup = per-run(1) / per-run(N):
+
+| Threads N | batch | batch wall | per-run | speedup |
+|-----------|-------|-----------|---------|---------|
+| 1 | 96 | 290.7 ms | 3.028 ms | 1.00× |
+| 2 | 96 | 187.8 ms | 1.957 ms | 1.55× |
+| 4 | 96 | 84.0 ms | 0.875 ms | 3.46× |
+| **8** | 96 | 53.4 ms | **0.557 ms** | **5.44×** |
+| 12 | 96 | 57.6 ms | 0.600 ms | 5.05× |
+| 16 | 96 | 58.5 ms | 0.610 ms | 4.97× |
+
+- **The batch amortises the per-run wall via across-run parallelism:** from **3.03
+  ms/run at N=1** down to **0.557 ms/run at N=8** (5.44×), i.e. throughput lifts
+  from **≈ 330 runs/sec to ≈ 1795 runs/sec** on the reference box. The curve
+  **saturates at ≈ N=8** and slightly *regresses* at 12/16 — past 8 concurrent
+  runs the **bundle writer's filesystem I/O** (each run atomically writes four
+  Parquet tables + a manifest via a temp-dir + rename) is the ceiling, **not** the
+  PyO3 boundary and **not** the GIL (which is released for the whole run). A second
+  independent pass (`--batch 64`) reproduced the shape: 1.00× / 1.81× / 3.55× /
+  5.14× for N = 1/2/4/8.
+
+### The boundary is a fraction of a percent of a run
+
+- **Marshal-in vs a full run:** the full config marshal-in **p50 ≈ 1.25 µs** is
+  **≈ 0.04 %** of a single 512-step `ic.run()` (**≈ 2.99 ms**) — about **1 part in
+  2400**. The per-crossing floor (**≈ 78 ns**) is smaller still.
+- **Where the 2.99 ms actually goes:** the engine (H1/PB-2 scaled to 512 steps ≈
+  512 × 2.35 µs/step ≈ **1.2 ms**) plus the bundle writer (H4/PB-5, ≈ **1.6–1.8
+  ms** for the ~3080-row four-table bundle) account for essentially all of it; the
+  PyO3 boundary is the ~0.04 % remainder. **The marshalling never dominates a
+  run** — it is already amortised into insignificance by the engine + writer cost
+  of even **one** run.
+
+**Coordinated-omission disclosure.** Every part is **closed-loop** — each marshal
+/ each `ic.run()` / each batch starts immediately after the previous finishes,
+with no external arrival schedule — so coordinated omission **does not apply**;
+the histograms record raw back-to-back latency (`record`, not `record_correct`).
+
+**Warmup.** Rust: an explicit 64-marshal un-recorded warmup on top of criterion's
+own. Python: a 30-run warmup before the single-call phase and a 2-batch warmup
+before the amortisation sweep; all single-call figures are steady-state.
+
+**Tail-resolution / sampling caveat (honest).** The Rust histograms are richly
+resolved (8.0 M / 257 k samples). The Python **single-call** percentiles rest on
+400 samples — p50/p90/p99 are solid, p99.9 is the observed max (treat as
+"≥ p99"). Each **batch** point is a **single** batch-wall sample (not a
+percentile), so the individual per-run numbers carry ≈ 10–15 % run-to-run noise
+(compare the N=2 point across the two passes: 1.55× vs 1.81×); the **curve shape**
+— strong amortisation through ~N=8, plateau/regression after — is the stable,
+reported result, not any single cell.
+
+### Run conditions
+
+| Field | Value |
+|-------|-------|
+| CPU | Apple M4 Max |
+| Cores | 16 (16 physical) |
+| Memory | 64 GiB |
+| OS | macOS 26.5.2 (build 25F84) |
+| Toolchain | rustc 1.97.0 (2d8144b78 2026-07-07) |
+| Python | 3.12.13 (Homebrew) |
+| Rust bench profile | `bench` (optimized, `cargo bench`, `PYO3_PYTHON=python3.12`) |
+| Python module build | `maturin develop --release --features "python orderbook simulator"` (optimized) |
+| PyO3 | 0.29.0 (`abi3-py310`) |
+| Bench harness | `criterion` 0.5.1, `harness = false`; Python percentiles are a pure sorted-array reduction (no numpy) |
+| Percentiles | `hdrhistogram` 7.5.4 (3 significant figures) on the Rust side |
+| `Cargo.lock` sha256 | `52e6e87afd51d878df63c046c2177946677ea92e5b59e55d1ed602063fabcb7b` |
+
+### Interpretation
+
+- **What the numbers mean.** One PyO3 boundary crossing costs **≈ 78 ns** and
+  marshalling a **complete** `BacktestConfig` costs **≈ 1.25 µs** on the reference
+  machine — **≈ 0.04 %** of even a small 512-step `ic.run()`. The Python cost of a
+  run is the engine + writer, not the boundary. Fanning a batch of independent
+  runs across GIL-releasing threads amortises the per-run **wall** time **5.4×**
+  (to ≈ 0.56 ms/run at 8 threads), saturating near the core count where the
+  writer's filesystem I/O — not the boundary — becomes the ceiling.
+- **Did it meet PB-6?** PB-6's DESIGN TARGET is **"per-call overhead documented and
+  bounded; the batch path amortises it"**
+  ([docs/07 §3](docs/07-performance-and-security.md#3-budgets-design-targets--pending-the-v01-bench-suite)).
+  **MET, and in the stronger sense:** the per-call overhead is not merely bounded,
+  it is **negligible** (~0.04 % of a run) *before* any batching; and the batch path
+  **does** amortise the per-run wall (5.4× at N=8) via the across-run parallelism
+  the GIL-release enables. Recorded, not asserted.
+- **When to batch (the plain guidance).** Because the boundary is never the
+  bottleneck, batching is **not** about hiding marshalling — it is about running
+  **independent** runs (parameter sweeps, Monte-Carlo grids) **concurrently**. Fan
+  them across a `ThreadPoolExecutor`; the win appears from **N = 2** and is strong
+  through **≈ N = 8** (5.4× here), then plateaus. Rule of thumb on this hardware:
+  batch whenever you have ≥ 2 independent runs, size the pool near the physical
+  core count, and expect I/O-bound saturation around 8 — a single run needs no
+  batching, and no batch width recovers a cost the boundary never charged.
+- **Scale / honest single-machine scope.** All figures are one Apple M4 Max. The
+  **absolute** per-run wall and the **saturation thread count** are
+  hardware/filesystem-specific (they will differ on Linux CI runners and on
+  spinning vs NVMe storage); the **portable takeaways** are the per-crossing floor
+  (~78 ns), the full-marshal cost (~1.25 µs), and the **boundary fraction of a run
+  (~0.04 %)**, which a uniform clock-speed factor largely preserves.
+
+### Downstream
+
+This is the **v0.4 PyO3-boundary baseline** the future gate builds on:
+
+- **#051 — percentile-regression gate (before v1.0).** CI will compare a tracked
+  boundary percentile (the `marshal_full_config` p50, or the per-crossing floor)
+  against **this committed baseline**, not an absolute number, so it tracks its own
+  hardware. This issue lands the **measurement**; #051 wraps it in the gate
+  ([docs/07 §6](docs/07-performance-and-security.md#6-regression-gates-in-ci-before-v10)).
+
 [`run_backtest`]: src/run.rs
 [`write_bundle`]: src/bundle/writer.rs
 [`BacktestRun`]: src/engine/backtest.rs
+[`ic.run()`]: src/python/run.rs

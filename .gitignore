@@ -11,3 +11,7 @@
 # seeds are the first line of defence against a re-regression, so they are
 # tracked, not ignored (issue #17 un-deferred this from #1).
 *.hgrm
+
+# Python bytecode from the pytest/bench runs (python/tests, python/benches)
+__pycache__/
+*.pyc
