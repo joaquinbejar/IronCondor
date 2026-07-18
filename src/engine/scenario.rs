@@ -388,6 +388,15 @@ fn num(value: Decimal) -> Result<serde_json::Value, BacktestError> {
 // The generator: ScenarioParams × base config → N independent BacktestConfigs
 // ---------------------------------------------------------------------------
 
+/// The hard ceiling on the number of runs one [`expand`] may produce. A batch
+/// crossing it is a typed [`BacktestError::Config`] **before** any allocation is
+/// sized from the (untrusted) `count × sweep.len()` product — so a
+/// `count = u32::MAX` sweep cannot abort the process on a giant `with_capacity`.
+/// One million independent runs is already far beyond any realistic Monte-Carlo
+/// or stress grid. Internal (not part of the public surface); the ceiling is
+/// surfaced to callers through the error message, not as an API constant.
+const MAX_RUNS: usize = 1_000_000;
+
 /// Expand a [`ScenarioParams`] batch over `base` into `N` independent
 /// [`BacktestConfig`]s — the generator behind the migrated scenario data types
 /// ([docs/02 §9](../../../docs/02-engine-architecture.md#9-scenario-orchestration)).
@@ -421,6 +430,12 @@ fn num(value: Decimal) -> Result<serde_json::Value, BacktestError> {
 ///
 /// # Errors
 ///
+/// - [`BacktestError::Config`] if the batch would expand to more than the
+///   internal `MAX_RUNS` cap (1,000,000 runs), if a
+///   non-[`ScenarioType::StressTest`] batch carries a walk shock
+///   (`walk_volatility_factor` / `walk_drift_delta`), or if an explicit
+///   [`ConfigOverride::seed`] is combined with `count > 1` (which would collide
+///   run ids across replicates).
 /// - [`BacktestError::ArithmeticOverflow`] if the run count overflows `u32`.
 /// - [`BacktestError::Conversion`] if a stress shock is not a finite `f64` or a
 ///   volatility factor is negative.
@@ -437,11 +452,49 @@ pub fn expand(
         &params.sweep
     };
 
+    // The walk shocks are StressTest-only; a non-StressTest batch carrying them
+    // is a misconfiguration, not a silent no-op (they would otherwise apply
+    // regardless of `kind`).
+    if params.kind != ScenarioType::StressTest
+        && overrides
+            .iter()
+            .any(|over| over.walk_volatility_factor.is_some() || over.walk_drift_delta.is_some())
+    {
+        return Err(BacktestError::Config(format!(
+            "walk_volatility_factor / walk_drift_delta are StressTest-only shocks, but the \
+             scenario kind is {:?}",
+            params.kind
+        )));
+    }
+
+    // An explicit per-override seed with count > 1 makes every replicate of that
+    // override share a run_id (identical config ⇒ identical run_id for file
+    // feeds), so the replicates would race for the same bundle directory. Reject
+    // it explicitly.
+    if params.count > 1 && overrides.iter().any(|over| over.seed.is_some()) {
+        return Err(BacktestError::Config(
+            "an explicit ConfigOverride.seed with count > 1 makes every replicate share a \
+             run_id (a concurrent bundle-directory race); use base_seed derivation \
+             (seed: None) for replicated runs, or set count = 1"
+                .to_string(),
+        ));
+    }
+
     let count = usize::try_from(params.count).map_err(|_| BacktestError::ArithmeticOverflow)?;
     let total = overrides
         .len()
         .checked_mul(count)
         .ok_or(BacktestError::ArithmeticOverflow)?;
+
+    // Hard run-count ceiling BEFORE the allocation is sized from the (untrusted)
+    // `count × sweep.len()` product, so a huge batch is a typed error rather than
+    // an aborting `with_capacity`.
+    if total > MAX_RUNS {
+        return Err(BacktestError::Config(format!(
+            "scenario batch expands to {total} runs, exceeding the hard cap of {MAX_RUNS}"
+        )));
+    }
+
     let mut out = Vec::with_capacity(total);
 
     let mut index: u32 = 0;
@@ -575,6 +628,7 @@ mod tests {
     use crate::config::{BacktestConfig, FeeSchedule, ResourceLimits, SlippageModel};
     use crate::data::DataSourceSpec;
     use crate::domain::ExecutionMode;
+    use crate::error::BacktestError;
     use rust_decimal::Decimal;
 
     fn base_config() -> BacktestConfig {
@@ -730,13 +784,101 @@ mod tests {
     }
 
     #[test]
+    fn test_expand_rejects_run_count_over_max() {
+        // count × sweep beyond MAX_RUNS is a typed Config error, raised before
+        // the result Vec is sized from the untrusted product.
+        let params = ScenarioParams {
+            kind: ScenarioType::MonteCarlo,
+            base_seed: 1,
+            count: u32::MAX,
+            sweep: Vec::new(),
+        };
+        assert!(matches!(
+            expand(&params, &base_config()),
+            Err(BacktestError::Config(_))
+        ));
+    }
+
+    #[test]
+    fn test_expand_rejects_explicit_seed_with_count_gt_one() {
+        // An explicit override seed with count > 1 would collide run_ids across
+        // replicates → rejected; count = 1 with the same seed is fine.
+        let bad = ScenarioParams {
+            kind: ScenarioType::MonteCarlo,
+            base_seed: 1,
+            count: 2,
+            sweep: vec![ConfigOverride {
+                seed: Some(7),
+                ..ConfigOverride::default()
+            }],
+        };
+        assert!(matches!(
+            expand(&bad, &base_config()),
+            Err(BacktestError::Config(_))
+        ));
+
+        let ok = ScenarioParams {
+            kind: ScenarioType::MonteCarlo,
+            base_seed: 1,
+            count: 1,
+            sweep: vec![ConfigOverride {
+                seed: Some(7),
+                ..ConfigOverride::default()
+            }],
+        };
+        assert!(expand(&ok, &base_config()).is_ok());
+    }
+
+    #[test]
+    fn test_expand_rejects_walk_shocks_outside_stress_test() {
+        // A walk shock is StressTest-only; carrying it under any other kind is a
+        // typed Config error, and StressTest accepts it.
+        for kind in [
+            ScenarioType::MonteCarlo,
+            ScenarioType::Historical,
+            ScenarioType::Custom,
+        ] {
+            let params = ScenarioParams {
+                kind,
+                base_seed: 1,
+                count: 1,
+                sweep: vec![ConfigOverride {
+                    seed: None,
+                    walk_volatility_factor: Some(Decimal::new(15, 1)),
+                    walk_drift_delta: None,
+                }],
+            };
+            assert!(
+                matches!(
+                    expand(&params, &base_config()),
+                    Err(BacktestError::Config(_))
+                ),
+                "kind {kind:?} must reject a walk shock"
+            );
+        }
+        let stress = ScenarioParams {
+            kind: ScenarioType::StressTest,
+            base_seed: 1,
+            count: 1,
+            sweep: vec![ConfigOverride {
+                seed: None,
+                walk_volatility_factor: Some(Decimal::new(15, 1)),
+                walk_drift_delta: None,
+            }],
+        };
+        assert!(expand(&stress, &base_config()).is_ok());
+    }
+
+    #[test]
     fn test_expand_is_scheduling_independent_pure_function() {
         // Regenerating from the same inputs yields byte-identical configs — the
         // expansion is a pure function of (params, base), never of order.
+        // count = 1 keeps the explicit-seed override path in play while
+        // respecting the "explicit seed + count > 1 is rejected" rule.
         let params = ScenarioParams {
             kind: ScenarioType::MonteCarlo,
             base_seed: 12_345,
-            count: 5,
+            count: 1,
             sweep: vec![
                 ConfigOverride {
                     seed: Some(111),

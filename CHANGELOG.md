@@ -8,7 +8,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **24 stack-review findings closed in one pass (PRs #55–#109 review response).**
+  The engine/analytics corrections change golden **values** (schema untouched;
+  re-blessed in the same commit, the sanctioned path):
+  - **Attribution cash scale**: per-fill slippage now scales by
+    `contract_multiplier` like every other cash flow, so `spread_capture` is on
+    the same basis as the P&L it explains; premium aggregates
+    (`net_premium_cents`, `return_on_premium`, `premium_capture`,
+    `CapitalUtilization`) carry the multiplier too.
+  - **Closed-leg attribution**: per-step Greek attribution now samples
+    beginning-of-step holdings, so a leg closed this step contributes its final
+    interval to θ/Δ/V instead of falling into the residual; the exact
+    attribution identity is unchanged.
+  - **Terminal-step duplicate close**: an exit policy firing on the final step
+    no longer collides with `on_end`'s close-all (the run previously aborted);
+    close-all reconciles against already-scheduled closes.
+  - **Correctness hardening**: leg selection matches the full contract identity
+    (expiration included) in multi-expiry snapshots; stale-quote exit decisions
+    read the ledger's carried mark, not the entry premium; the execution seam's
+    fill-correlation mode is now explicit (`fill_groups() -> Option<…>`), so a
+    surplus realistic fill is a typed error, never silently attached to the
+    wrong order; `SimClock` rejects step regressions in release builds;
+    `ExitPolicy::TimeSteps` records a truthful exit reason instead of
+    `Expiration`; the golden oracle rejects fractional-cent metrics instead of
+    truncating.
+  - **Boundary validation**: `Quantity`, `OrderIntent` (marketable ⇒ IOC),
+    `InstrumentSpec`, and `RunId` (64-hex; `from_hex` now fallible) validate on
+    deserialization; `TapeMeta` enforces the 0-based consecutive step contract;
+    the bundle reader verifies `strategy_run_id == run_id` and post-sort key
+    uniqueness / step contiguity / cross-table consistency; the bundle writer's
+    overwrite is move-aside (a complete bundle survives any single failure);
+    Parquet/CSV ingestion hashes and parses one open handle (no TOCTOU);
+    scenario expansion gains a hard `MAX_RUNS` ceiling, rejects an explicit
+    seed with `count > 1`, and gates walk shocks to `StressTest`; the Python
+    `Bundle.metrics()` read is bounded and `Bundle.write()` rejects
+    source == destination before deleting anything.
+
 ### Security
+
+- **Simulator responses are capped while streaming** (review fix): every
+  response body is read chunked into a bounded buffer and aborted mid-stream
+  past the ceiling, so a hostile simulator can no longer force an OOM before
+  the post-parse limits ran. **URL userinfo redaction fails closed** for
+  scheme-less authority-like values (`user:secret@host` without `://` now
+  collapses to `[redacted-url]`). The release workflow's publish job
+  additionally requires the repository variable `PYPI_PUBLISH_ENABLED == 'true'`
+  (fail-closed kill-switch complementing the environment-reviewers gate).
 
 - **Captured-log credential test proving a simulator credential never leaks, and
   the supply-chain / no-panic-across-FFI controls reaffirmed at the 1.0 cut

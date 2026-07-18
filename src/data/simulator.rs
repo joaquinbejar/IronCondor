@@ -450,11 +450,22 @@ pub struct MarketState {
 pub struct ApiClient {
     client: reqwest::Client,
     base_url: String,
+    /// The maximum bytes any single response body may buffer. Applied **while
+    /// streaming** the body (not after a full buffer), so a hostile or runaway
+    /// simulator cannot OOM the client with an unbounded response before a size
+    /// ceiling is even consulted.
+    max_response_bytes: u64,
 }
 
 impl ApiClient {
     /// The conventional default simulator host.
     pub const DEFAULT_BASE_URL: &'static str = "http://localhost:7070";
+
+    /// The default response-body cap when none is configured — mirrors the
+    /// default [`ResourceLimits::max_file_bytes`] (4 GiB): a generous anti-OOM
+    /// ceiling, not a tight bound. The tape materialiser overrides it with the
+    /// run's own `max_file_bytes` via [`Self::with_max_response_bytes`].
+    pub const DEFAULT_MAX_RESPONSE_BYTES: u64 = 4 * (1 << 30);
 
     /// The base URL to use when the caller does not name one: the `API_URL`
     /// environment variable when set, otherwise [`Self::DEFAULT_BASE_URL`].
@@ -491,7 +502,69 @@ impl ApiClient {
         Ok(Self {
             client,
             base_url: base_url.trim_end_matches('/').to_string(),
+            max_response_bytes: Self::DEFAULT_MAX_RESPONSE_BYTES,
         })
+    }
+
+    /// Cap the bytes any single response body may buffer before deserialisation,
+    /// reusing the run's `max_file_bytes` resource ceiling. Set by the tape
+    /// materialiser from [`ResourceLimits`] so a hostile / runaway simulator
+    /// cannot OOM the client with an unbounded body.
+    #[must_use = "the reconfigured client must be used"]
+    pub fn with_max_response_bytes(mut self, max_response_bytes: u64) -> Self {
+        self.max_response_bytes = max_response_bytes;
+        self
+    }
+
+    /// Read a response body **capped while streaming** — the length is checked
+    /// chunk by chunk and the read aborts the moment it would exceed
+    /// `max_response_bytes`, so an oversized body is a typed
+    /// [`BacktestError::Session`] before it is ever fully buffered. The bounded
+    /// bytes are then deserialised.
+    ///
+    /// The deserialise failure keeps the established `"{what} failed: {serde
+    /// detail}"` wording (e.g. `"parse chain response failed: …"`) — the streaming
+    /// cap changed only *how* the body is buffered, not the error contract, so a
+    /// caller matching on that fragment still works.
+    async fn read_capped_json<T: serde::de::DeserializeOwned>(
+        &self,
+        response: reqwest::Response,
+        what: &str,
+    ) -> Result<T, BacktestError> {
+        let bytes = self.read_capped_body(response, what).await?;
+        serde_json::from_slice(&bytes)
+            .map_err(|e| BacktestError::Session(format!("{what} failed: {e}")))
+    }
+
+    /// Accumulate a response body into a bounded `Vec`, streaming
+    /// [`reqwest::Response::chunk`] by chunk and aborting the moment the running
+    /// length would exceed `max_response_bytes` (checked arithmetic, no wrap).
+    async fn read_capped_body(
+        &self,
+        mut response: reqwest::Response,
+        what: &str,
+    ) -> Result<Vec<u8>, BacktestError> {
+        let mut body: Vec<u8> = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|e| BacktestError::Session(format!("{what}: read body failed: {e}")))?
+        {
+            let next_len = body
+                .len()
+                .checked_add(chunk.len())
+                .ok_or(BacktestError::ArithmeticOverflow)?;
+            let next_len =
+                u64::try_from(next_len).map_err(|_| BacktestError::ArithmeticOverflow)?;
+            if next_len > self.max_response_bytes {
+                return Err(BacktestError::Session(format!(
+                    "{what}: response body exceeds the {}-byte cap",
+                    self.max_response_bytes
+                )));
+            }
+            body.extend_from_slice(chunk.as_ref());
+        }
+        Ok(body)
     }
 
     /// Create a new session.
@@ -513,12 +586,10 @@ impl ApiClient {
             .await
             .map_err(|e| BacktestError::Session(format!("create_session request failed: {e}")))?;
         if !response.status().is_success() {
-            return Err(Self::error_from_response(response).await);
+            return Err(self.error_from_response(response).await);
         }
-        response
-            .json::<SessionResponse>()
+        self.read_capped_json::<SessionResponse>(response, "parse session response")
             .await
-            .map_err(|e| BacktestError::Session(format!("parse session response failed: {e}")))
     }
 
     /// Advance the session one step and return the served chain snapshot
@@ -573,12 +644,10 @@ impl ApiClient {
                 BacktestError::Session(format!("get_next_step request failed: {e}"))
             })?;
         if !response.status().is_success() {
-            return Err(Self::error_from_response(response).await);
+            return Err(self.error_from_response(response).await);
         }
-        response
-            .json::<ChainResponse>()
+        self.read_capped_json::<ChainResponse>(response, "parse chain response")
             .await
-            .map_err(|e| BacktestError::Session(format!("parse chain response failed: {e}")))
     }
 
     /// Replace the session's parameters wholesale (`PUT`).
@@ -601,12 +670,10 @@ impl ApiClient {
             .await
             .map_err(|e| BacktestError::Session(format!("replace_session request failed: {e}")))?;
         if !response.status().is_success() {
-            return Err(Self::error_from_response(response).await);
+            return Err(self.error_from_response(response).await);
         }
-        response
-            .json::<SessionResponse>()
+        self.read_capped_json::<SessionResponse>(response, "parse session response")
             .await
-            .map_err(|e| BacktestError::Session(format!("parse session response failed: {e}")))
     }
 
     /// Apply a partial update to the session (`PATCH`).
@@ -629,12 +696,10 @@ impl ApiClient {
             .await
             .map_err(|e| BacktestError::Session(format!("update_session request failed: {e}")))?;
         if !response.status().is_success() {
-            return Err(Self::error_from_response(response).await);
+            return Err(self.error_from_response(response).await);
         }
-        response
-            .json::<SessionResponse>()
+        self.read_capped_json::<SessionResponse>(response, "parse session response")
             .await
-            .map_err(|e| BacktestError::Session(format!("parse session response failed: {e}")))
     }
 
     /// Terminate the session (`DELETE`).
@@ -649,7 +714,7 @@ impl ApiClient {
                 BacktestError::Session(format!("delete_session request failed: {e}"))
             })?;
         if !response.status().is_success() {
-            return Err(Self::error_from_response(response).await);
+            return Err(self.error_from_response(response).await);
         }
         Ok(())
     }
@@ -657,11 +722,16 @@ impl ApiClient {
     /// Build a typed [`BacktestError::Session`] from a non-2xx response,
     /// including the status and (when present) the server's error message.
     #[cold]
-    async fn error_from_response(response: reqwest::Response) -> BacktestError {
+    async fn error_from_response(&self, response: reqwest::Response) -> BacktestError {
         let status = response.status().as_u16();
-        match response.json::<ErrorResponse>().await {
-            Ok(body) => BacktestError::Session(format!("http {status}: {}", body.error)),
-            Err(_) => BacktestError::Session(format!("http {status}: unparseable error body")),
+        match self.read_capped_body(response, "error body").await {
+            Ok(bytes) => match serde_json::from_slice::<ErrorResponse>(&bytes) {
+                Ok(body) => BacktestError::Session(format!("http {status}: {}", body.error)),
+                Err(_) => BacktestError::Session(format!("http {status}: unparseable error body")),
+            },
+            Err(_) => BacktestError::Session(format!(
+                "http {status}: error body exceeded the response cap"
+            )),
         }
     }
 }
@@ -1066,7 +1136,8 @@ impl SimulatorFeed {
         timeout: Duration,
         limits: &ResourceLimits,
     ) -> Result<Self, BacktestError> {
-        let client = ApiClient::new(&spec.base_url, timeout)?;
+        let client =
+            ApiClient::new(&spec.base_url, timeout)?.with_max_response_bytes(limits.max_file_bytes);
 
         // Create the session, sending the configured data seed as the walk
         // seed (the cross-layer contract, docs/03 §6). If this fails there is
@@ -1358,6 +1429,71 @@ mod tests {
         // needs no live server.
         let result = sim.next_step().await;
         assert!(matches!(result, Err(BacktestError::Session(_))));
+    }
+
+    #[tokio::test]
+    async fn test_response_body_cap_rejects_oversized_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        // A scripted responder on an ephemeral port answers a create_session
+        // POST with a 200 whose JSON body is far larger than the client cap. The
+        // capped streaming read must abort with a typed Session error before the
+        // whole body is buffered — an oversized body cannot OOM the client.
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(e) => panic!("bind failed: {e}"),
+        };
+        let addr = match listener.local_addr() {
+            Ok(addr) => addr,
+            Err(e) => panic!("local_addr failed: {e}"),
+        };
+
+        let server = tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                // Best-effort drain of the request; we need not read all of it
+                // to answer.
+                let mut scratch = [0u8; 1024];
+                let _ = socket.read(&mut scratch).await;
+                let body = vec![b'x'; 4096]; // 4 KiB — well past the 64-byte cap.
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = socket.write_all(header.as_bytes()).await;
+                let _ = socket.write_all(&body).await;
+                let _ = socket.flush().await;
+            }
+        });
+
+        let base_url = format!("http://{addr}");
+        let client = match ApiClient::new(&base_url, Duration::from_secs(5)) {
+            Ok(client) => client.with_max_response_bytes(64),
+            Err(e) => panic!("client build failed: {e}"),
+        };
+        let request = CreateSessionRequest {
+            symbol: "SPX".to_string(),
+            steps: 1,
+            initial_price: 100.0,
+            days_to_expiration: 30.0,
+            volatility: 0.2,
+            risk_free_rate: 0.03,
+            dividend_yield: 0.0,
+            method: json!({"Brownian": {"dt": 0.004, "drift": 0.0, "volatility": 0.2}}),
+            time_frame: "Day".to_string(),
+            chain_size: None,
+            strike_interval: None,
+            skew_slope: None,
+            smile_curve: None,
+            spread: None,
+            seed: None,
+        };
+        let result = client.create_session(request).await;
+        assert!(
+            matches!(result, Err(BacktestError::Session(_))),
+            "an oversized response body must be a typed Session error, got {result:?}"
+        );
+        let _ = server.await;
     }
 
     // ---- SessionState parsing / derivation --------------------------------

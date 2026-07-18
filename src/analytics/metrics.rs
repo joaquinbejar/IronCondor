@@ -344,8 +344,13 @@ impl RealisedStats {
         };
         for trade in trade_log {
             let pnl = trade.realized_pnl.value();
+            // Cash basis: `entry_premium × quantity × contract_multiplier`, the
+            // same scaling `realized_pnl` carries — otherwise the premium
+            // aggregates that feed CapitalUtilization / return_on_premium /
+            // premium_capture are underweighted by the multiplier (F23).
             let premium = i128::from(trade.entry_premium.value())
                 .checked_mul(i128::from(trade.quantity.value()))
+                .and_then(|p| p.checked_mul(i128::from(trade.contract_multiplier)))
                 .ok_or(BacktestError::ArithmeticOverflow)?;
             match pnl.cmp(&0) {
                 std::cmp::Ordering::Greater => {
@@ -540,27 +545,62 @@ fn net_premium_cents(
     open_at_end: &[OpenPosition],
 ) -> Result<i64, BacktestError> {
     let mut net: i128 = 0;
+    // Closed legs carry their own multiplier; scale premium to the cash basis so
+    // net premium matches the cash-scaled realised P&L (F23).
     for trade in trade_log {
-        let premium = i128::from(trade.entry_premium.value())
-            .checked_mul(i128::from(trade.quantity.value()))
-            .ok_or(BacktestError::ArithmeticOverflow)?;
-        net = match trade.side {
-            Side::Short => net.checked_add(premium),
-            Side::Long => net.checked_sub(premium),
-        }
-        .ok_or(BacktestError::ArithmeticOverflow)?;
+        let premium = premium_cash_cents(
+            trade.entry_premium.value(),
+            trade.quantity.value(),
+            trade.contract_multiplier,
+        )?;
+        net = net_add(net, trade.side, premium)?;
     }
+    // Legs still open at feed end are `OpenPosition`s, which do not carry the
+    // multiplier. A single-underlying run shares one multiplier across every
+    // leg, so reuse the run's (taken from any closed leg). With no closed legs
+    // there is no realised P&L for net premium to be inconsistent with, so an
+    // unweighted (per-contract) premium is the documented degenerate fallback.
+    let run_multiplier = trade_log.first().map_or(1, |t| t.contract_multiplier);
     for leg in open_at_end {
-        let premium = i128::from(leg.entry_premium.value())
-            .checked_mul(i128::from(leg.quantity.value()))
-            .ok_or(BacktestError::ArithmeticOverflow)?;
-        net = match leg.side {
-            Side::Short => net.checked_add(premium),
-            Side::Long => net.checked_sub(premium),
-        }
-        .ok_or(BacktestError::ArithmeticOverflow)?;
+        let premium = premium_cash_cents(
+            leg.entry_premium.value(),
+            leg.quantity.value(),
+            run_multiplier,
+        )?;
+        net = net_add(net, leg.side, premium)?;
     }
     i64::try_from(net).map_err(|_| BacktestError::ArithmeticOverflow)
+}
+
+/// Premium on the cash basis: `entry_premium_cents × quantity ×
+/// contract_multiplier`, in `i128` cents (checked).
+///
+/// # Errors
+///
+/// [`BacktestError::ArithmeticOverflow`] if the product overflows `i128`.
+fn premium_cash_cents(
+    entry_premium_cents: u64,
+    quantity: u32,
+    contract_multiplier: u32,
+) -> Result<i128, BacktestError> {
+    i128::from(entry_premium_cents)
+        .checked_mul(i128::from(quantity))
+        .and_then(|p| p.checked_mul(i128::from(contract_multiplier)))
+        .ok_or(BacktestError::ArithmeticOverflow)
+}
+
+/// Add a leg's premium to the running net with its side sign: a short leg
+/// **received** premium (`+`), a long leg **paid** it (`−`).
+///
+/// # Errors
+///
+/// [`BacktestError::ArithmeticOverflow`] if the running sum overflows `i128`.
+fn net_add(net: i128, side: Side, premium: i128) -> Result<i128, BacktestError> {
+    match side {
+        Side::Short => net.checked_add(premium),
+        Side::Long => net.checked_sub(premium),
+    }
+    .ok_or(BacktestError::ArithmeticOverflow)
 }
 
 /// Build the [`AdvancedRiskMetrics`] tail-risk slice from the return and
@@ -1036,6 +1076,7 @@ mod tests {
             contract: key(strike, style),
             side,
             quantity: qty(1),
+            contract_multiplier: 100,
             entry_premium: PriceCents::new(entry),
             exit_price: PriceCents::new(exit),
             close_fees: Cents::new(0),
@@ -1175,10 +1216,11 @@ mod tests {
         assert_eq!(stats.long_trades, 2);
         assert_eq!(stats.call_trades, 2);
         assert_eq!(stats.put_trades, 2);
-        // Net premium: shorts (2000+1800) − longs (800+700) = 2300c.
+        // Net premium on the cash basis: (shorts 2000+1800 − longs 800+700) ×
+        // 100 multiplier = 230_000c (F23 — scaled like realised P&L).
         assert!(matches!(
             result.custom_metrics.get(NET_PREMIUM_CENTS_KEY),
-            Some(v) if *v == Decimal::from(2_300)
+            Some(v) if *v == Decimal::from(230_000)
         ));
         // win_rate = 2/4 = 0.5.
         assert!(matches!(

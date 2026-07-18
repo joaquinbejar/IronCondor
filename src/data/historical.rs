@@ -96,7 +96,7 @@
 
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -197,17 +197,33 @@ impl ParquetFeed {
         let path_ref = path.as_ref();
         let path_str = path_ref.to_string_lossy().into_owned();
 
-        // (1) File-size ceiling, from the filesystem metadata, BEFORE any read.
-        //     Reject a non-regular file first: a FIFO / pipe / device reports
-        //     `len() == 0`, which would slip past the size guard and let the
-        //     streaming hash below block indefinitely on a hostile path.
-        let metadata = std::fs::metadata(path_ref)?;
-        if !metadata.is_file() {
+        // (1) Reject a non-regular file from the path metadata BEFORE opening: a
+        //     FIFO / pipe / device would otherwise make the open in (2) block
+        //     indefinitely on a hostile path.
+        let path_metadata = std::fs::metadata(path_ref)?;
+        if !path_metadata.is_file() {
             return Err(BacktestError::Conversion(format!(
                 "feed path is not a regular file: {path_str}"
             )));
         }
-        let file_len = metadata.len();
+
+        // (2) Open ONCE. The size ceiling, the sha256 data identity, and the
+        //     Parquet parse below all read this single handle — so the recorded
+        //     data-identity sha is provably the sha of the exact bytes the
+        //     parser consumes. Previously size / sha / parse each reopened the
+        //     path (a TOCTOU window a hostile actor could exploit by swapping
+        //     the file between reads, producing a bundle whose recorded tape sha
+        //     did not match the bytes actually replayed). The handle is
+        //     re-stat-ed (fstat) as defence-in-depth against a swap between the
+        //     path stat above and this open.
+        let mut file = File::open(path_ref)?;
+        let handle_metadata = file.metadata()?;
+        if !handle_metadata.is_file() {
+            return Err(BacktestError::Conversion(format!(
+                "feed path is not a regular file: {path_str}"
+            )));
+        }
+        let file_len = handle_metadata.len();
         if file_len > limits.max_file_bytes {
             return Err(BacktestError::TapeTooLarge {
                 limit: "max_file_bytes",
@@ -216,12 +232,14 @@ impl ParquetFeed {
             });
         }
 
-        // (2) Streaming file sha256 = the tape's data identity (bounded by the
-        //     size ceiling checked above).
-        let sha256 = file_sha256(path_ref)?;
+        // (3) Streaming sha256 of the open handle (bounded by the size ceiling),
+        //     then rewind so the Parquet reader parses the SAME bytes from byte
+        //     zero — no reopen between hashing and parsing.
+        let sha256 = hash_reader(&mut file, limits.max_file_bytes)?;
+        file.rewind()?;
 
-        // (3) Read the Parquet footer metadata; a truncated / corrupt footer is
-        //     a typed Conversion, never a panic.
+        // (4) Read the Parquet footer metadata from the same handle; a truncated
+        //     / corrupt footer is a typed Conversion, never a panic.
         //     `with_skip_arrow_metadata(true)` is REQUIRED for no-panic on
         //     untrusted input: a Parquet footer may embed an `ARROW:schema` IPC
         //     flatbuffer whose parse panics inside arrow-ipc (`unimplemented!` in
@@ -234,7 +252,6 @@ impl ParquetFeed {
         //     known metadata-panic class on malformed input (arrow-rs #9840,
         //     #9868, #5382) that unwinds instead of returning `Err`, so any such
         //     panic is contained and mapped to a typed `BacktestError::Data`.
-        let file = File::open(path_ref)?;
         let builder = guard_parquet("metadata read", || {
             ParquetRecordBatchReaderBuilder::try_new_with_options(
                 file,
@@ -628,9 +645,22 @@ impl CsvFeed {
                 u32::try_from(index).map_err(|_| BacktestError::ArithmeticOverflow)?,
             );
 
-            // (4a) Per-file size ceiling, from filesystem metadata, before any
-            //      read.
-            let file_len = std::fs::metadata(file_path)?.len();
+            // (4a) Open the file ONCE. Its size ceiling, content sha256, and CSV
+            //      parse all derive from this single handle and the bounded
+            //      in-memory bytes read from it — so a hostile actor cannot swap
+            //      the path between the hash and the parse and make the recorded
+            //      directory identity diverge from the bytes actually replayed
+            //      (the size / sha / parse TOCTOU across three reopens). The
+            //      directory scan already rejected non-file entries; the fstat
+            //      here re-checks the opened handle as defence-in-depth.
+            let file = File::open(file_path)?;
+            let file_metadata = file.metadata()?;
+            if !file_metadata.is_file() {
+                return Err(BacktestError::Conversion(format!(
+                    "csv feed entry is not a regular file: {name:?}"
+                )));
+            }
+            let file_len = file_metadata.len();
             if file_len > limits.max_file_bytes {
                 return Err(BacktestError::TapeTooLarge {
                     limit: "max_file_bytes",
@@ -652,17 +682,26 @@ impl CsvFeed {
                 });
             }
 
-            // (4c) Fold this file's identity into the directory hash, in
+            // (4c) Read the whole (bounded) file into memory ONCE, so the hash
+            //      and the parse below see byte-identical content.
+            let cap = usize::try_from(file_len).map_err(|_| BacktestError::ArithmeticOverflow)?;
+            let mut bytes = Vec::with_capacity(cap);
+            file.take(limits.max_file_bytes).read_to_end(&mut bytes)?;
+
+            // (4d) Fold this file's identity into the directory hash, in
             //      name-sorted order: name, NUL, then the file's own content
-            //      sha256 (streaming, bounded by the size ceiling above).
-            let file_hex = file_sha256(file_path)?;
+            //      sha256. The digest of these bounded bytes equals the previous
+            //      per-path streaming hash for a well-formed file (same bytes ⇒
+            //      same digest), so a recorded directory identity is unchanged.
+            let file_hex = to_hex(&Sha256::digest(&bytes));
             dir_hasher.update(name.as_encoded_bytes());
             dir_hasher.update([0u8]);
             dir_hasher.update(file_hex.as_bytes());
 
-            // (4d) Parse the file into one snapshot's raw quotes + snapshot-level
-            //      meta, then convert once through the single boundary.
-            let parsed = parse_csv_snapshot(file_path, step, limits)?;
+            // (4e) Parse the in-memory bytes into one snapshot's raw quotes +
+            //      snapshot-level meta, then convert once through the single
+            //      boundary.
+            let parsed = parse_csv_snapshot(&bytes, step, limits)?;
             // The first file (first in replay order) sets ts_0 for the tape.
             let anchor = match anchor_ts {
                 Some(existing) => existing,
@@ -827,23 +866,23 @@ impl CsvColumns {
     }
 }
 
-/// Parse one CSV chain file into a [`ParsedCsvSnapshot`], enforcing a bounded
-/// read (`max_file_bytes`) and `max_contracts_per_snapshot`.
+/// Parse one CSV chain file's **already-bounded, in-memory bytes** into a
+/// [`ParsedCsvSnapshot`], enforcing `max_contracts_per_snapshot`.
 ///
-/// The read is bounded by `max_file_bytes` even under a race that grows the file
-/// after its metadata was checked ([`std::io::Read::take`]); a truncation then
-/// surfaces as a typed CSV decode error, never an unbounded read.
+/// The caller reads the file once (bounded by `max_file_bytes`) and hashes the
+/// same bytes it passes here, so the content the directory identity commits to
+/// is byte-identical to the content parsed — there is no reopen between hashing
+/// and parsing.
 fn parse_csv_snapshot(
-    path: &Path,
+    bytes: &[u8],
     step: StepIndex,
     limits: &ResourceLimits,
 ) -> Result<ParsedCsvSnapshot, BacktestError> {
-    let file = File::open(path)?;
     let mut reader = csv::ReaderBuilder::new()
         .has_headers(true)
         .flexible(false)
         .trim(csv::Trim::All)
-        .from_reader(file.take(limits.max_file_bytes));
+        .from_reader(bytes);
 
     let cols = CsvColumns::from_header(
         reader
@@ -936,8 +975,8 @@ fn parse_csv_snapshot(
     let (ts, underlying, underlying_price, tick_size_cents, contract_multiplier) = header_fields
         .ok_or_else(|| {
             BacktestError::Conversion(format!(
-                "csv file {} has no data rows; every file is one chain snapshot",
-                path.display()
+                "csv file at step {} has no data rows; every file is one chain snapshot",
+                step.value()
             ))
         })?;
     Ok(ParsedCsvSnapshot {
@@ -1526,17 +1565,26 @@ fn ensure_const<S: std::fmt::Display, T: PartialEq + std::fmt::Display>(
     }
 }
 
-/// Compute the streaming `sha256` (lowercase hex) of a file's bytes.
+/// Streaming `sha256` (lowercase hex) of an **already-open** reader, bounded by
+/// `max_bytes` ([`std::io::Read::take`]) so a hostile handle can never cause an
+/// unbounded read.
+///
+/// The feed opens each input **once** and hashes it through this handle, then
+/// rewinds and parses the same handle — the size ceiling, the identity hash, and
+/// the parse therefore all read one open file, closing the size/sha/parse TOCTOU
+/// that three separate path reopens left. For a well-formed file (smaller than
+/// the ceiling) the digest is byte-for-byte identical to a full-file hash, so a
+/// recorded tape identity is unchanged.
 ///
 /// # Errors
 ///
-/// Returns [`BacktestError::DataIo`] if the file cannot be opened or read.
-fn file_sha256(path: &Path) -> Result<String, BacktestError> {
-    let mut file = File::open(path)?;
+/// Returns [`BacktestError::DataIo`] if the handle cannot be read.
+fn hash_reader<R: Read>(reader: &mut R, max_bytes: u64) -> Result<String, BacktestError> {
+    let mut bounded = reader.take(max_bytes);
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; HASH_CHUNK_BYTES];
     loop {
-        let read = file.read(&mut buffer)?;
+        let read = bounded.read(&mut buffer)?;
         if read == 0 {
             break;
         }
@@ -1611,7 +1659,7 @@ mod tests {
     use parquet::arrow::ArrowWriter;
     use tempfile::TempDir;
 
-    use super::{ParquetFeed, SharedParquetTape, file_sha256};
+    use super::{ParquetFeed, SharedParquetTape};
     use crate::config::ResourceLimits;
     use crate::data::feed::DataFeed;
     use crate::domain::ChainSnapshot;
@@ -2090,10 +2138,13 @@ mod tests {
         let Ok((_dir, path)) = write_standard(&chain) else {
             panic!("fixture must write");
         };
-        let Ok(sha) = file_sha256(&path) else {
-            panic!("the fixture must hash");
-        };
         let limits = ResourceLimits::default();
+        // The feed's own computed data identity is the file sha256; it must
+        // round-trip back through `open_verified`.
+        let sha = match ParquetFeed::open(&path, &limits) {
+            Ok(feed) => feed.tape_meta().data_identity.clone(),
+            Err(e) => panic!("the fixture must open: {e}"),
+        };
         // Empty expected sha skips the check; the real sha passes; a wrong sha is
         // a typed Conversion error, never a silent divergent open.
         assert!(ParquetFeed::open_verified(&path, "", &limits).is_ok());

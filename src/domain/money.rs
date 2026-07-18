@@ -136,9 +136,13 @@ impl PriceCents {
 
 /// A contract count — strictly positive.
 ///
-/// Serialises as its bare inner scalar.
+/// Serialises as its bare inner scalar and **deserialises through the `> 0`
+/// invariant**: `into`/`try_from` route every decode of a `Quantity` (bare, or
+/// nested in a strategy-spec / order-intent JSON) through [`Quantity::new`], so
+/// a wire `0` is a typed [`BacktestError::InvalidQuantity`], never a silently
+/// admitted zero-size leg (the derived `transparent` impl bypassed the check).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
+#[serde(into = "u32", try_from = "u32")]
 pub struct Quantity(u32);
 
 impl Quantity {
@@ -159,6 +163,24 @@ impl Quantity {
     #[must_use]
     pub const fn value(self) -> u32 {
         self.0
+    }
+}
+
+/// Validated deserialisation seam: every decoded `u32` is routed through the
+/// `> 0` invariant, so a wire `0` fails loudly instead of admitting a zero-size
+/// leg.
+impl TryFrom<u32> for Quantity {
+    type Error = BacktestError;
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+/// The transparent wire form: a `Quantity` serialises as its bare inner scalar.
+impl From<Quantity> for u32 {
+    fn from(quantity: Quantity) -> Self {
+        quantity.0
     }
 }
 
@@ -202,6 +224,17 @@ mod tests {
     fn test_quantity_new_nonzero_round_trips() {
         let qty = Quantity::new(4);
         assert!(matches!(qty, Ok(q) if q.value() == 4));
+    }
+
+    #[test]
+    fn test_quantity_deserialize_rejects_zero() {
+        // The `try_from = "u32"` seam routes a bare wire scalar through the
+        // `> 0` invariant, so a strategy-spec / order-intent JSON carrying
+        // `quantity: 0` fails to deserialise rather than admitting a zero leg.
+        let zero: Result<Quantity, _> = serde_json::from_str("0");
+        assert!(zero.is_err(), "quantity 0 must be rejected on deserialize");
+        let ok: Result<Quantity, _> = serde_json::from_str("3");
+        assert!(matches!(ok, Ok(q) if q.value() == 3));
     }
 
     #[test]

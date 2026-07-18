@@ -139,7 +139,17 @@ pub struct SimulatorSourceSpec {
 #[cfg(feature = "simulator")]
 fn redact_url_userinfo(url: &str) -> String {
     let Some(scheme_sep) = url.find("://") else {
-        // No authority component — nothing that can hold userinfo credentials.
+        // No scheme separator. A bare `host[:port]` holds no userinfo, but a
+        // scheme-less `user:secret@host` DOES — returning it verbatim would leak
+        // the credential (the reported gap). Fail closed: if the authority-like
+        // prefix (up to the first '/', '?' or '#') carries an '@', collapse to
+        // the placeholder — without a scheme to anchor parsing we cannot reliably
+        // show such a value credential-free.
+        let authority_end = url.find(['/', '?', '#']).unwrap_or(url.len());
+        let authority = url.get(..authority_end).unwrap_or(url);
+        if authority.contains('@') {
+            return "[redacted-url]".to_string();
+        }
         return url.to_string();
     };
     let authority_start = scheme_sep + "://".len();
@@ -321,8 +331,21 @@ mod tests {
             redact_url_userinfo("http://127.0.0.1:59440"),
             "http://127.0.0.1:59440"
         );
-        // No scheme separator: left as-is (no authority that can hold a secret).
+        // No scheme separator AND no userinfo: left as-is (nothing to redact).
         assert_eq!(redact_url_userinfo("localhost:7070"), "localhost:7070");
+        // No scheme separator BUT userinfo present: fail closed — a scheme-less
+        // `user:secret@host` must never be returned verbatim (the reported leak).
+        assert_eq!(redact_url_userinfo("ci-bot:SECRET@host"), "[redacted-url]");
+        assert_eq!(
+            redact_url_userinfo("ci-bot:SECRET@host:7070/api/v1/chain"),
+            "[redacted-url]"
+        );
+        // An '@' after the authority (in the path) is not userinfo — a
+        // scheme-less path-only value with no authority '@' stays unchanged.
+        assert_eq!(
+            redact_url_userinfo("host:7070/path@notsecret"),
+            "host:7070/path@notsecret"
+        );
     }
 
     #[cfg(feature = "simulator")]

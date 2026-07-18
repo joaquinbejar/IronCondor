@@ -90,6 +90,12 @@ impl SimClock {
     /// Returns [`BacktestError::DataOutOfOrder`] when `ts <= self.ts` (a
     /// duplicate or reversed timestamp), carrying the offending `step`, `ts`,
     /// and the previous `prev` it failed to strictly exceed.
+    ///
+    /// Returns [`BacktestError::Data`] when `step` regresses below the current
+    /// step even though `ts` advanced — a malformed tape whose step ordinals do
+    /// not increase monotonically. This is enforced in **release** builds too
+    /// (not a `debug_assert!`): a silently reordered step index would corrupt
+    /// every step-keyed result, so it is a hard, typed error.
     pub fn advance_to(&mut self, ts: SimTime, step: StepIndex) -> Result<(), BacktestError> {
         if ts <= self.ts {
             return Err(BacktestError::DataOutOfOrder {
@@ -98,12 +104,14 @@ impl SimClock {
                 prev: self.ts.value(),
             });
         }
-        debug_assert!(
-            step.value() >= self.step.value(),
-            "step must advance monotonically: {} >= {}",
-            step.value(),
-            self.step.value(),
-        );
+        if step.value() < self.step.value() {
+            return Err(BacktestError::Data(format!(
+                "step index regressed: step {} is before the previous step {} at ts {}",
+                step.value(),
+                self.step.value(),
+                ts.value(),
+            )));
+        }
         self.step = step;
         self.ts = ts;
         Ok(())
@@ -225,6 +233,25 @@ mod tests {
         // A rejected advance leaves the clock state unchanged.
         assert_eq!(clock.step().value(), 0);
         assert_eq!(clock.ts().value(), 500);
+    }
+
+    #[test]
+    fn test_clock_rejects_step_regression_in_release() {
+        // A step that regresses below the current step — even with a strictly
+        // later ts — is a malformed tape and a hard typed error, enforced in
+        // release builds too (the check is a real `if`, not a `debug_assert!`,
+        // so this test holds whether or not `debug_assertions` is set).
+        let mut clock = SimClock::new();
+        assert!(matches!(
+            clock.advance_to(SimTime::new(1_000), StepIndex::new(5)),
+            Ok(())
+        ));
+        // ts advances (2_000 > 1_000) but step regresses (3 < 5): rejected.
+        let regressed = clock.advance_to(SimTime::new(2_000), StepIndex::new(3));
+        assert!(matches!(regressed, Err(BacktestError::Data(_))));
+        // A rejected advance leaves the clock state unchanged.
+        assert_eq!(clock.step().value(), 5);
+        assert_eq!(clock.ts().value(), 1_000);
     }
 
     #[test]

@@ -141,9 +141,12 @@ mode_b_diff() {
         fail "this PR adds no CHANGELOG entry (no change to $CHANGELOG between '$base' and '$head'); add an [Unreleased] entry, or mark the PR chore:/refactor:/…/[skip changelog]"
     fi
 
-    # (2) the diff must ADD ≥1 line whose NEW-file line number lands inside the
-    # head [Unreleased] range. We track each hunk's +new line counter and test
-    # every added ('+', not '+++') line for membership in [u_start, u_end].
+    # (2) the diff must ADD ≥1 REAL entry whose NEW-file line number lands inside
+    # the head [Unreleased] range. We track each hunk's +new line counter and
+    # test every added ('+', not '+++') line for membership in [u_start, u_end],
+    # applying Mode A's content rule so a blank line or a bare `## [Unreleased]` /
+    # `### …` heading does NOT satisfy the gate — only non-blank, non-heading
+    # content counts as an entry.
     if printf '%s\n' "$diff_out" | awk -v s="$u_start" -v e="$u_end" '
         /^@@/ {
             if (match($0, /\+[0-9]+/)) { nl = substr($0, RSTART + 1, RLENGTH - 1) + 0 }
@@ -152,7 +155,14 @@ mode_b_diff() {
         }
         !inhunk    { next }
         /^\+\+\+/  { next }
-        /^\+/      { if (nl >= s && nl <= e) { found = 1 }; nl++; next }
+        /^\+/      {
+            body = substr($0, 2)   # the added line, without the diff "+" marker
+            if (nl >= s && nl <= e && body !~ /^###/ && body !~ /^## \[/ && body ~ /[^ \t]/) {
+                found = 1
+            }
+            nl++
+            next
+        }
         /^-/       { next }
         /^\\/      { next }   # "\ No newline at end of file"
         { nl++ }              # context line (leading space)

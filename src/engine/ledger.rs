@@ -178,7 +178,23 @@ pub struct Ledger {
     /// allocates on a warm step (PB-1). Pushing a leg clones its
     /// [`ContractKey`], but the ticker is `Arc<str>` so that is a refcount bump,
     /// not a heap allocation.
+    ///
+    /// These are the **post-fill surviving** legs (legs closed this step were
+    /// removed from the inventory before `settle`), valued at `S_n` — the set the
+    /// bundle's `positions.parquet` rows describe.
     position_marks: Vec<PositionMark>,
+    /// Per-leg **attribution** hand-off for the step just settled, in
+    /// beginning-of-step inventory order — the set the P&L-attribution pass
+    /// consumes ([`Ledger::attribution_marks`]).
+    ///
+    /// Distinct from [`Self::position_marks`]: this is the **beginning-of-step**
+    /// holdings (the legs open at `S_{n-1}`, **including** any that close this
+    /// step), each carrying its retained `S_{n-1}` unit Greeks so a leg that dies
+    /// this step still contributes its θ/Δ/V interval instead of dumping it in the
+    /// residual (F22). Built by [`Ledger::collect_attribution_marks`] **before**
+    /// [`Ledger::settle`] advances the Greek endpoint to `S_n`. Reused scratch,
+    /// cleared and refilled in place — PB-1-safe.
+    attribution_marks: Vec<PositionMark>,
     /// Last-known per-contract **unit** Greeks — the retained `S_{n-1}`
     /// observation endpoint the enrichment (#30) surfaces on each leg's
     /// [`PositionMark::prior_greeks`]. Updated **in place** at the *end* of
@@ -226,6 +242,7 @@ impl Ledger {
             running_peak: initial_capital.value(),
             marks: BTreeMap::new(),
             position_marks: Vec::new(),
+            attribution_marks: Vec::new(),
             greeks: BTreeMap::new(),
             prev_equity: initial_capital.value(),
             step_slippage: 0,
@@ -242,6 +259,20 @@ impl Ledger {
         self.cash
     }
 
+    /// The last-known per-contract mark, keyed by [`ContractKey`] — the
+    /// carry-forward mids the ledger accumulated through the most recently
+    /// settled step (updated in [`Ledger::settle`]).
+    ///
+    /// The replay loop threads this into the strategy's
+    /// [`crate::engine::strategy::ChainContext`] so a stale-quote exit decision
+    /// reads the carried mark instead of the entry premium. It is a **reference**
+    /// to the ledger's own map (no allocation), valid until the next `settle`
+    /// mutates it; during a step's exit phase it holds marks through `S_{n-1}`.
+    #[must_use]
+    pub const fn marks(&self) -> &BTreeMap<ContractKey, PriceCents> {
+        &self.marks
+    }
+
     /// The per-leg valuation of the step most recently settled — the enriched
     /// engine→analytics hand-off (#30), in open-inventory order.
     ///
@@ -253,6 +284,61 @@ impl Ledger {
     #[must_use]
     pub fn position_marks(&self) -> &[PositionMark] {
         &self.position_marks
+    }
+
+    /// The **beginning-of-step** attribution hand-off collected by
+    /// [`Ledger::collect_attribution_marks`] — the legs open at `S_{n-1}`
+    /// (including any that close this step), each carrying its retained `S_{n-1}`
+    /// unit Greeks. Valid until the next `collect_attribution_marks`; the P&L
+    /// attribution reads it so a leg that dies this step still contributes its
+    /// θ/Δ/V interval instead of inflating the residual (F22).
+    #[must_use]
+    pub fn attribution_marks(&self) -> &[PositionMark] {
+        &self.attribution_marks
+    }
+
+    /// Build the beginning-of-step [`Ledger::attribution_marks`] from
+    /// `begin_of_step` (the inventory as held at `S_{n-1}`, **before** this step's
+    /// opens/closes were applied), each leg carrying its retained `S_{n-1}` unit
+    /// Greeks.
+    ///
+    /// Call this **after** the step's fills are applied to the inventory but
+    /// **before** [`Ledger::settle`], because `settle` advances the retained Greek
+    /// endpoint from `S_{n-1}` to `S_n` at its end; reading `self.greeks` here
+    /// therefore observes the `S_{n-1}` endpoint the attribution needs. Legs that
+    /// open **this** step are deliberately excluded — they held no `S_{n-1}→S_n`
+    /// interval, and (with no `S_{n-1}` Greeks) contributed nothing to the Greek
+    /// terms anyway; legs that **close** this step are included so their interval
+    /// is attributed rather than lost to the residual.
+    ///
+    /// The `mark` / `stale_mark` fields on each [`PositionMark`] are neutral
+    /// placeholders here — the attribution collector reads only `contract`,
+    /// `prior_greeks`, `quantity`, `contract_multiplier`, and `side`. Reused
+    /// scratch, cleared and refilled in place — PB-1-safe (a leg push is an
+    /// `Arc<str>` refcount bump, not a heap allocation).
+    pub fn collect_attribution_marks(
+        &mut self,
+        begin_of_step: &[OpenPosition],
+        contract_multiplier: u32,
+    ) {
+        self.attribution_marks.clear();
+        for leg in begin_of_step {
+            // The retained endpoint is still S_{n-1} at this point (settle's
+            // deferred update to S_n runs later), so this is the leg's
+            // beginning-of-step Greek observation.
+            let prior_greeks = self.greeks.get(&leg.contract).copied();
+            self.attribution_marks.push(PositionMark {
+                position_id: leg.position_id,
+                contract: leg.contract.clone(),
+                side: leg.side,
+                quantity: leg.quantity,
+                contract_multiplier,
+                // Unused by the attribution collector — a neutral placeholder.
+                mark: leg.entry_premium,
+                stale_mark: false,
+                prior_greeks,
+            });
+        }
     }
 
     /// The step just settled's `spread_capture = −Σ slippage` over its fills —
@@ -329,11 +415,23 @@ impl Ledger {
             .ok_or(BacktestError::ArithmeticOverflow)?;
         let net = i64::try_from(net).map_err(|_| BacktestError::ArithmeticOverflow)?;
         self.cash = self.cash.checked_add(Cents::new(net))?;
-        // Accumulate the step's fill signals (raw slippage sum and fee sum); the
+        // Accumulate the step's fill signals (slippage sum and fee sum); the
         // single sign flip to spread_capture happens once, at settle.
+        //
+        // `fill.slippage` is `(price − decision_mid) × quantity × side_sign` —
+        // per-contract cents already weighted by quantity but NOT by the
+        // contract multiplier. `spread_capture = −Σ slippage` sits in the P&L
+        // attribution identity against the cash-scaled `step_pnl`, so it must be
+        // on the **same cash basis** as cash flow (`price × quantity ×
+        // multiplier`). Scale the per-fill slippage by `contract_multiplier`
+        // here; otherwise spread_capture is underreported by the multiplier and
+        // the attribution residual absorbs the difference.
+        let scaled_slippage = i128::from(fill.slippage.value())
+            .checked_mul(i128::from(contract_multiplier))
+            .ok_or(BacktestError::ArithmeticOverflow)?;
         self.step_slippage = self
             .step_slippage
-            .checked_add(i128::from(fill.slippage.value()))
+            .checked_add(scaled_slippage)
             .ok_or(BacktestError::ArithmeticOverflow)?;
         self.step_fees = self
             .step_fees
@@ -1001,6 +1099,54 @@ mod tests {
     }
 
     #[test]
+    fn test_attribution_marks_include_a_leg_closed_this_step() {
+        // A leg held through S_0 and closed at step 1: the beginning-of-step
+        // attribution hand-off must still carry it with its S_0 unit Greeks so
+        // its interval is attributed, even though `settle` marks an EMPTY
+        // post-fill inventory (F22). The bundle-facing `position_marks` stays the
+        // post-fill survivors (here, none).
+        let mut ledger = Ledger::new(Cents::new(10_000_000));
+        let leg = short_call(200);
+
+        // Step 0: settle with the leg open → retains S_0 unit Greeks (delta 0.5).
+        let snap0 = snapshot(0, Some((510_000, OptionStyle::Call, 250)));
+        let Ok(_p0) = ledger.settle(
+            StepIndex::new(0),
+            snap0.ts,
+            std::slice::from_ref(&leg),
+            &snap0,
+        ) else {
+            panic!("settle 0");
+        };
+
+        // Step 1: the leg closes this step. Beginning-of-step holdings still
+        // include it (collect BEFORE settle advances the Greek endpoint); the
+        // post-fill inventory is empty.
+        let snap1 = snapshot(1, Some((510_000, OptionStyle::Call, 260)));
+        ledger.collect_attribution_marks(std::slice::from_ref(&leg), 100);
+        let Ok(_p1) = ledger.settle(StepIndex::new(1), snap1.ts, &[], &snap1) else {
+            panic!("settle 1");
+        };
+
+        // The attribution hand-off carries the closed leg with its S_0 Greeks…
+        let Some(mark) = ledger.attribution_marks().first() else {
+            panic!("the beginning-of-step leg is in the attribution hand-off");
+        };
+        assert_eq!(mark.position_id, PositionId::new(1));
+        assert_eq!(
+            mark.prior_greeks,
+            Some(default_unit_greeks()),
+            "the closed leg carries its S_0 unit Greeks as the interval endpoint"
+        );
+        assert_eq!(mark.contract_multiplier, 100);
+        // …while the bundle-facing position_marks (post-fill survivors) is empty.
+        assert!(
+            ledger.position_marks().is_empty(),
+            "no surviving legs after the close"
+        );
+    }
+
+    #[test]
     fn test_step_pnl_uses_initial_capital_baseline_at_step_zero() {
         // step_pnl_0 = equity_0 − initial_capital (the step-−1 baseline); every
         // later step_pnl is equity_n − equity_{n-1}.
@@ -1047,13 +1193,15 @@ mod tests {
 
     #[test]
     fn test_settle_aggregates_and_resets_step_fill_signals() {
-        // spread_capture = −Σ slippage and fees = Σ fees accumulate across the
-        // step's fills, are exposed at settle, and zero for the next step.
+        // spread_capture = −Σ (slippage × multiplier) and fees = Σ fees
+        // accumulate across the step's fills, are exposed at settle, and zero for
+        // the next step. Slippage is scaled to the cash basis by the contract
+        // multiplier (100×); fees are already a cash magnitude and are not.
         let mut ledger = Ledger::new(Cents::new(10_000_000));
         let leg = short_call(200);
 
-        // Two fills in the step: slippage 20 and −5 → Σ = 15 → spread_capture
-        // −15; fees 65 and 30 → Σ = 95.
+        // Two fills in the step: slippage 20 and −5 (per-contract) × 100 mult →
+        // 2_000 and −500 → Σ = 1_500 → spread_capture −1_500; fees 65 and 30 → 95.
         let Ok(()) = ledger.apply_fill(&sell_fill_signals(200, 65, 20), 100) else {
             panic!("apply fill 1");
         };
@@ -1071,8 +1219,8 @@ mod tests {
         };
         assert_eq!(
             ledger.spread_capture().value(),
-            -15,
-            "spread_capture is −Σ slippage, the single sign flip"
+            -1_500,
+            "spread_capture is −Σ (slippage × multiplier), the single sign flip"
         );
         assert_eq!(ledger.fees().value(), 95, "fees is Σ fees, always ≥ 0");
 

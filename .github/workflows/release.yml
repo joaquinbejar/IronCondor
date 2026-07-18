@@ -10,11 +10,18 @@
 #      a pull_request, or a manual dispatch never reach the publish job. The
 #      publish job additionally re-asserts the tag ref in its `if:` (defence in
 #      depth).
-#   2. ENVIRONMENT APPROVAL. `publish-pypi` runs in the GitHub `pypi`
-#      environment. The OWNER must create that environment with REQUIRED
-#      REVIEWERS (Settings → Environments → pypi → "Required reviewers"), so
-#      every publish pauses for a human approval click. This gate is USER-SIDE:
-#      until it exists (or without a reviewer approving), the job never uploads.
+#   2. ENVIRONMENT APPROVAL + REPO-VARIABLE KILL-SWITCH. `publish-pypi` runs in
+#      the GitHub `pypi` environment AND its `if:` additionally requires the
+#      repository variable `PYPI_PUBLISH_ENABLED == 'true'`. IMPORTANT: the
+#      `environment:` key is only a real approval gate once the OWNER creates
+#      the environment with REQUIRED REVIEWERS (Settings → Environments → pypi →
+#      "Required reviewers"). A referenced-but-unconfigured environment is
+#      AUTO-CREATED by GitHub with NO protection rules, so `environment:` alone
+#      does NOT pause for a human. The `PYPI_PUBLISH_ENABLED` variable (unset by
+#      default, settable only by a repo admin: Settings → Secrets and variables
+#      → Actions → Variables) is the fail-closed complement — until BOTH the
+#      variable is set AND a reviewer approves, the job never uploads. The
+#      variable COMPLEMENTS, it does NOT replace, the required-reviewers action.
 #   3. OIDC, NO TOKEN. Publishing uses `pypa/gh-action-pypi-publish` with
 #      `permissions: id-token: write` and NO password/API token. It works ONLY
 #      once the OWNER registers a PyPI "trusted publisher" for this repo +
@@ -178,20 +185,30 @@ jobs:
           if-no-files-found: error
 
   # ───────────────────────────────────────────────────────────────────────────
-  # (b) Publish to PyPI via trusted publishing (OIDC). GATED four ways:
-  #     tag-only trigger + `if` tag guard + `environment: pypi` (manual approval)
+  # (b) Publish to PyPI via trusted publishing (OIDC). GATED five ways:
+  #     tag-only trigger + `if` guard (tag ref AND the `PYPI_PUBLISH_ENABLED`
+  #     repo-variable kill-switch) + `environment: pypi` required reviewers
   #     + OIDC-no-token (needs the owner's trusted-publisher registration).
-  #     The "Private :: Do Not Upload" classifier is a fifth, upload-time guard.
+  #     The "Private :: Do Not Upload" classifier is a sixth, upload-time guard.
   publish-pypi:
     name: publish-pypi
     needs: [build-wheels, build-sdist]
     runs-on: ubuntu-24.04
-    # Belt-and-suspenders: the trigger is already tag-only, but re-assert it so
-    # the publish path is structurally unreachable on any non-tag ref.
-    if: startsWith(github.ref, 'refs/tags/v')
-    # The USER-SIDE approval gate: create this environment with REQUIRED
-    # REVIEWERS so every publish pauses for a human. Until it exists / is
-    # approved, this job cannot upload.
+    # Fail-closed gate: the tag ref (belt-and-suspenders over the tag-only
+    # trigger) AND the repo-variable kill-switch. `environment: pypi` is NOT a
+    # sufficient approval gate on its own — a referenced-but-unconfigured
+    # environment is auto-created with no protection rules — so the publish path
+    # additionally requires `vars.PYPI_PUBLISH_ENABLED == 'true'`, a repository
+    # variable only a repo admin can set (unset by default). It COMPLEMENTS, it
+    # does NOT replace, the required-reviewers user action described below.
+    if: >-
+      startsWith(github.ref, 'refs/tags/v')
+      && vars.PYPI_PUBLISH_ENABLED == 'true'
+    # The USER-SIDE approval gate: this environment enforces a human pause ONLY
+    # once the owner configures it with REQUIRED REVIEWERS (Settings →
+    # Environments → pypi). Unconfigured, GitHub auto-creates it with no
+    # protection, so the `PYPI_PUBLISH_ENABLED` variable in the `if:` above is
+    # the complementary fail-closed switch, not this key alone.
     environment:
       name: pypi
       url: https://pypi.org/project/ironcondor/

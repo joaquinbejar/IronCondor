@@ -65,20 +65,41 @@ impl TapeMeta {
     /// allowed and preserved); the non-empty guarantee is established here so
     /// the loop never has to re-check it.
     ///
+    /// The tape's [`StepIndex`](crate::domain::StepIndex) is **0-based and
+    /// consecutive** (`+1` per snapshot); this is validated here, in the shared
+    /// core every feed funnels through, so a duplicate, reordered, or gapped
+    /// `step` can never masquerade as a shorter run (a step equal to a prior one
+    /// would otherwise let a later phase key on the wrong snapshot, ending the
+    /// run early). The check is independent of the timestamp check: `ts` fixes
+    /// wall-order, `step` fixes the run ordinal.
+    ///
     /// # Errors
     ///
     /// - [`BacktestError::Conversion`] if the tape is empty — the non-empty
     ///   guarantee cannot be established.
     /// - [`BacktestError::DataOutOfOrder`] if any timestamp is not strictly
     ///   after its predecessor (a duplicate or reversed `ts`).
+    /// - [`BacktestError::Conversion`] if the first step is not `0` or any step
+    ///   is not exactly one greater than its predecessor (a duplicate, gap, or
+    ///   non-zero start).
+    /// - [`BacktestError::ArithmeticOverflow`] if the expected next step
+    ///   overflows `u32` (unreachable under the `max_steps` ceiling, checked
+    ///   rather than wrapped).
     pub fn from_tape(data_identity: String, tape: &[ChainSnapshot]) -> Result<Self, BacktestError> {
         let mut iter = tape.iter();
         let first = iter.next().ok_or_else(|| {
             BacktestError::Conversion("cannot build tape meta from an empty tape".to_string())
         })?;
+        if first.step.value() != 0 {
+            return Err(BacktestError::Conversion(format!(
+                "tape must start at step 0, got step {} (the StepIndex contract is \
+                 0-based and consecutive)",
+                first.step.value()
+            )));
+        }
         let first_ts = first.ts;
         let mut prev = first.ts;
-        let mut final_step = first.step;
+        let mut prev_step = first.step;
         for snapshot in iter {
             if snapshot.ts <= prev {
                 return Err(BacktestError::DataOutOfOrder {
@@ -87,14 +108,25 @@ impl TapeMeta {
                     prev: prev.value(),
                 });
             }
+            let expected = prev_step
+                .value()
+                .checked_add(1)
+                .ok_or(BacktestError::ArithmeticOverflow)?;
+            if snapshot.step.value() != expected {
+                return Err(BacktestError::Conversion(format!(
+                    "tape step {} is out of sequence: expected consecutive step {expected} \
+                     (the StepIndex contract is 0-based and +1 per snapshot)",
+                    snapshot.step.value()
+                )));
+            }
             prev = snapshot.ts;
-            final_step = snapshot.step;
+            prev_step = snapshot.step;
         }
         Ok(Self {
             data_identity,
             non_empty: true,
             first_ts,
-            final_step,
+            final_step: prev_step,
         })
     }
 }
@@ -385,6 +417,42 @@ mod tests {
                 ts: 20,
                 prev: 30
             })
+        ));
+    }
+
+    #[test]
+    fn test_tape_meta_from_tape_rejects_non_zero_start_step() {
+        // A tape whose first snapshot is step 1 violates the 0-based contract.
+        let tape = vec![snapshot(10, 1), snapshot(20, 2)];
+        let meta = TapeMeta::from_tape("id".to_string(), &tape);
+        assert!(matches!(meta, Err(BacktestError::Conversion(_))));
+    }
+
+    #[test]
+    fn test_tape_meta_from_tape_rejects_duplicate_step() {
+        // Two snapshots both at step 0 (ts still strictly increasing): the
+        // consecutive-step contract is violated even though ts is fine, so a
+        // repeated final step can no longer end the run early.
+        let tape = vec![snapshot(10, 0), snapshot(20, 0)];
+        let meta = TapeMeta::from_tape("id".to_string(), &tape);
+        assert!(matches!(meta, Err(BacktestError::Conversion(_))));
+    }
+
+    #[test]
+    fn test_tape_meta_from_tape_rejects_step_gap() {
+        // Steps 0 then 2 (a gap): expected consecutive step 1, got 2.
+        let tape = vec![snapshot(10, 0), snapshot(20, 2)];
+        let meta = TapeMeta::from_tape("id".to_string(), &tape);
+        assert!(matches!(meta, Err(BacktestError::Conversion(_))));
+    }
+
+    #[test]
+    fn test_tape_meta_from_tape_accepts_consecutive_zero_based_steps() {
+        let tape = vec![snapshot(10, 0), snapshot(20, 1), snapshot(30, 2)];
+        let meta = TapeMeta::from_tape("id".to_string(), &tape);
+        assert!(matches!(
+            meta,
+            Ok(m) if m.non_empty && m.final_step == StepIndex::new(2) && m.first_ts == SimTime::new(10)
         ));
     }
 

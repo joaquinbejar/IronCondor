@@ -53,16 +53,16 @@
       "max_capital_used": "0",
       "max_margin_used": "0",
       "max_position_size": "0",
-      "net_premium": "15.00",
+      "net_premium": "1500.00",
       "total_margin_used": "0",
       "total_premium_paid": "0.00",
-      "total_premium_received": "15.00"
+      "total_premium_received": "1500.00"
     },
     "custom_metrics": {
       "long_legs_realized_cents": "0",
       "max_drawdown_cents": "660",
       "max_drawdown_ratio": "-0.0000660000000000000050601884",
-      "net_premium_cents": "1500",
+      "net_premium_cents": "150000",
       "realized_pnl_cents": "-330",
       "short_legs_realized_cents": "-330"
     },
@@ -112,10 +112,10 @@
       "avg_vomma_exposure": null,
       "calls_percentage": "0.50",
       "long_percentage": "0",
-      "premium_capture": "-0.22",
+      "premium_capture": "-0.0022",
       "puts_percentage": "0.50",
       "return_on_margin": null,
-      "return_on_premium": "-0.22",
+      "return_on_premium": "-0.0022",
       "short_percentage": "1"
     },
     "risk_metrics": {

@@ -482,7 +482,10 @@ proptest! {
     fn bundle_serde_identity(
         step in any::<u32>(),
         ts_ns in any::<i64>(),
-        run_id in ".*",
+        // A run_id is a sha256 hex (64 lowercase hex chars); RunId now validates
+        // that on deserialize, so the generator produces well-formed ids (also
+        // the realistic shape of a FillRow.strategy_run_id).
+        run_id in "[0-9a-f]{64}",
         trade_id in any::<u64>(),
         position_id in any::<u64>(),
         order_id in any::<u64>(),
@@ -598,8 +601,10 @@ proptest! {
         let back: Result<RowCounts, _> = serde_json::from_str(&json);
         prop_assert!(matches!(back, Ok(ref r) if *r == counts));
 
-        // run_id is transparent over its bare string.
+        // run_id is transparent over its bare (validated 64-hex) string.
         let id = RunId::from_hex(run_id.clone());
+        prop_assert!(id.is_ok());
+        let Ok(id) = id else { return Ok(()); };
         let json = serde_json::to_string(&id);
         prop_assert!(json.is_ok());
         let Ok(json) = json else { return Ok(()); };

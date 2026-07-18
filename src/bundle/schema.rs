@@ -109,15 +109,69 @@ pub const fn greeks_sort_key(row: &GreeksAttributionRow) -> u32 {
 /// The deterministic run identity — a lower-hex `sha256` string
 /// ([docs/01 §10](../../../docs/01-domain-model.md#10-run-identity-and-manifest)).
 ///
-/// Serialises as its **bare** inner string (`#[serde(transparent)]`), so a
+/// Serialises as its **bare** inner string (via `into = "String"`), so a
 /// `RunId` is `"9f2c…"` on the wire, never `{"RunId":"9f2c…"}`. It is also the
 /// directory name of the bundle and the `strategy_run_id` stamped on every
 /// [`FillRow`].
 ///
+/// **Deserialisation is validated** (`try_from = "String"`): a decoded value
+/// must be exactly 64 lowercase hexadecimal characters (a `sha256` digest), so a
+/// tampered manifest cannot smuggle a `run_id` that is a path fragment, an
+/// overlong string, or mixed-case — it becomes a typed [`BacktestError::Bundle`]
+/// at the boundary. The `sha256` shape is what makes a `run_id` safe to use as
+/// the bundle directory name.
+///
 /// See [`RunId::derive`] for the exact hashed preimage.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
+#[serde(into = "String", try_from = "String")]
 pub struct RunId(String);
+
+/// The fixed length of a `run_id`: a `sha256` digest is 32 bytes = 64 lower-hex
+/// characters.
+const RUN_ID_HEX_LEN: usize = 64;
+
+/// Validate that `hex` is exactly 64 lowercase hexadecimal characters — the
+/// `sha256` shape every `run_id` must carry before it is trusted as a bundle
+/// directory name.
+///
+/// # Errors
+///
+/// Returns [`BacktestError::Bundle`] naming the violation (wrong length, or a
+/// non-lowercase-hex character).
+fn validate_run_id_hex(hex: &str) -> Result<(), BacktestError> {
+    if hex.len() != RUN_ID_HEX_LEN {
+        return Err(BacktestError::Bundle(format!(
+            "run_id must be {RUN_ID_HEX_LEN} lowercase hex characters, got {} characters",
+            hex.len()
+        )));
+    }
+    if !hex
+        .bytes()
+        .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f'))
+    {
+        return Err(BacktestError::Bundle(format!(
+            "run_id must be {RUN_ID_HEX_LEN} lowercase hex characters, got {hex:?}"
+        )));
+    }
+    Ok(())
+}
+
+/// Validated deserialisation seam: a decoded string is admitted only if it is a
+/// well-formed lowercase-hex `sha256`.
+impl TryFrom<String> for RunId {
+    type Error = BacktestError;
+
+    fn try_from(hex: String) -> Result<Self, Self::Error> {
+        Self::from_hex(hex)
+    }
+}
+
+/// The transparent wire form: a `RunId` serialises as its bare inner string.
+impl From<RunId> for String {
+    fn from(id: RunId) -> Self {
+        id.0
+    }
+}
 
 impl RunId {
     /// Derive the run identity from the **complete reproducibility tuple**
@@ -194,10 +248,17 @@ impl RunId {
     }
 
     /// Wrap an already-computed run-id string (e.g. one read back from a
-    /// manifest). Prefer [`RunId::derive`] to mint a fresh identity.
-    #[must_use]
-    pub const fn from_hex(hex: String) -> Self {
-        Self(hex)
+    /// manifest), **validating** it is a 64-character lowercase-hex `sha256`.
+    /// Prefer [`RunId::derive`] to mint a fresh identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BacktestError::Bundle`] if `hex` is not exactly 64 lowercase
+    /// hexadecimal characters.
+    #[must_use = "the validated run id must be used"]
+    pub fn from_hex(hex: String) -> Result<Self, BacktestError> {
+        validate_run_id_hex(&hex)?;
+        Ok(Self(hex))
     }
 
     /// The bare run-id string — the bundle directory name and the value stamped
@@ -446,13 +507,50 @@ mod tests {
 
     #[test]
     fn test_run_id_serialises_transparently_as_a_bare_string() {
-        let id = RunId::from_hex("abc123".to_string());
+        // A well-formed 64-char lowercase-hex id round-trips as a bare string.
+        let hex = "a".repeat(64);
+        let Ok(id) = RunId::from_hex(hex.clone()) else {
+            panic!("a 64-char hex id must build");
+        };
         let Ok(json) = serde_json::to_string(&id) else {
             panic!("run id serialises");
         };
-        assert_eq!(json, "\"abc123\"");
-        let back: Result<RunId, _> = serde_json::from_str("\"abc123\"");
-        assert!(matches!(back, Ok(ref r) if r.as_str() == "abc123"));
+        assert_eq!(json, format!("\"{hex}\""));
+        let back: Result<RunId, _> = serde_json::from_str(&format!("\"{hex}\""));
+        assert!(matches!(back, Ok(ref r) if r.as_str() == hex));
+    }
+
+    #[test]
+    fn test_run_id_from_hex_rejects_malformed_ids() {
+        // Wrong length, uppercase hex, and non-hex characters are all rejected
+        // — a run_id must be a 64-char lowercase-hex sha256 before it is a
+        // bundle directory name.
+        assert!(RunId::from_hex("abc123".to_string()).is_err(), "too short");
+        assert!(
+            RunId::from_hex("A".repeat(64)).is_err(),
+            "uppercase hex rejected"
+        );
+        assert!(
+            RunId::from_hex("g".repeat(64)).is_err(),
+            "non-hex character rejected"
+        );
+        assert!(
+            RunId::from_hex(format!("../{}", "a".repeat(61))).is_err(),
+            "a path fragment is rejected"
+        );
+        assert!(
+            RunId::from_hex("a".repeat(64)).is_ok(),
+            "valid hex accepted"
+        );
+    }
+
+    #[test]
+    fn test_run_id_deserialize_rejects_malformed_ids() {
+        // The `try_from = "String"` seam rejects a tampered manifest run_id.
+        let bad: Result<RunId, _> = serde_json::from_str("\"not-a-sha256\"");
+        assert!(bad.is_err(), "a non-hex run_id must fail to deserialize");
+        let ok: Result<RunId, _> = serde_json::from_str(&format!("\"{}\"", "0".repeat(64)));
+        assert!(ok.is_ok(), "a valid 64-char hex run_id deserializes");
     }
 
     #[test]

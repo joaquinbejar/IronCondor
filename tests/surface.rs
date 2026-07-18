@@ -6,15 +6,22 @@
 //! Two of the four frozen SemVer surfaces
 //! ([docs/SEMVER.md §"What counts as a public surface"](../docs/SEMVER.md)):
 //!
-//! - **Rust public API** — every `pub mod` and every `pub use` leaf declared in
-//!   [`src/lib.rs`](../src/lib.rs), annotated with its cfg feature (or
-//!   `default`). This is the documented source of truth for the Rust surface:
-//!   internal items not re-exported from `lib.rs` are not part of the contract.
-//!   The extracted list is compared against the committed snapshot
-//!   [`tests/surface/rust-public-api.txt`](surface/rust-public-api.txt). A
-//!   re-export **add / remove / rename** changes the snapshot and **fails CI**
-//!   unless the snapshot is regenerated in the same PR — the visible SemVer
-//!   event.
+//! - **Rust public API** — the whole surface reachable through the `pub mod`
+//!   tree rooted at [`src/lib.rs`](../src/lib.rs): every `pub mod`, every
+//!   `pub use` leaf, and every `pub` item (`fn` / `struct` / `enum` / `trait` /
+//!   `type` / `const` / `static`) declared at module level in `lib.rs` **and in
+//!   each module transitively reachable through a `pub mod`** (resolved from
+//!   `src/X.rs` / `src/X/mod.rs`), each annotated with its effective cfg feature
+//!   (or `default`). Because a `pub mod` re-exports every `pub` item beneath it
+//!   under `ironcondor::<path>`, those items are part of the contract even when
+//!   they are not re-exported at the crate root — so the snapshot tracks them
+//!   too (that is the #44 gap the earlier lib.rs-only extractor missed).
+//!   `pub(crate)` / `pub(super)` items are excluded (not reachable). The
+//!   extracted list is compared against the committed snapshot
+//!   [`tests/surface/rust-public-api.txt`](surface/rust-public-api.txt). An
+//!   **add / remove / rename** anywhere in that surface changes the snapshot and
+//!   **fails CI** unless the snapshot is regenerated in the same PR — the
+//!   visible SemVer event.
 //! - **Configuration env vars** — the set of runtime environment variables the
 //!   crate reads (`env::var` / `env::var_os` under `src/`). Only `API_URL` (the
 //!   OptionChain-Simulator base-URL override) is a behaviour-affecting runtime
@@ -135,55 +142,266 @@ fn parse_use(stmt: &str) -> Vec<String> {
     }
 }
 
-/// Extract the public re-export surface declared in `src/lib.rs`: every
-/// `pub mod` and every `pub use` leaf, each tagged with its cfg feature (or
-/// `default`). Returns sorted `"<feature> <kind> <path>"` lines.
-fn extract_surface(src: &str) -> Vec<String> {
+/// A file-based `pub mod NAME;` child to recurse into: its exported name, the
+/// path prefix its own items receive, and the cfg feature it inherits.
+struct ChildMod {
+    /// The module identifier (resolves to `<dir>/NAME.rs` or `<dir>/NAME/mod.rs`).
+    name: String,
+    /// The `path::` prefix prepended to every item declared inside the module.
+    prefix: String,
+    /// The inherited feature gate (`None` == `default`).
+    feature: Option<String>,
+}
+
+/// Combine an inherited module feature with an item's own `#[cfg(feature)]`:
+/// either alone when only one is present, the shared value when equal, else a
+/// deterministic sorted `"a+b"` join (an item reachable only with BOTH gates).
+fn combine_feature(base: Option<&str>, item: Option<&str>) -> String {
+    match (base, item) {
+        (None, None) => "default".to_string(),
+        (Some(f), None) | (None, Some(f)) => f.to_string(),
+        (Some(a), Some(b)) if a == b => a.to_string(),
+        (Some(a), Some(b)) => {
+            let mut parts = [a, b];
+            parts.sort_unstable();
+            format!("{}+{}", parts[0], parts[1])
+        }
+    }
+}
+
+/// Map a rendered `effective` feature back to the `Option` a child module
+/// inherits (`"default"` == none).
+fn feature_to_opt(effective: &str) -> Option<String> {
+    (effective != "default").then(|| effective.to_string())
+}
+
+/// Determine the `(kind, name)` of a top-level `pub` item line, if it is one of
+/// the tracked item kinds. The `const fn` / `async fn` forms are matched before
+/// the bare `const` so the function name (not `"fn"`) is captured. Returns
+/// `None` for any other line. `pub(crate)` / `pub(super)` never match — the
+/// prefixes carry a trailing space, which `pub(` lacks.
+fn item_kind_and_name(line: &str) -> Option<(&'static str, String)> {
+    const RULES: [(&str, &str); 10] = [
+        ("pub const fn ", "fn"),
+        ("pub async fn ", "fn"),
+        ("pub fn ", "fn"),
+        ("pub struct ", "struct"),
+        ("pub enum ", "enum"),
+        ("pub trait ", "trait"),
+        ("pub type ", "type"),
+        ("pub const ", "const"),
+        ("pub static ", "static"),
+        ("pub union ", "union"),
+    ];
+    for (prefix, kind) in RULES {
+        if let Some(rest) = line.strip_prefix(prefix) {
+            let name = leading_ident(rest);
+            if !name.is_empty() {
+                return Some((kind, name));
+            }
+        }
+    }
+    None
+}
+
+/// The leading Rust identifier of `s` (stops at the first `(`, `<`, `:`, `=`,
+/// `;`, `{`, or whitespace) — the item name after its keyword.
+fn leading_ident(s: &str) -> String {
+    s.chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect()
+}
+
+/// Remove up to one 4-space indentation level (or a single leading tab) from a
+/// line — used to dedent an inline `pub mod { … }` body before re-extracting it.
+fn dedent_one(line: &str) -> &str {
+    line.strip_prefix("    ")
+        .or_else(|| line.strip_prefix('\t'))
+        .unwrap_or(line)
+}
+
+/// Capture the body of an inline `pub mod X { … }` opening at `lines[start]`: the
+/// lines through the matching **column-0** closing brace, each dedented one
+/// level, joined with newlines. rustfmt guarantees the module's own closing
+/// brace is the first line that is exactly `}` at column 0 (nested `fn` / `impl`
+/// braces close indented). Returns the body text and the index just past `}`.
+fn capture_inline_body(lines: &[&str], start: usize) -> (String, usize) {
+    let mut body = String::new();
+    let mut i = start + 1;
+    while i < lines.len() {
+        if lines[i] == "}" {
+            i += 1;
+            break;
+        }
+        body.push_str(dedent_one(lines[i]));
+        body.push('\n');
+        i += 1;
+    }
+    (body, i)
+}
+
+/// Extract the public surface declared **directly** in one module's text.
+///
+/// `prefix` is the module's path prefix (`""` for `lib.rs`, `"engine::"` for
+/// `src/engine/mod.rs`, …) and `base_feature` the cfg feature it inherits.
+/// Records every `pub mod`, `pub use` leaf, and tracked `pub` item, each tagged
+/// with its effective feature; inline `pub mod X { … }` bodies are extracted in
+/// place (recursively), while file-based `pub mod X;` declarations are returned
+/// as [`ChildMod`]s for the driver to read and recurse into. Only column-0
+/// (module-level) lines are items, so struct fields and `impl` methods — always
+/// indented in rustfmt'd code — are excluded. Returns the sorted
+/// `"<feature> <kind> <path>"` lines plus the file-based children.
+fn extract_module(
+    text: &str,
+    prefix: &str,
+    base_feature: Option<&str>,
+) -> (BTreeSet<String>, Vec<ChildMod>) {
     let mut out: BTreeSet<String> = BTreeSet::new();
+    let mut children: Vec<ChildMod> = Vec::new();
     let mut pending_feature: Option<String> = None;
-    let mut lines = src.lines();
-    while let Some(raw) = lines.next() {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let raw = lines[i];
         let line = raw.trim();
+
+        // A `#[cfg(feature = "X")]` attaches to the NEXT item.
         if line.starts_with("#[cfg(feature") {
             if let Some(feature) = feature_of(line) {
                 pending_feature = Some(feature);
             }
+            i += 1;
             continue;
         }
-        // Other attributes, doc comments, comments, blanks: keep any pending
-        // feature (a `#[cfg(feature)]` attaches to the next item) and skip.
-        if line.is_empty() || line.starts_with('#') || line.starts_with("//") {
+        // Only column-0 lines are module-level items; anything indented is a
+        // field / method / item body. Blank / attribute / comment lines keep any
+        // pending feature (a cfg attaches to the next item) and are skipped.
+        let indented = raw.starts_with(|c: char| c.is_whitespace());
+        if indented || line.is_empty() || line.starts_with('#') || line.starts_with("//") {
+            i += 1;
             continue;
         }
-        let feature = pending_feature
-            .clone()
-            .unwrap_or_else(|| "default".to_string());
+
+        let effective = combine_feature(base_feature, pending_feature.as_deref());
+
+        // `pub mod` — inline (`{`) body extracted in place, or file (`;`) child.
         if let Some(rest) = line.strip_prefix("pub mod ") {
-            let name = rest.trim_end_matches(';').trim();
-            out.insert(format!("{feature} mod {name}"));
-            pending_feature = None;
-            continue;
-        }
-        if line.starts_with("pub use ") {
-            // Accumulate a possibly multi-line group until the terminating `;`.
-            let mut stmt = String::from(line);
-            while !stmt.contains(';') {
-                match lines.next() {
-                    Some(next) => {
-                        stmt.push(' ');
-                        stmt.push_str(next.trim());
-                    }
-                    None => break,
+            let name = leading_ident(rest);
+            if !name.is_empty() {
+                out.insert(format!("{effective} mod {prefix}{name}"));
+                let child_prefix = format!("{prefix}{name}::");
+                let child_feature = feature_to_opt(&effective);
+                if line.contains('{') {
+                    let (body, next) = capture_inline_body(&lines, i);
+                    let (child_lines, child_children) =
+                        extract_module(&body, &child_prefix, child_feature.as_deref());
+                    out.extend(child_lines);
+                    children.extend(child_children);
+                    i = next;
+                } else {
+                    children.push(ChildMod {
+                        name,
+                        prefix: child_prefix,
+                        feature: child_feature,
+                    });
+                    i += 1;
                 }
+                pending_feature = None;
+                continue;
+            }
+        }
+
+        // `pub use` — accumulate a possibly multi-line group until `;`.
+        if line.starts_with("pub use ") {
+            let mut stmt = String::from(line);
+            while !stmt.contains(';') && i + 1 < lines.len() {
+                i += 1;
+                stmt.push(' ');
+                stmt.push_str(lines[i].trim());
             }
             for path in parse_use(&stmt) {
-                out.insert(format!("{feature} use {path}"));
+                out.insert(format!("{effective} use {prefix}{path}"));
             }
             pending_feature = None;
+            i += 1;
             continue;
         }
-        // Any other item ends the reach of a pending feature.
-        pending_feature = None;
+
+        // Any other tracked `pub` item (fn / struct / enum / trait / type / …).
+        if let Some((kind, name)) = item_kind_and_name(line) {
+            out.insert(format!("{effective} {kind} {prefix}{name}"));
+            pending_feature = None;
+            i += 1;
+            continue;
+        }
+
+        // A column-0 line starting with a letter (a non-pub item — `impl`, a
+        // private `fn`, a macro invocation) ends the reach of a pending feature;
+        // punctuation-led continuation lines (`)]`, `}`, …) leave it intact.
+        if raw.starts_with(|c: char| c.is_ascii_alphabetic()) {
+            pending_feature = None;
+        }
+        i += 1;
+    }
+    (out, children)
+}
+
+/// Extract the public surface declared **directly** in one module's text (no
+/// recursion into file-based children). The extractor unit tests use this; the
+/// freeze gate itself uses [`extract_tree`].
+fn extract_surface(src: &str) -> Vec<String> {
+    extract_module(src, "", None).0.into_iter().collect()
+}
+
+/// Resolve `pub mod name;` under `dir` to `(module file, submodule dir)`:
+/// `dir/name.rs` or `dir/name/mod.rs`, with the module's own submodules resolved
+/// against `dir/name`.
+fn resolve_module(dir: &Path, name: &str) -> Option<(PathBuf, PathBuf)> {
+    let sub_dir = dir.join(name);
+    let as_file = dir.join(format!("{name}.rs"));
+    if as_file.is_file() {
+        return Some((as_file, sub_dir));
+    }
+    let as_mod = sub_dir.join("mod.rs");
+    if as_mod.is_file() {
+        return Some((as_mod, sub_dir));
+    }
+    None
+}
+
+/// Extract the crate's entire public surface: `src/lib.rs` plus every module
+/// transitively reachable through a `pub mod`, each item tagged with its
+/// effective cfg feature. Returns sorted `"<feature> <kind> <path>"` lines.
+fn extract_tree(src_dir: &Path) -> Vec<String> {
+    let lib = src_dir.join("lib.rs");
+    let src = match fs::read_to_string(&lib) {
+        Ok(src) => src,
+        Err(err) => panic!("cannot read {}: {err}", lib.display()),
+    };
+    let mut out: BTreeSet<String> = BTreeSet::new();
+    let (lines, children) = extract_module(&src, "", None);
+    out.extend(lines);
+    // Each stack entry pairs a child module with the directory its file resolves
+    // against (children of `lib.rs` live directly under `src/`).
+    let mut stack: Vec<(ChildMod, PathBuf)> = children
+        .into_iter()
+        .map(|child| (child, src_dir.to_path_buf()))
+        .collect();
+    while let Some((child, dir)) = stack.pop() {
+        let Some((file, sub_dir)) = resolve_module(&dir, &child.name) else {
+            // A `pub mod` with no on-disk file has no textual surface — skip it
+            // rather than fail (every mod in this crate does resolve).
+            continue;
+        };
+        let text = match fs::read_to_string(&file) {
+            Ok(text) => text,
+            Err(err) => panic!("cannot read {}: {err}", file.display()),
+        };
+        let (lines, grandchildren) = extract_module(&text, &child.prefix, child.feature.as_deref());
+        out.extend(lines);
+        for grandchild in grandchildren {
+            stack.push((grandchild, sub_dir.clone()));
+        }
     }
     out.into_iter().collect()
 }
@@ -232,12 +450,7 @@ fn scan_runtime_env_vars(src_dir: &Path) -> BTreeSet<String> {
 
 #[test]
 fn test_rust_public_api_surface_matches_snapshot() {
-    let lib = crate_root().join("src/lib.rs");
-    let src = match fs::read_to_string(&lib) {
-        Ok(src) => src,
-        Err(err) => panic!("cannot read {}: {err}", lib.display()),
-    };
-    let current = extract_surface(&src);
+    let current = extract_tree(&crate_root().join("src"));
     let rendered = format!("{}\n", current.join("\n"));
     let path = snapshot_path();
 
@@ -293,7 +506,10 @@ fn test_runtime_env_vars_are_pinned() {
 
 #[cfg(test)]
 mod extractor_unit_tests {
-    use super::{extract_surface, parse_use, scan_runtime_env_vars};
+    use super::{
+        combine_feature, crate_root, extract_module, extract_surface, extract_tree,
+        item_kind_and_name, parse_use, scan_runtime_env_vars,
+    };
     use std::path::PathBuf;
 
     #[test]
@@ -343,6 +559,166 @@ pub use execution::RealisticFill;
         assert!(out.contains(&"python mod python".to_string()));
         assert!(out.contains(&"default use error::BacktestError".to_string()));
         assert!(out.contains(&"orderbook use execution::RealisticFill".to_string()));
+    }
+
+    #[test]
+    fn test_item_kind_and_name_covers_each_kind() {
+        let cases = [
+            ("pub struct Foo {", Some(("struct", "Foo"))),
+            ("pub struct Bar(u64);", Some(("struct", "Bar"))),
+            ("pub struct Unit;", Some(("struct", "Unit"))),
+            ("pub struct Gen<T> {", Some(("struct", "Gen"))),
+            ("pub enum E {", Some(("enum", "E"))),
+            ("pub trait T: Base {", Some(("trait", "T"))),
+            ("pub fn f(x: u8) -> u8 {", Some(("fn", "f"))),
+            ("pub type Alias<X> = Vec<X>;", Some(("type", "Alias"))),
+            ("pub const K: u8 = 1;", Some(("const", "K"))),
+            ("pub static S: u8 = 1;", Some(("static", "S"))),
+            // `const fn` / `async fn` must capture the fn NAME, not "fn".
+            ("pub const fn cf() -> u8 { 0 }", Some(("fn", "cf"))),
+            ("pub async fn af() {}", Some(("fn", "af"))),
+            // restricted visibility is not part of the public surface.
+            ("pub(crate) fn hidden() {}", None),
+            ("pub(super) struct Inner;", None),
+            ("fn private() {}", None),
+            ("impl Foo {", None),
+        ];
+        for (line, expected) in cases {
+            let got = item_kind_and_name(line);
+            let want = expected.map(|(k, n)| (k, n.to_string()));
+            assert_eq!(got, want, "item_kind_and_name({line:?})");
+        }
+    }
+
+    #[test]
+    fn test_combine_feature_joins_two_gates() {
+        assert_eq!(combine_feature(None, None), "default");
+        assert_eq!(combine_feature(Some("python"), None), "python");
+        assert_eq!(combine_feature(None, Some("simulator")), "simulator");
+        assert_eq!(combine_feature(Some("python"), Some("python")), "python");
+        // A deterministic sorted join when an item needs BOTH gates.
+        assert_eq!(
+            combine_feature(Some("python"), Some("orderbook")),
+            "orderbook+python"
+        );
+        assert_eq!(
+            combine_feature(Some("orderbook"), Some("python")),
+            "orderbook+python"
+        );
+    }
+
+    #[test]
+    fn test_extract_module_captures_pub_items_with_prefix() {
+        let src = "\
+pub struct Foo {
+    field: u8,
+}
+pub enum Bar {
+    A,
+}
+impl Foo {
+    pub fn method(&self) {}
+}
+pub fn free() {}
+pub const fn konst() -> u8 { 0 }
+pub const K: u8 = 1;
+pub type Alias = u8;
+";
+        let (out, _children) = extract_module(src, "engine::", None);
+        assert!(out.contains("default struct engine::Foo"), "{out:?}");
+        assert!(out.contains("default enum engine::Bar"));
+        assert!(out.contains("default fn engine::free"));
+        assert!(out.contains("default fn engine::konst"));
+        assert!(out.contains("default const engine::K"));
+        assert!(out.contains("default type engine::Alias"));
+        // An `impl` method is indented, so it is NOT a module-level item.
+        assert!(
+            !out.contains("default fn engine::method"),
+            "impl methods excluded: {out:?}"
+        );
+        // Struct fields are indented, so they never appear.
+        assert!(!out.iter().any(|l| l.contains("field")));
+    }
+
+    #[test]
+    fn test_extract_module_returns_file_children_with_feature() {
+        let src = "\
+pub mod backtest;
+#[cfg(feature = \"simulator\")]
+pub mod session;
+";
+        let (out, children) = extract_module(src, "engine::", None);
+        assert!(out.contains("default mod engine::backtest"));
+        assert!(out.contains("simulator mod engine::session"));
+        let got: Vec<(&str, &str, Option<&str>)> = children
+            .iter()
+            .map(|c| (c.name.as_str(), c.prefix.as_str(), c.feature.as_deref()))
+            .collect();
+        assert!(
+            got.contains(&("backtest", "engine::backtest::", None)),
+            "{got:?}"
+        );
+        assert!(got.contains(&("session", "engine::session::", Some("simulator"))));
+    }
+
+    #[test]
+    fn test_extract_module_inline_mod_prefixes_body_items() {
+        let src = "\
+pub mod sign {
+    pub const fn side_sign() -> i64 {
+        1
+    }
+    pub fn helper() {}
+}
+pub struct After;
+";
+        let (out, children) = extract_module(src, "domain::", None);
+        assert!(out.contains("default mod domain::sign"));
+        assert!(
+            out.contains("default fn domain::sign::side_sign"),
+            "{out:?}"
+        );
+        assert!(out.contains("default fn domain::sign::helper"));
+        // Parsing resumes after the inline module's column-0 closing brace.
+        assert!(out.contains("default struct domain::After"));
+        // An inline module yields no file-based child.
+        assert!(children.iter().all(|c| c.name != "sign"));
+    }
+
+    #[test]
+    fn test_extract_module_propagates_base_feature() {
+        let src = "\
+pub fn plain() {}
+#[cfg(feature = \"orderbook\")]
+pub fn gated() {}
+";
+        let (out, _) = extract_module(src, "python::", Some("python"));
+        assert!(out.contains("python fn python::plain"), "{out:?}");
+        // An item's own cfg combines with the inherited module feature.
+        assert!(out.contains("orderbook+python fn python::gated"));
+    }
+
+    #[test]
+    fn test_extract_tree_is_a_superset_of_the_lib_surface() {
+        use std::fs;
+        let src_dir = crate_root().join("src");
+        let lib = fs::read_to_string(src_dir.join("lib.rs")).expect("read lib.rs");
+        let lib_surface = extract_surface(&lib);
+        let tree = extract_tree(&src_dir);
+        // Every lib.rs-level line survives the recursive extraction …
+        for line in &lib_surface {
+            assert!(tree.contains(line), "tree missing lib line {line:?}");
+        }
+        // … and recursion adds strictly more (the module internals, the #44 gap).
+        assert!(
+            tree.len() > lib_surface.len(),
+            "recursion must add nested-module surface"
+        );
+        // A nested `pub mod` declaration is now tracked (e.g. engine::<sub>).
+        assert!(
+            tree.iter().any(|l| l.starts_with("default mod engine::")),
+            "expected a nested engine submodule in the surface"
+        );
     }
 
     #[test]

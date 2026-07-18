@@ -61,6 +61,12 @@ pub struct ClosedTrade {
     /// Contracts closed on this event (`> 0`) — the full open size for a clean
     /// close, or the reduced amount for a partial close.
     pub quantity: Quantity,
+    /// Contracts → underlying units for this leg (e.g. `100`) — the same
+    /// multiplier the realised P&L was scaled by. Carried so the post-run metrics
+    /// pass can put premium aggregates (`entry_received` / `entry_paid` /
+    /// `net_premium`) on the **same cash basis** as [`Self::realized_pnl`] rather
+    /// than reporting a per-contract-unweighted premium (F23).
+    pub contract_multiplier: u32,
     /// Per-contract entry premium in integer cents.
     pub entry_premium: PriceCents,
     /// Per-contract exit (close) execution price in integer cents.
@@ -220,6 +226,7 @@ impl TradeLogCollector {
             contract: leg.contract.clone(),
             side: leg.side,
             quantity,
+            contract_multiplier,
             entry_premium: leg.entry_premium,
             exit_price,
             close_fees,

@@ -314,6 +314,47 @@ fn test_iron_condor_run_over_parquet_fixture_produces_equity_curve() {
 }
 
 #[test]
+fn test_exit_policy_firing_on_terminal_step_closes_each_leg_once() {
+    // F11 regression: a TimeSteps policy that fires exactly on the final step
+    // makes the exit phase close every leg, and on_end runs in the SAME step.
+    // Without the reconciliation, on_end re-closes the now-removed legs and the
+    // run aborts in reduce_leg ("close targets position … which is not open");
+    // with it, each leg closes exactly once and the run completes cleanly.
+    use optionstratlib::backtesting::ExitReason;
+    use optionstratlib::simulation::ExitPolicy;
+
+    let Ok(dir) = tempfile::tempdir() else {
+        panic!("tempdir must create");
+    };
+    let path = dir.path().join("condor.parquet");
+    // A 4-step tape (steps 0..=3); TimeSteps(3) fires only at the terminal step.
+    let rows = common::condor_rows(4, None);
+    if let Err(e) = common::write_parquet(&path, &rows) {
+        panic!("the condor fixture must write: {e}");
+    }
+
+    let Ok(run) = common::run_condor_with_exit(&path, 11, ExitPolicy::TimeSteps(3)) else {
+        panic!("the run must complete cleanly without a duplicate-close abort");
+    };
+
+    // Every leg closed exactly once at the terminal step — none left open, and
+    // exactly four realised closes (one per condor leg).
+    assert!(
+        run.open_at_end.is_empty(),
+        "every leg closed at the terminal step"
+    );
+    assert_eq!(run.trade_log.len(), 4, "exactly one close per condor leg");
+    // The closes were the exit policy's (a step-count hold), recorded truthfully.
+    for trade in &run.trade_log {
+        assert_eq!(
+            trade.exit_reason,
+            ExitReason::Other("time_steps".to_string()),
+            "a TimeSteps exit is recorded as time_steps, not Expiration"
+        );
+    }
+}
+
+#[test]
 fn test_run_backtest_over_parquet_fixture_populates_minimal_metrics() {
     use optionstratlib::simulation::ExitPolicy;
     use rust_decimal::Decimal;

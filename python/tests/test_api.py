@@ -250,6 +250,71 @@ def test_write_copies_the_directory_without_rerunning(bundle: ic.Bundle, tmp_pat
     assert (dest / "manifest.json").read_bytes() == original_manifest
 
 
+def test_write_rejects_same_path_and_preserves_source(bundle: ic.Bundle) -> None:
+    # write(dir == bundle.path, overwrite=True) previously deleted the source
+    # then copied from the now-empty directory, irreversibly destroying the very
+    # bundle it was meant to preserve. It must be refused BEFORE any deletion,
+    # with the source left byte-for-byte intact (F35).
+    src = Path(bundle.path)
+    original = {p.name: p.read_bytes() for p in sorted(src.iterdir()) if p.is_file()}
+    assert original, "the bundle has files"
+
+    with pytest.raises(ic.IronCondorError):
+        bundle.write(str(src), overwrite=True)
+
+    after = {p.name: p.read_bytes() for p in sorted(src.iterdir()) if p.is_file()}
+    assert after == original, "a same-path write must not touch the source"
+
+
+def test_write_rejects_destination_containing_the_source(bundle: ic.Bundle) -> None:
+    # The parent of the bundle directory CONTAINS the source; an overwrite there
+    # would delete the source too. Reject it (F35).
+    parent = Path(bundle.path).parent
+    manifest_before = (Path(bundle.path) / "manifest.json").read_bytes()
+
+    with pytest.raises(ic.IronCondorError):
+        bundle.write(str(parent), overwrite=True)
+
+    assert (Path(bundle.path) / "manifest.json").read_bytes() == manifest_before
+
+
+def test_write_overwrite_replaces_existing_destination(
+    bundle: ic.Bundle, tmp_path: Path
+) -> None:
+    # overwrite=True onto a DIFFERENT existing directory still works, and the
+    # atomic stage+rename fully replaces the stale prior contents (F35).
+    dest = tmp_path / "copy"
+    dest.mkdir()
+    (dest / "stale.txt").write_text("old")
+
+    with pytest.warns(DeprecationWarning):
+        copy = bundle.write(str(dest), overwrite=True)
+
+    assert Path(copy.path) == dest
+    assert not (dest / "stale.txt").exists(), "stale content is replaced, not merged"
+    for name in [
+        "manifest.json",
+        "fills.parquet",
+        "equity_curve.parquet",
+        "positions.parquet",
+        "greeks_attribution.parquet",
+    ]:
+        assert (dest / name).is_file(), f"{name} present after overwrite"
+
+
+def test_metrics_rejects_oversized_manifest_swapped_after_load(bundle: ic.Bundle) -> None:
+    # The handle keeps only its directory, so a directory swapped under it after
+    # load must not drive an unbounded manifest read. metrics() re-reads the
+    # manifest bounded by the default 16 MiB ceiling and fails typed on an
+    # oversized swap — no OOM / hang (F34).
+    manifest = Path(bundle.path) / "manifest.json"
+    padding = "0" * (17 * 1024 * 1024)  # 17 MiB > the 16 MiB default ceiling
+    manifest.write_text('{"metrics": {}, "padding": "' + padding + '"}')
+
+    with pytest.raises(ic.IronCondorError):
+        bundle.metrics()
+
+
 def test_run_releases_the_gil(tmp_path: Path) -> None:
     # Smoke: a background Python thread makes progress while run() executes,
     # proving run() releases the GIL for the engine + writer.

@@ -267,6 +267,7 @@ impl BacktestEngine {
             ids: IdCounters::new(),
             ledger: Ledger::new(Cents::new(initial_cents)),
             inventory: Vec::new(),
+            begin_scratch: Vec::with_capacity(16),
             cmds: Vec::with_capacity(16),
             fills: Vec::with_capacity(16),
             equity_curve: Vec::with_capacity(capacity),
@@ -295,6 +296,10 @@ impl BacktestEngine {
         state
             .attribution
             .reserve_legs(capacity, state.inventory.len());
+        // Pre-size the beginning-of-step buffer to the opening leg count so a
+        // constant-leg warm step refills it without reallocating (PB-1). A run
+        // that later opens more legs grows amortised at that transient.
+        state.begin_scratch.reserve(state.inventory.len());
         // Each opening leg closes at most once, so the trade log is bounded by
         // the opening leg count for a hold-to-close run; reserving here keeps a
         // close an amortised push (a run that opens more later grows amortised at
@@ -376,6 +381,14 @@ struct RunState<S: Strategy, X: ExecutionModel> {
     /// slice [`ChainContext::open`] borrows. Legs are pushed on open and removed
     /// on full close, so the order is monotone and therefore deterministic.
     inventory: Vec<OpenPosition>,
+    /// Reusable buffer holding the **beginning-of-step** inventory (the holdings
+    /// as of `S_{n-1}`, before this step's opens/closes), captured before
+    /// [`apply_step_fills`] mutates [`Self::inventory`]. Fed to the ledger's
+    /// attribution hand-off so a leg that closes this step still contributes its
+    /// θ/Δ/V interval instead of inflating the residual (F22). Cleared and
+    /// refilled in place each step — PB-1-safe (an `OpenPosition` clone is an
+    /// `Arc<str>` refcount bump, not a heap allocation).
+    begin_scratch: Vec<OpenPosition>,
     cmds: Vec<OrderCommand>,
     fills: Vec<Fill>,
     equity_curve: Vec<EquityPoint>,
@@ -418,6 +431,7 @@ impl<S: Strategy, X: ExecutionModel> RunState<S, X> {
                 snapshot,
                 open: inventory.as_slice(),
                 pending: &[],
+                marks: ledger.marks(),
                 rng: &mut *rng,
                 step: snapshot.step,
             };
@@ -459,6 +473,7 @@ impl<S: Strategy, X: ExecutionModel> RunState<S, X> {
             ids,
             ledger,
             inventory,
+            begin_scratch,
             cmds,
             fills,
             equity_curve,
@@ -477,6 +492,7 @@ impl<S: Strategy, X: ExecutionModel> RunState<S, X> {
                 snapshot,
                 open: inventory.as_slice(),
                 pending: &[],
+                marks: ledger.marks(),
                 rng: &mut *rng,
                 step: snapshot.step,
             };
@@ -492,6 +508,7 @@ impl<S: Strategy, X: ExecutionModel> RunState<S, X> {
                 snapshot,
                 open: inventory.as_slice(),
                 pending: &[],
+                marks: ledger.marks(),
                 rng: &mut *rng,
                 step: snapshot.step,
             };
@@ -506,6 +523,7 @@ impl<S: Strategy, X: ExecutionModel> RunState<S, X> {
                     snapshot,
                     open: inventory.as_slice(),
                     pending: &[],
+                    marks: ledger.marks(),
                     rng: &mut *rng,
                     step: snapshot.step,
                 };
@@ -531,11 +549,18 @@ impl<S: Strategy, X: ExecutionModel> RunState<S, X> {
         // e. the single execution phase (naive = e2 only; realistic e1 is v0.2).
         fills.clear();
         execution.fill(cmds.as_slice(), snapshot, fills)?;
-        // The fill→order grouping for this call (empty ⇒ single-shot 1:1, naive;
-        // non-empty ⇒ one group per filling `Submit`, realistic). Borrows
-        // `execution` immutably, disjoint from the inventory/ledger/bundle borrows
-        // `apply_step_fills` takes.
+        // The fill→order correlation for this call (`None` ⇒ one-per-`Submit`
+        // 1:1, naive; `Some` ⇒ one group per filling `Submit`, realistic).
+        // Borrows `execution` immutably, disjoint from the inventory/ledger/bundle
+        // borrows `apply_step_fills` takes.
         let groups = execution.fill_groups();
+
+        // Capture the beginning-of-step holdings (as of S_{n-1}) BEFORE
+        // apply_step_fills mutates the inventory, so a leg that closes this step
+        // still contributes its attribution interval (F22). Refilled in place —
+        // no per-step allocation on a constant-leg run (PB-1).
+        begin_scratch.clear();
+        begin_scratch.extend_from_slice(inventory.as_slice());
 
         // Mint ids + update the inventory + move cash (close validation lives in
         // apply_step_fills, which fails an unknown/oversized close as Execution),
@@ -553,6 +578,13 @@ impl<S: Strategy, X: ExecutionModel> RunState<S, X> {
             &reasons,
         )?;
 
+        // Build the beginning-of-step attribution hand-off BEFORE settle advances
+        // the retained Greek endpoint from S_{n-1} to S_n (F22): the legs open at
+        // S_{n-1}, including any that closed this step, each with its S_{n-1}
+        // unit Greeks.
+        ledger
+            .collect_attribution_marks(begin_scratch.as_slice(), snapshot.spec.contract_multiplier);
+
         // f. the ONE ledger mutation for the step ⇒ the step's single point.
         let point = ledger.settle(snapshot.step, snapshot.ts, inventory.as_slice(), snapshot)?;
         // g. record: the ordered equity curve (#14), the per-step attribution
@@ -567,7 +599,16 @@ impl<S: Strategy, X: ExecutionModel> RunState<S, X> {
         let spread_capture = ledger.spread_capture();
         let fees = ledger.fees();
         let step_pnl = ledger.step_pnl();
-        attribution.collect(snapshot, marks, spread_capture, fees, step_pnl);
+        // Attribution reads the BEGINNING-of-step holdings (incl. legs closed
+        // this step), NOT the post-fill survivors `marks`; the bundle position
+        // snapshots below still read `marks` (what is held at end of step).
+        attribution.collect(
+            snapshot,
+            ledger.attribution_marks(),
+            spread_capture,
+            fees,
+            step_pnl,
+        );
         // `is_last` legs surviving to the final settle are exactly the legs open
         // at feed exhaustion, so their open rows carry `open_at_end = true`.
         bundle.collect_step(snapshot.step.value(), snapshot.ts.value(), marks, is_last)?;
@@ -753,11 +794,16 @@ fn vwap_cents(notional: u128, total_qty: u64) -> Result<PriceCents, BacktestErro
 ///
 /// Each `Submit` mints one [`OrderId`] and owns a contiguous run of one or more
 /// fills. `groups` (the [`ExecutionModel::fill_groups`] channel, [`FillGroup`])
-/// says how many fills each `Submit` produced: an **empty** `groups` is the
-/// single-shot 1:1 contract (naive mode — exactly one fill per `Submit`, in
-/// submission order); a **non-empty** `groups` maps each filling `Submit` to its
-/// level count (realistic mode — a marketable order walking `n` levels yields
-/// `n` fills, one group of `fill_count = n`). Either way the run's fills are
+/// is the **explicit correlation mode**, so the two contracts are never
+/// conflated by a coincidental fill count (F31): `None` is the one-per-`Submit`
+/// 1:1 contract (naive mode — exactly one fill per `Submit`, in submission
+/// order, and no uncorrelated fills); `Some(groups)` is the grouped contract
+/// (realistic mode) mapping each filling `Submit` to its level count (a
+/// marketable order walking `n` levels yields `n` fills, one group of
+/// `fill_count = n`). `Some(&[])` is a grouped step that produced no command
+/// fills — any fill present is then a surplus and a typed error, whereas the old
+/// empty-slice sentinel would silently treat it as naive one-per-`Submit`. Either
+/// way the run's fills are
 /// aggregated to **one** leg: a group of `Open`s in a step shares one freshly
 /// minted [`TradeId`]; each `Open` mints one [`PositionId`], pushes one inventory
 /// leg whose `quantity` is the total filled and whose `entry_premium` is the VWAP
@@ -790,7 +836,7 @@ fn vwap_cents(notional: u128, total_qty: u64) -> Result<PriceCents, BacktestErro
 fn apply_step_fills(
     cmds: &[OrderCommand],
     fills: &[Fill],
-    groups: &[FillGroup],
+    groups: Option<&[FillGroup]>,
     snapshot: &ChainSnapshot,
     inventory: &mut Vec<OpenPosition>,
     ids: &mut IdCounters,
@@ -802,23 +848,28 @@ fn apply_step_fills(
     let multiplier = snapshot.spec.contract_multiplier;
     let ts_ns = snapshot.ts.value();
 
-    // Coverage precheck: the groups (or the implicit one-fill-per-`Submit` mapping
-    // when `groups` is empty) must account for EXACTLY the produced fills, so the
-    // per-command consumption below never mis-attributes a fill.
-    let expected_fills = if groups.is_empty() {
-        cmds.iter()
+    // Coverage precheck: the correlation mode must account for EXACTLY the
+    // produced fills, so the per-command consumption below never mis-attributes a
+    // fill. `None` (naive) is one fill per `Submit`; `Some(groups)` (grouped,
+    // realistic) is the sum of the groups' fill counts — `Some(&[])` therefore
+    // expects zero fills, so a surplus refresh fill is rejected here rather than
+    // silently consumed one-per-`Submit` (F31).
+    let expected_fills = match groups {
+        None => cmds
+            .iter()
             .filter(|cmd| matches!(cmd, OrderCommand::Submit(_)))
-            .count()
-    } else {
-        let mut total: usize = 0;
-        for group in groups {
-            let count =
-                usize::try_from(group.fill_count).map_err(|_| BacktestError::ArithmeticOverflow)?;
-            total = total
-                .checked_add(count)
-                .ok_or(BacktestError::ArithmeticOverflow)?;
+            .count(),
+        Some(groups) => {
+            let mut total: usize = 0;
+            for group in groups {
+                let count = usize::try_from(group.fill_count)
+                    .map_err(|_| BacktestError::ArithmeticOverflow)?;
+                total = total
+                    .checked_add(count)
+                    .ok_or(BacktestError::ArithmeticOverflow)?;
+            }
+            total
         }
-        total
     };
     if expected_fills != fills.len() {
         return Err(BacktestError::Execution(format!(
@@ -830,7 +881,9 @@ fn apply_step_fills(
     }
 
     let mut cursor: usize = 0;
-    let mut groups_iter = groups.iter().peekable();
+    // `None` (naive) has no group iterator; `Some` (grouped) walks the groups in
+    // command order, matching each filling `Submit` by its `command_index`.
+    let mut groups_iter = groups.map(|g| g.iter().peekable());
     // One trade_id per step's group of Open intents.
     let mut step_trade: Option<TradeId> = None;
     for (idx, cmd) in cmds.iter().enumerate() {
@@ -838,20 +891,20 @@ fn apply_step_fills(
             OrderCommand::Submit(intent) => {
                 let order_id = ids.mint_order()?;
                 // How many fills this `Submit` produced: exactly one under the
-                // empty-groups single-shot contract, else this command's group.
-                let count = if groups.is_empty() {
-                    1
-                } else {
-                    match groups_iter.peek() {
+                // naive one-per-`Submit` contract (`None`), else this command's
+                // group (`Some`), or zero when no group targets this index.
+                let count = match groups_iter.as_mut() {
+                    None => 1,
+                    Some(iter) => match iter.peek() {
                         Some(group) if group.command_index == idx => {
                             let count = usize::try_from(group.fill_count)
                                 .map_err(|_| BacktestError::ArithmeticOverflow)?;
-                            groups_iter.next();
+                            iter.next();
                             count
                         }
                         // No group at this index ⇒ this Submit produced no fill.
                         _ => 0,
-                    }
+                    },
                 };
                 if count == 0 {
                     return Err(BacktestError::Execution(format!(
@@ -968,8 +1021,10 @@ fn apply_step_fills(
         }
     }
     // The precheck guarantees full coverage; assert the walk consumed every fill
-    // and every group as defence in depth.
-    if cursor != fills.len() || groups_iter.next().is_some() {
+    // and every group as defence in depth. A `None` (naive) iterator has no
+    // groups to leave unconsumed, so it is trivially exhausted.
+    let groups_unconsumed = groups_iter.is_some_and(|mut iter| iter.next().is_some());
+    if cursor != fills.len() || groups_unconsumed {
         return Err(BacktestError::Execution(
             "execution fills were not fully correlated to submitted orders".to_string(),
         ));
@@ -1051,13 +1106,13 @@ mod tests {
     use crate::data::DataSourceSpec;
     use crate::data::feed::InMemoryFeed;
     use crate::domain::{
-        ChainSnapshot, ContractKey, ExecutionMode, InstrumentSpec, OrderCommand, OrderIntent,
-        PositionAction, PositionId, PriceCents, Quantity, QuoteView, SimTime, StepIndex,
-        Underlying,
+        Cents, ChainSnapshot, ContractKey, ExecutionMode, Fill, InstrumentSpec, OrderCommand,
+        OrderIntent, PositionAction, PositionId, PriceCents, Quantity, QuoteView, SimTime,
+        StepIndex, Underlying,
     };
     use crate::engine::strategy::{ChainContext, Strategy};
     use crate::error::BacktestError;
-    use crate::execution::NaiveFill;
+    use crate::execution::{ExecutionModel, FillGroup, NaiveFill};
 
     const TS0: i64 = 1_750_291_200_000_000_000;
     const STRIKE: u64 = 510_000;
@@ -1384,7 +1439,95 @@ mod tests {
         }
     }
 
+    /// A strategy that emits no commands — used to isolate the execution seam.
+    struct Passive;
+
+    impl Strategy for Passive {
+        fn on_start(
+            &mut self,
+            _ctx: &mut ChainContext,
+            _out: &mut Vec<OrderCommand>,
+        ) -> Result<(), BacktestError> {
+            Ok(())
+        }
+
+        fn on_snapshot(
+            &mut self,
+            _ctx: &mut ChainContext,
+            _out: &mut Vec<OrderCommand>,
+        ) -> Result<(), BacktestError> {
+            Ok(())
+        }
+
+        fn on_end(
+            &mut self,
+            _ctx: &mut ChainContext,
+            _out: &mut Vec<OrderCommand>,
+        ) -> Result<(), BacktestError> {
+            Ok(())
+        }
+    }
+
+    /// An execution model that appends one uncorrelated fill (simulating a
+    /// realistic refresh-generated fill of a resting order) while reporting the
+    /// **grouped** correlation contract with **no** groups (`Some(&[])`). This is
+    /// the F31 case the old empty-slice sentinel silently mis-correlated as naive
+    /// one-per-`Submit`.
+    struct GroupedRefreshOnly {
+        groups: Vec<FillGroup>,
+    }
+
+    impl ExecutionModel for GroupedRefreshOnly {
+        fn fill(
+            &mut self,
+            _commands: &[OrderCommand],
+            snap: &ChainSnapshot,
+            out_fills: &mut Vec<Fill>,
+        ) -> Result<(), BacktestError> {
+            // A refresh fill with no corresponding Submit command in this step.
+            out_fills.push(Fill {
+                ts: snap.ts,
+                step: snap.step,
+                contract: call_key(),
+                side: Side::Short,
+                quantity: qty(1),
+                price: PriceCents::new(100),
+                fees: Cents::new(0),
+                slippage: Cents::new(0),
+                mode: ExecutionMode::Realistic,
+            });
+            Ok(())
+        }
+
+        // Grouped contract, but no groups: any produced fill is a surplus.
+        fn fill_groups(&self) -> Option<&[FillGroup]> {
+            Some(&self.groups)
+        }
+
+        fn mode(&self) -> ExecutionMode {
+            ExecutionMode::Realistic
+        }
+    }
+
     // --- tests -------------------------------------------------------------
+
+    #[test]
+    fn test_grouped_no_groups_surplus_fill_is_typed_error_not_silent() {
+        // F31: a grouped-mode step (`Some(&[])`) that produces a fill with NO
+        // Submit group must be a typed Execution error — NOT silently consumed
+        // one-per-`Submit` as the old empty-slice sentinel would. This holds in
+        // release builds (the correlation check is a real guard, not a
+        // debug_assert): at on_start the strategy submits nothing, yet the model
+        // appends a refresh fill, so `expected_fills = 0 != 1`.
+        let feed = feed_of(&[105, 106]);
+        let config = config();
+        let execution = GroupedRefreshOnly { groups: Vec::new() };
+        let result = BacktestEngine::run(&config, feed, execution, Passive, "passive");
+        assert!(
+            matches!(result, Err(BacktestError::Execution(_))),
+            "a surplus refresh fill under the grouped contract is a typed error"
+        );
+    }
 
     #[test]
     fn test_on_start_positions_are_visible_in_open_at_step_zero() {
