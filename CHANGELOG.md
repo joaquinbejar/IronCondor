@@ -10,6 +10,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The four public surfaces are frozen for SemVer 1.0 (#49).** Each surface —
+  the result bundle, the `src/lib.rs` Rust re-exports, the PyO3 module surface,
+  and the `BacktestConfig` + env-var configuration surface — now has a named
+  source of truth and a CI diff gate that fails a PR changing the surface without
+  updating its committed snapshot in the same diff:
+  - the **Rust re-export surface** is snapshotted in
+    `tests/surface/rust-public-api.txt` and diffed by the new `surface` CI job
+    (`tests/surface.rs`, regenerate with `BLESS=1 cargo test --test surface`);
+  - the **PyO3 runtime names** are pinned in
+    `python/tests/expected_public_names.txt`, checked against the built wheel by
+    a new step in the `python-wheels` job and by `python/tests/test_surface.py`
+    (`python/ironcondor.pyi` remains the human-readable snapshot);
+  - the **`BacktestConfig` serialized field set** and the **runtime env-var set**
+    (`API_URL`) are pinned by `test_config_serialized_field_set_is_pinned` and
+    `test_runtime_env_vars_are_pinned`;
+  - the **result-bundle schema** stays gated by the v0.3 golden + conformance
+    round-trip (#36) — no new bundle code, its failure is wired to the freeze.
+  The v1.0 commitments, the one-quarter stability window (start = the v1.0 cut
+  date), and the deferred CLI surface are recorded in `docs/SEMVER.md`. A robust
+  stable-toolchain committed-snapshot gate was chosen over `cargo-public-api` /
+  `cargo-semver-checks`, both of which require nightly rustdoc JSON (and the
+  latter is directional under `0.x` semantics); rationale in `docs/SEMVER.md`.
 - **The `ironcondor.bundle.v1` wire contract is FROZEN (#36).** The result-bundle
   schema is now a **versioned wire contract**, not a proposal: the tag
   `"ironcondor.bundle.v1"` is the consumer's primary version pin, and any

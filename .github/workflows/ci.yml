@@ -64,6 +64,28 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --test golden
 
+  surface:
+    name: surface
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: Swatinem/rust-cache@v2
+      # SemVer surface-freeze gate (#49, docs/SEMVER.md §"Surface-freeze gates").
+      # Diffs the `src/lib.rs` re-export surface against the committed snapshot
+      # `tests/surface/rust-public-api.txt`, pins the config env-var set
+      # (`API_URL`), and pins the `BacktestConfig` serialized field set. A
+      # re-export add/remove/rename, a new runtime env var, or a config-field
+      # change fails here unless the committed snapshot / pinned list is
+      # regenerated in the SAME PR (`BLESS=1 cargo test --test surface`) — the
+      # visible SemVer event. Stable-toolchain only: no nightly rustdoc-JSON
+      # dependency, so the freeze never breaks on nightly format churn (unlike
+      # cargo-public-api / cargo-semver-checks; rationale in docs/SEMVER.md).
+      # The bundle surface is gated by `golden` + `test` (#36 goldens); the
+      # Python surface by `python-wheels` (runtime-names step below).
+      - run: cargo test --test surface
+      - run: cargo test --lib test_config_serialized_field_set_is_pinned
+
   zero-alloc:
     name: zero-alloc
     runs-on: ubuntu-24.04
@@ -235,5 +257,50 @@ jobs:
           echo "ironcondor.__version__ = ${MODULE_VERSION}"
           echo "crate version         = ${CRATE_VERSION}"
           test "${MODULE_VERSION}" = "${CRATE_VERSION}"
+      # PyO3 surface-freeze gate (#49, docs/SEMVER.md §"Surface-freeze gates").
+      # The runtime-names comparison against the built wheel: `dir(ironcondor)`
+      # minus the Python-injected module dunders MUST equal the committed
+      # `python/tests/expected_public_names.txt`. A `#[pymodule]` name added or
+      # removed in `src/python/*` fails here unless the frozen list is updated in
+      # the same PR — the visible SemVer event. `python/ironcondor.pyi` is the
+      # human-readable snapshot of the same surface. (`test_surface.py` in the
+      # pytest step below runs the identical check for local/dev feedback.)
+      - name: Assert the PyO3 surface matches the frozen name list (#49)
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import types
+          from pathlib import Path
+          import ironcondor
+
+          # Python/packaging-injected module dunders + the maturin mixed-layout
+          # `ironcondor` submodule self-reference (a packaging artifact, excluded
+          # by dropping every submodule attribute) are not part of the surface.
+          auto = {
+              "__name__", "__doc__", "__package__", "__loader__", "__spec__",
+              "__file__", "__builtins__", "__path__", "__all__", "__dict__",
+              "__cached__",
+          }
+          exposed = {
+              name for name in dir(ironcondor)
+              if name not in auto
+              and not isinstance(getattr(ironcondor, name, None), types.ModuleType)
+          }
+          expected = {
+              line.strip()
+              for line in Path("python/tests/expected_public_names.txt")
+              .read_text(encoding="utf-8")
+              .splitlines()
+              if line.strip()
+          }
+          if exposed != expected:
+              missing = sorted(expected - exposed)
+              added = sorted(exposed - expected)
+              raise SystemExit(
+                  f"PyO3 surface drift: missing={missing} added={added}; update "
+                  "python/tests/expected_public_names.txt and record the SemVer event"
+              )
+          print(f"PyO3 surface OK: {len(expected)} frozen names")
+          PY
       - name: Run the pytest smoke suite
         run: python -m pytest python/tests -q
