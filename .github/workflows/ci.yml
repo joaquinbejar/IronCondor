@@ -64,6 +64,20 @@ jobs:
       # Distinct from the throughput bench (#18) and the golden job (#17).
       - run: cargo test --test zero_alloc
 
+  security:
+    name: security
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: Swatinem/rust-cache@v2
+      # Adversarial-input suite (docs/TESTING.md §12.1, docs/07 §8): every
+      # malformed Parquet fixture must yield a typed BacktestError with a
+      # bounded resource ceiling — never a panic, hang, or OOM. The fixtures
+      # are committed permanent regressions. Distinct from
+      # test/golden/zero-alloc/audit/deny.
+      - run: cargo test --test security
+
   build-release:
     name: build-release
     runs-on: ubuntu-24.04

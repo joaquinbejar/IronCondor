@@ -10,6 +10,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Adversarial-input hardening for the Parquet feed (`tests/security.rs`, the
+  `security` CI job): 11 committed deterministic adversarial-fixture
+  generators (crossed quote, negative strike, NaN analytic, out-of-order and
+  duplicate timestamps, oversized steps/contracts, decompression bomb,
+  truncated footer, corrupt row group, over-total-bytes) each drive
+  `ParquetFeed::open` and assert the documented typed `BacktestError` with a
+  bounded resource ceiling — never a panic, hang, or OOM. Closes the v0.1
+  untrusted-input security gate for the release feed (#21).
+- The `max_total_bytes` materialised-tape ceiling in the Parquet feed: a
+  per-snapshot in-memory footprint estimate (O(entries), checked arithmetic)
+  accumulated before each `tape.push`, so a hostile tape is cut off with
+  `BacktestError::TapeTooLarge { limit: "max_total_bytes", .. }` before memory
+  grows unbounded — the one feed ceiling #9 had left unenforced (#21).
+
 - Supply-chain CI gates from v0.1: the `audit` job (`cargo audit --deny
   warnings`) and the `deny` job (`cargo deny check` — licences, bans, sources,
   advisories), both green on the current dependency set so a new RUSTSEC
