@@ -74,3 +74,36 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release
+
+  audit:
+    name: audit
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: Swatinem/rust-cache@v2
+      # RUSTSEC advisory gate, green from v0.1 (docs/07 §10,
+      # docs/TESTING.md §12.4). Pinned tool version installed from source with
+      # `--locked` (no third-party install action added in the supply-chain PR
+      # itself). `--deny warnings` fails the build on ANY advisory — a
+      # vulnerability OR an unmaintained/unsound warning; the single documented
+      # ignore (RUSTSEC-2024-0436, paste unmaintained) lives in
+      # `.cargo/audit.toml`, auto-read from the repo root.
+      - run: cargo install --locked --version 0.22.1 cargo-audit
+      - run: cargo audit --deny warnings
+
+  deny:
+    name: deny
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: Swatinem/rust-cache@v2
+      # Licence / bans / sources / advisories gate (`deny.toml`), green from
+      # v0.1. A disallowed licence, a banned or unknown source, or a NEW RUSTSEC
+      # advisory fails the build; only the documented paste ignore in deny.toml
+      # is exempt. `Cargo.lock` is committed and pins the exact audited tree
+      # (its sha256 becomes `lockfile_sha256` build provenance in the v0.3
+      # bundle manifest, docs/07 §10).
+      - run: cargo install --locked --version 0.19.2 cargo-deny
+      - run: cargo deny check

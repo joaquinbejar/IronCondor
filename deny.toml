@@ -1,0 +1,79 @@
+# cargo-deny configuration — supply-chain gate for `ironcondor`.
+#
+# Wired into CI (`.github/workflows/ci.yml`, job `deny`) from v0.1 so a new
+# RUSTSEC advisory, a disallowed licence, or a banned / unknown source fails the
+# build (docs/07 §10 supply-chain controls, docs/TESTING.md §12.4).
+#
+# `Cargo.lock` is committed and pins the exact audited tree; its sha256 travels
+# in every bundle manifest as `lockfile_sha256` build provenance (v0.3 bundle
+# writer, docs/07 §10). Keep the allow-lists explicit — never a blanket
+# allow-all.
+#
+# Schema: cargo-deny 0.19.
+
+# ---------------------------------------------------------------------------
+# Advisories — RUSTSEC database (vulnerabilities, unmaintained, unsound, yanked)
+# ---------------------------------------------------------------------------
+[advisories]
+# Yanked crates are a hard failure — the pinned lockfile must resolve to live
+# crates only.
+yanked = "deny"
+# The ONLY ignored advisory. RUSTSEC-2024-0436: `paste 1.0.15` is unmaintained
+# (author archived the repo) — an UNMAINTAINED notice, NOT a vulnerability.
+# It is transitive through optionstratlib's numeric stack
+# (optionstratlib -> statrs -> nalgebra -> simba -> paste) and also via
+# parquet; it cannot be dropped without dropping optionstratlib. `paste` is a
+# stable, widely-used compile-time proc-macro in maintenance-only mode with no
+# known security impact. Revisit when optionstratlib's numeric stack migrates
+# off it (e.g. to `pastey`). No other advisory is ignored, so a genuinely new
+# vulnerability still fails the gate.
+ignore = ["RUSTSEC-2024-0436"]
+
+# ---------------------------------------------------------------------------
+# Licences — explicit permissive allow-list (SPDX). No blanket allow.
+# ---------------------------------------------------------------------------
+[licenses]
+# Every licence expression in the current dependency tree resolves to one of
+# these permissive licences. Confirmed with `cargo deny check licenses`.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "Unicode-3.0",
+    "0BSD",
+    "Zlib",
+    # `bzip2 v0.6.1` (transitive: optionstratlib -> zip -> bzip2) is the ONLY
+    # crate under the `bzip2-1.0.6` SPDX licence — a permissive BSD-style
+    # licence. A scoped `[licenses.exceptions]` is the natural home for it, but
+    # cargo-deny 0.19 reports the exception "not encountered" for a crate whose
+    # sole licence IS the exception licence, so it is named explicitly here
+    # instead. Still an explicit, named permissive allow — never a blanket.
+    "bzip2-1.0.6",
+]
+confidence-threshold = 0.8
+
+# ---------------------------------------------------------------------------
+# Bans — duplicate versions, wildcards
+# ---------------------------------------------------------------------------
+[bans]
+# The upstream numeric / async stacks legitimately pull duplicate major versions
+# (e.g. rand 0.8 & 0.10, thiserror 1 & 2, getrandom 0.2 / 0.3 / 0.4). Surface
+# them as a warning for visibility, but do not fail the build on a transitive
+# duplicate we do not control.
+multiple-versions = "warn"
+# A `*` version requirement is an unpinned-dependency smell; flag it.
+wildcards = "warn"
+highlight = "all"
+
+# ---------------------------------------------------------------------------
+# Sources — where crates may come from
+# ---------------------------------------------------------------------------
+[sources]
+# Only the public crates.io registry is permitted; an unknown registry or an
+# unvetted git source fails the build.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -10,6 +10,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Supply-chain CI gates from v0.1: the `audit` job (`cargo audit --deny
+  warnings`) and the `deny` job (`cargo deny check` — licences, bans, sources,
+  advisories), both green on the current dependency set so a new RUSTSEC
+  advisory or a disallowed licence fails the build. `deny.toml` encodes an
+  **explicit** licence allow-list (MIT, Apache-2.0, BSD-2/3-Clause, BSL-1.0,
+  CC0-1.0, Unicode-3.0, 0BSD, Zlib, bzip2-1.0.6) and a single documented
+  advisory ignore — RUSTSEC-2024-0436 (`paste` unmaintained, transitive via
+  `optionstratlib`'s numeric stack, not a vulnerability); `.cargo/audit.toml`
+  mirrors that one ignore. `#![forbid(unsafe_code)]` in the shipped crate is
+  intact (#20).
+
+### Changed
+
+- `SECURITY.md` status refreshed: implementation has landed (the v0.1 core
+  engine and naive fill model), correcting the stale "no implementation code
+  exists yet" framing; the report channel, scope, and disclosure expectation
+  are unchanged (#20).
+
 - The zero-steady-state-allocation replay-loop CI gate (`tests/zero_alloc.rs`,
   the `zero-alloc` CI job): a test-only per-thread counting allocator plus a
   sampling-strategy decorator measure the per-step-body (steps b–g) allocation
