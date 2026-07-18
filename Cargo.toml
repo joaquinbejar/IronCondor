@@ -47,6 +47,11 @@ parquet = { version = "59", default-features = false, features = ["arrow", "snap
 # Streaming file sha256 = the tape data-identity for file feeds. Licence:
 # MIT OR Apache-2.0.
 sha2 = "0.10"
+# Seeded ChaCha8Rng — the run's SOLE randomness source (docs/02 §7); seeded
+# from config.seed so `(seed, config, data)` is byte-reproducible. Never
+# `thread_rng`. `ChaCha8Rng` + its re-exported `rand_core::SeedableRng` are the
+# only surface used; no `rand` facade is pulled. Licence: MIT OR Apache-2.0.
+rand_chacha = { version = "0.3", default-features = false }
 # simulator feed transport — feature-gated, absent from the default build.
 # reqwest: pure-Rust rustls TLS (no system OpenSSL, reproducible CI) + json.
 reqwest = { version = "0.12", default-features = false, features = [

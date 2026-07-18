@@ -5,8 +5,9 @@
 //! identity ([`Underlying`], [`ContractKey`] and the canonical
 //! `contract_id`), market data ([`InstrumentSpec`], [`QuoteView`],
 //! [`ChainSnapshot`]), and execution records ([`OrderIntent`],
-//! [`OrderCommand`], [`Fill`], the lifecycle ids, and the
-//! [`execution::sign_convention`] truth-table helpers).
+//! [`OrderCommand`], [`Fill`], [`OpenPosition`], [`PendingOrder`], the
+//! lifecycle ids, and the [`execution::sign_convention`] truth-table
+//! helpers).
 
 pub mod contract;
 pub mod execution;
@@ -16,8 +17,8 @@ pub mod time;
 
 pub use contract::{ContractKey, Underlying};
 pub use execution::{
-    ExecutionMode, Fill, OrderCommand, OrderId, OrderIntent, PositionAction, PositionId,
-    TimeInForce, TradeId,
+    ExecutionMode, Fill, OpenPosition, OrderCommand, OrderId, OrderIntent, PendingOrder,
+    PositionAction, PositionId, TimeInForce, TradeId,
 };
 pub use market::{ChainSnapshot, InstrumentSpec, QuoteView};
 pub use money::{Cents, PriceCents, Quantity, Ticks};
