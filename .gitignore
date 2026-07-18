@@ -7,5 +7,7 @@
 /CLAUDE.md
 /milestones
 .env
-proptest-regressions/
+# proptest-regressions/ is committed (docs/TESTING.md §3): generated regression
+# seeds are the first line of defence against a re-regression, so they are
+# tracked, not ignored (issue #17 un-deferred this from #1).
 *.hgrm
