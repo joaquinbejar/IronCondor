@@ -69,6 +69,11 @@ pub enum BacktestError {
     /// An IO failure reading a data source.
     #[error("data source io: {0}")]
     DataIo(#[from] std::io::Error),
+    /// Undecodable input bytes — a truncated or corrupt Parquet footer or
+    /// row group. Distinct from [`Self::Conversion`], which is a semantic
+    /// failure on data that decoded fine.
+    #[error("malformed data: {0}")]
+    Data(String),
     /// A chain failed validation while converting into an
     /// `optionstratlib::chains::OptionChain`.
     #[error("chain conversion: {0}")]

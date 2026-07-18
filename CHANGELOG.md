@@ -10,6 +10,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The Parquet historical feed (`src/data/historical.rs`, `ParquetFeed`) — the
+  single v0.1 release feed. Reads one columnar file, groups rows into
+  `ChainSnapshot`s by ascending `step`, funnels each through the single
+  conversion boundary, and materialises a validated, strictly-ordered,
+  immutable tape at construction; `next` is a pure in-memory read. Enforces
+  `max_file_bytes`, `max_decompressed_bytes` (footer-declared **and**
+  incremental), `max_steps`, and `max_contracts_per_snapshot` with no
+  unbounded read, rejects a non-regular file before hashing, and pins the
+  file `sha256` as the tape identity (#9).
+- `BacktestError::Data(String)` for undecodable input bytes (truncated or
+  corrupt Parquet footer / row group), distinct from `Conversion`, a semantic
+  failure on data that decoded cleanly (#9).
+- Dependencies for the columnar stack (shared with the future bundle writer
+  per ADR-0004): `arrow 59` and `parquet 59` (both `default-features = false`,
+  minimal features), `sha2 0.10`; dev-only `tempfile 3` (#9).
+
 - The `DataFeed` seam (`src/data/feed.rs`): a trait exposing exactly
   `next` / `meta` / `tape_meta` (no peek/rewind — no look-ahead by
   construction), the engine-facing `TapeMeta` (`data_identity`, `non_empty`,
