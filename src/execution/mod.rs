@@ -48,6 +48,45 @@ use crate::domain::{
 use crate::error::BacktestError;
 use optionstratlib::Side;
 
+/// The fill→order correlation channel — how a fill model tells the engine which
+/// appended fills belong to which `Submit` command, **without** polluting the
+/// shared [`Fill`] shape.
+///
+/// One order can produce several fills — a realistic marketable order walking
+/// price levels yields one [`Fill`] per level ([docs/04 §5.2](../../../docs/04-execution-models.md)).
+/// The engine must group those fills back to the single `Submit` intent that
+/// produced them so it mints **one** `order_id` / `position_id` / `trade_id` for
+/// the order and assigns each fill its 0-based `fill_seq` within the group
+/// ([docs/05 §7](../../../docs/05-analytics-and-reporting.md#7-fillsparquet), the
+/// `(step, order_id, fill_seq)` unique key).
+///
+/// This is a **correlation channel, not a report field**: it is exposed through
+/// [`ExecutionModel::fill_groups`] and consumed by the engine's fill-correlation
+/// pass, then discarded — it never rides on the [`Fill`] / bundle `FillRecord`,
+/// so the analytics-facing fill report stays byte-shape identical across modes
+/// (exactly the reason `fill_seq` and [`FeeCharge`] live off the domain [`Fill`]).
+///
+/// Each `FillGroup` describes one **contiguous run** of fills in the last
+/// `fill` call's `out_fills` produced by the `Submit` at `command_index`:
+/// - Groups are appended in **command order** (ascending `command_index`), and a
+///   `Submit`'s fills are contiguous, so the engine walks `out_fills` from index
+///   `0` consuming `fill_count` fills per group.
+/// - A `Cancel` / `Replace`, and a `Submit` that produced no fill, contribute
+///   **no** group.
+/// - The groups account for **exactly** the command fills; refresh-generated
+///   fills (e1, [docs/04 §6.1](../../../docs/04-execution-models.md)) carry no
+///   group (they belong to a prior-step resting order, not a current command),
+///   so the engine requires `Σ fill_count == out_fills.len()` and rejects any
+///   surplus as an uncorrelated fill (resting-order fill routing is deferred).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FillGroup {
+    /// 0-based index into the step's `commands` of the `Submit` that produced
+    /// this contiguous run of fills.
+    pub command_index: usize,
+    /// The count of contiguous fills (`≥ 1`) this command produced.
+    pub fill_count: u32,
+}
+
 /// The command→fill seam. The engine selects one implementation from config
 /// and drives it once per step; a strategy never sees which mode is active
 /// ([docs/04 §2](../../../docs/04-execution-models.md)).
@@ -81,8 +120,10 @@ pub trait ExecutionModel {
     ///   directly ([rules/global_rules.md](../../../rules/global_rules.md)
     ///   "Concurrency").
     ///
-    /// Naive mode always fills the full intent; realistic mode may fill
-    /// partially or not at all.
+    /// Naive mode always fills the full intent single-shot; realistic mode may
+    /// fill partially, walk several price levels (one [`Fill`] per level), or
+    /// not fill at all. A model that produces **more than one fill per
+    /// `Submit`** MUST report the grouping through [`Self::fill_groups`].
     ///
     /// # Errors
     ///
@@ -94,6 +135,24 @@ pub trait ExecutionModel {
         snap: &ChainSnapshot,
         out_fills: &mut Vec<Fill>,
     ) -> Result<(), BacktestError>;
+
+    /// The fill→order grouping for the **most recent** [`Self::fill`] call — how
+    /// the appended fills map back to the `Submit` commands (see [`FillGroup`]).
+    ///
+    /// The default is **empty**, which the engine reads as the single-shot
+    /// contract: **exactly one fill per `Submit`, in submission order** (naive
+    /// mode, and any model that never multi-fills). A model that produces more
+    /// than one fill for a `Submit` — realistic mode walking price levels —
+    /// overrides this to return one [`FillGroup`] per filling `Submit`, in
+    /// command order, so the engine correlates every level to the one order and
+    /// assigns `fill_seq = 0, 1, …`.
+    ///
+    /// Returning a borrow of reusable model scratch keeps this allocation-free
+    /// on the per-step path (PB-1); the slice is valid until the next `fill`.
+    #[must_use]
+    fn fill_groups(&self) -> &[FillGroup] {
+        &[]
+    }
 
     /// Which fill model this is — `Naive` or `Realistic`.
     #[must_use]

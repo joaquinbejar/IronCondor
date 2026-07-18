@@ -91,7 +91,7 @@ use crate::domain::{
 };
 use crate::error::BacktestError;
 
-use super::{ExecutionModel, FeeCharge, FillDraft, assemble_fill, liquidity};
+use super::{ExecutionModel, FeeCharge, FillDraft, FillGroup, assemble_fill, liquidity};
 
 /// The first strategy `OrderId`. Strategy ids occupy the low range
 /// `[STRATEGY_ID_BASE, MAKER_ID_BASE)`; a handle at or above [`MAKER_ID_BASE`]
@@ -168,6 +168,16 @@ pub struct RealisticFill {
     /// place by [`liquidity::plan_seed_into`] each refresh, so the refresh's own
     /// plan buffer never reallocates ([docs/07 §4](../../../docs/07-performance-and-security.md)).
     seed_plan: Vec<liquidity::SeedOrder>,
+    /// The fill→order grouping for the most recent [`Self::fill`] call — one
+    /// [`FillGroup`] per `Submit` (e2) that produced at least one fill, in
+    /// command order (the fill→order correlation channel the engine reads via
+    /// [`Self::fill_groups`]). A marketable order walking `n` price levels appends
+    /// `n` fills and one group of `fill_count = n`, so the engine mints one
+    /// order/position for it and assigns `fill_seq = 0..n`. **Reusable scratch:**
+    /// cleared in place each `fill` (capacity retained), so it adds no
+    /// steady-state allocation. Refresh-generated fills (e1) carry **no** group
+    /// (they belong to a prior-step resting order, not a current command).
+    fill_groups: Vec<FillGroup>,
     /// Per-contract leaf books, in stable key order (never a `HashMap`).
     books: BTreeMap<ContractKey, OptionOrderBook>,
 }
@@ -208,6 +218,7 @@ impl std::fmt::Debug for RealisticFill {
             .field("liquidity_profile", &self.liquidity_profile)
             .field("resting_seed_ids", &self.resting_seed_ids.len())
             .field("resting_strategy", &self.resting_strategy.len())
+            .field("fill_groups", &self.fill_groups.len())
             .field("books", &self.books.len())
             .finish()
     }
@@ -236,6 +247,7 @@ impl RealisticFill {
             resting_seed_ids: BTreeMap::new(),
             resting_strategy: BTreeMap::new(),
             seed_plan: Vec::new(),
+            fill_groups: Vec::new(),
             books: BTreeMap::new(),
         }
     }
@@ -270,6 +282,7 @@ impl RealisticFill {
             resting_seed_ids: BTreeMap::new(),
             resting_strategy: BTreeMap::new(),
             seed_plan: Vec::new(),
+            fill_groups: Vec::new(),
             books: BTreeMap::new(),
         }
     }
@@ -763,20 +776,52 @@ impl ExecutionModel for RealisticFill {
         snap: &ChainSnapshot,
         out_fills: &mut Vec<Fill>,
     ) -> Result<(), BacktestError> {
+        // The fill→order grouping is rebuilt every call: clear in place (capacity
+        // retained ⇒ no steady-state allocation), then record one group per
+        // filling `Submit` (e2) below. e1 refresh fills carry no group.
+        self.fill_groups.clear();
         // e1: refresh the per-strike books from `snap` (cancel the stale seed,
         // reseed fresh depth) and append any refresh-generated fills BEFORE the
         // intent fills. On the first snapshot this degenerates to the #023
         // initial seed; a no-op for the raw adapter (no profile).
         self.refresh_books(snap, out_fills)?;
-        // e2: route the step's commands against the freshly reseeded book.
-        for command in commands {
+        // e2: route the step's commands against the freshly reseeded book. For
+        // each `Submit`, record how many fills it produced so the engine can
+        // group them back to one order and assign each fill its `fill_seq`
+        // (a marketable order walking `n` levels ⇒ one group of `fill_count = n`).
+        for (command_index, command) in commands.iter().enumerate() {
             match command {
-                OrderCommand::Submit(intent) => self.fill_submit(intent, snap, out_fills)?,
+                OrderCommand::Submit(intent) => {
+                    let before = out_fills.len();
+                    self.fill_submit(intent, snap, out_fills)?;
+                    // `fill_submit` only appends, so `len >= before` always holds;
+                    // `checked_sub` (never `saturating_sub` on a counter, per the
+                    // repo's Category-E rule) surfaces any future refactor that
+                    // shrank the buffer as a typed error rather than a silent 0.
+                    let produced = out_fills.len().checked_sub(before).ok_or_else(|| {
+                        BacktestError::Execution(
+                            "fill buffer shrank during fill_submit".to_string(),
+                        )
+                    })?;
+                    if produced > 0 {
+                        let fill_count = u32::try_from(produced)
+                            .map_err(|_| BacktestError::ArithmeticOverflow)?;
+                        self.fill_groups.push(FillGroup {
+                            command_index,
+                            fill_count,
+                        });
+                    }
+                }
                 // Resting-order cancel/replace lifecycle is deferred (see docs).
                 OrderCommand::Cancel(_) | OrderCommand::Replace { .. } => {}
             }
         }
         Ok(())
+    }
+
+    #[inline]
+    fn fill_groups(&self) -> &[FillGroup] {
+        &self.fill_groups
     }
 
     #[inline]
