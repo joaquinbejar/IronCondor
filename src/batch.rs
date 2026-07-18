@@ -51,6 +51,24 @@
 //! distinct `<run_id>/` directories (the seed is part of the `run_id` hash), so
 //! runs never collide.
 //!
+//! # The read-only parse cache ([docs/03 §8](../../docs/03-data-layer.md#8-caching))
+//!
+//! Before fan-out the runner materialises each **distinct** file-feed path
+//! **once**, single-threaded, into a read-only `SharedTapes` cache (a
+//! `SharedParquetTape` — an [`Arc`](std::sync::Arc) over the immutable parsed
+//! tape). A sweep of `N` runs over the same Parquet file then parses it once and
+//! shares the tape; each run gets a cheap `Arc` view with its own cursor. The
+//! cache is a pure parse-time optimisation and **never changes results**: a feed
+//! over a shared tape yields byte-identically to a per-run
+//! [`ParquetFeed::open`], and a run whose path is not cached (a failed
+//! pre-materialisation) simply re-opens it itself. The cache stays **off** the
+//! single-run path — [`crate::run::run_backtest`] opens its own [`ParquetFeed`].
+//!
+//! Materialisation verifies each recorded file `sha256`
+//! ([`ParquetFeed::open_verified`]): a changed / missing / tampered file is the
+//! typed [`BacktestError`] recorded in that run's index entry, never a silent
+//! divergent run.
+//!
 //! # Honest reproducibility ([docs/03 §6](../../docs/03-data-layer.md#6-synthetic-feed--optionchain-simulator))
 //!
 //! The batch's reproducibility guarantee covers the **engine** seeds (the fixed
@@ -64,6 +82,7 @@
 //! each child's engine seed, data seed, `run_id` (or error), bundle path, and
 //! tape `sha256` either way.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -76,7 +95,7 @@ use crate::config::BacktestConfig;
 #[cfg(feature = "simulator")]
 use crate::data::SimulatorFeed;
 use crate::data::historical::to_hex;
-use crate::data::{DataSourceSpec, ParquetFeed};
+use crate::data::{DataSourceSpec, ParquetFeed, SharedParquetTape};
 use crate::domain::{InstrumentSpec, Quantity, StrategySpec};
 use crate::engine::{BacktestRun, ScenarioParams, ScenarioType, expand};
 use crate::error::BacktestError;
@@ -220,8 +239,15 @@ pub fn run_scenario_batch(
         planned.push(PlannedRun { index, config });
     }
 
+    // 1b. Parse each distinct file-feed tape ONCE, single-threaded, into the
+    //     read-only batch cache: a sweep of N runs over the same Parquet path
+    //     parses it once and shares the immutable tape. A pure optimisation —
+    //     each run falls back to its own verified open on a cache miss, so
+    //     correctness never depends on it (docs/03 §8).
+    let shared = materialise_shared_tapes(&planned);
+
     // 2. Fan out across a bounded pool — each worker runs whole, independent runs.
-    let runs = fan_out(&planned, strategy, exit, materialisation)?;
+    let runs = fan_out(&planned, strategy, exit, materialisation, &shared)?;
 
     // 3. Assemble + publish the deterministic parent index.
     let batch_id = derive_batch_id(params, base_config, strategy)?;
@@ -259,6 +285,46 @@ struct PlannedRun {
     config: BacktestConfig,
 }
 
+/// The batch **parse cache**: each distinct file-feed path materialised once and
+/// shared read-only across every run over it ([docs/03 §8](../../docs/03-data-layer.md#8-caching)).
+///
+/// Keyed by source path; deterministic (a [`BTreeMap`] populated in planned
+/// order, read-only during fan-out). A path absent from the cache — a failed
+/// pre-materialisation (missing / oversized / tampered file) — is **not** an
+/// error: the run falls back to a per-run verified open, which surfaces the same
+/// typed error into that run's index entry. So the cache is observationally
+/// invisible: it never hides a divergence and never changes a bundle.
+type SharedTapes = BTreeMap<String, SharedParquetTape>;
+
+/// Materialise each distinct Parquet source path once (single-threaded), pinning
+/// and verifying its recorded `sha256`, into the read-only batch cache.
+///
+/// A materialisation failure is deliberately skipped rather than propagated: the
+/// batch does not abort on one bad input, and the affected run re-attempts its
+/// own [`ParquetFeed::open_verified`] in [`open_and_run`], recording the identical
+/// typed error. Non-Parquet sources (the simulator feed) are not shared — each
+/// session materialises its own tape per run.
+///
+/// INVARIANT (uniform limits per path): the cache is keyed by path with a sha
+/// guard at hit time, NOT by `(path, limits)`. That is safe only because
+/// `ConfigOverride` can vary neither `limits` nor `data_source` today, so every
+/// run sharing a path shares the exact `(sha256, limits)` a fresh open would
+/// use. If a future override gains either knob, key this cache on
+/// `(path, limits)` (or split per-limits) — otherwise a cache hit could serve a
+/// tape that a stricter-limits fresh open would reject with `TapeTooLarge`.
+fn materialise_shared_tapes(planned: &[PlannedRun]) -> SharedTapes {
+    let mut shared = SharedTapes::new();
+    for run in planned {
+        if let DataSourceSpec::Parquet { path, sha256 } = &run.config.data_source
+            && !shared.contains_key(path)
+            && let Ok(tape) = SharedParquetTape::materialise(path, sha256, &run.config.limits)
+        {
+            shared.insert(path.clone(), tape);
+        }
+    }
+    shared
+}
+
 /// A completed run's summary (the [`BatchRunOutcome::Ok`] payload).
 struct RunSummary {
     run_id: String,
@@ -280,15 +346,19 @@ fn worker_count(run_count: usize) -> usize {
 /// each, and collect their entries in **index** order (scheduling-independent).
 ///
 /// Nothing mutable is shared: each worker borrows the immutable `strategy` /
-/// `exit` / `materialisation` and its own disjoint `&[PlannedRun]` slice, and
-/// returns owned entries. A worker only panics on a bug (every run failure is a
-/// recorded [`BatchRunOutcome::Error`]); a panic is surfaced as a typed error
-/// rather than silently dropping a chunk.
+/// `exit` / `materialisation`, the read-only [`SharedTapes`] parse cache, and its
+/// own disjoint `&[PlannedRun]` slice, and returns owned entries. The cache is an
+/// [`Arc`](std::sync::Arc)-backed immutable tape (a cheap clone per run view), so
+/// it crosses the thread boundary without any cross-run mutable state. A worker
+/// only panics on a bug (every run failure is a recorded
+/// [`BatchRunOutcome::Error`]); a panic is surfaced as a typed error rather than
+/// silently dropping a chunk.
 fn fan_out(
     planned: &[PlannedRun],
     strategy: &StrategySpec,
     exit: &ExitPolicy,
     materialisation: Option<&SimulatorMaterialisation>,
+    shared: &SharedTapes,
 ) -> Result<Vec<BatchRunEntry>, BacktestError> {
     if planned.is_empty() {
         return Ok(Vec::new());
@@ -304,7 +374,7 @@ fn fan_out(
             handles.push(scope.spawn(move || {
                 let mut local = Vec::with_capacity(chunk.len());
                 for run in chunk {
-                    local.push(run_one_entry(run, strategy, exit, materialisation));
+                    local.push(run_one_entry(run, strategy, exit, materialisation, shared));
                 }
                 local
             }));
@@ -335,10 +405,11 @@ fn run_one_entry(
     strategy: &StrategySpec,
     exit: &ExitPolicy,
     materialisation: Option<&SimulatorMaterialisation>,
+    shared: &SharedTapes,
 ) -> BatchRunEntry {
     let engine_seed = run.config.seed;
     let data_seed = data_seed_of(&run.config);
-    let outcome = match run_one(&run.config, strategy, exit, materialisation) {
+    let outcome = match run_one(&run.config, strategy, exit, materialisation, shared) {
         Ok(summary) => BatchRunOutcome::Ok {
             run_id: summary.run_id,
             bundle_path: summary.bundle_path,
@@ -364,9 +435,10 @@ fn run_one(
     strategy: &StrategySpec,
     exit: &ExitPolicy,
     materialisation: Option<&SimulatorMaterialisation>,
+    shared: &SharedTapes,
 ) -> Result<RunSummary, BacktestError> {
     config.validate()?;
-    let run = open_and_run(config, strategy, exit, materialisation)?;
+    let run = open_and_run(config, strategy, exit, materialisation, shared)?;
     let bundle_path = write_bundle(&run, config, strategy)?;
 
     // `<output_dir>/<run_id>` — the final component is the run_id.
@@ -393,16 +465,33 @@ fn run_one(
 /// analytics core ([`run_with_feed`]). `Parquet` and (feature `simulator`)
 /// `Simulator` are dispatched; `Csv` and everything else are deferred, matching
 /// `run_backtest`.
+///
+/// A `Parquet` source uses the batch parse cache when it holds this path's tape
+/// **and** the tape's identity matches the run's recorded `sha256` (or the run
+/// pins no `sha256`) — a cheap `Arc` view over the once-parsed tape. Otherwise it
+/// falls back to a per-run [`ParquetFeed::open_verified`], which re-reads and
+/// re-verifies the file, so a changed / missing / tampered file is the typed
+/// error recorded in this run's index entry, never a silent divergent run. Either
+/// way the feed yields byte-identically, so the cache never changes results.
 #[cfg_attr(not(feature = "simulator"), allow(unused_variables))]
 fn open_and_run(
     config: &BacktestConfig,
     strategy: &StrategySpec,
     exit: &ExitPolicy,
     materialisation: Option<&SimulatorMaterialisation>,
+    shared: &SharedTapes,
 ) -> Result<BacktestRun, BacktestError> {
     match &config.data_source {
-        DataSourceSpec::Parquet { path, .. } => {
-            let feed = ParquetFeed::open(path, &config.limits)?;
+        DataSourceSpec::Parquet { path, sha256 } => {
+            let feed = match shared.get(path) {
+                // Cache hit — only when the run's recorded identity matches the
+                // once-parsed tape (an empty `sha256` pins whatever was read, as
+                // `open` does). A mismatch cannot slip past: it falls through to
+                // the verified re-read, which fails typed.
+                Some(tape) if sha256.is_empty() || tape.data_identity() == sha256 => tape.feed(),
+                // Cache miss / bypass — a per-run verified open (identical tape).
+                _ => ParquetFeed::open_verified(path, sha256, &config.limits)?,
+            };
             run_with_feed(config, feed, strategy, exit.clone())
         }
         #[cfg(feature = "simulator")]

@@ -98,6 +98,7 @@ use std::ffi::OsString;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use arrow::array::{Array, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Schema};
@@ -124,24 +125,44 @@ const READ_BATCH_ROWS: usize = 8_192;
 /// [`TapeMeta::data_identity`]. The read is bounded by `max_file_bytes`.
 const HASH_CHUNK_BYTES: usize = 65_536;
 
-/// The historical Parquet [`DataFeed`] — a materialised, validated, immutable
-/// tape over one columnar chain file.
+/// The immutable, validated Parquet tape — the snapshots plus their pinned
+/// identity, held behind an [`Arc`] so a batch can parse a file **once** and
+/// share it read-only across every run over that path (the batch parse cache,
+/// [`SharedParquetTape`], [docs/03 §8](../../../docs/03-data-layer.md#8-caching)).
 ///
-/// Construct with [`ParquetFeed::open`]; all I/O happens there. [`DataFeed::next`]
-/// is a pure in-memory read that never blocks or `.await`s.
+/// It is immutable after construction; the mutable cursor lives on the
+/// [`ParquetFeed`] that borrows it, so two feeds over the same shared tape have
+/// independent read positions and never race.
 #[derive(Debug)]
-#[must_use = "a ParquetFeed does nothing unless its snapshots are consumed via DataFeed::next"]
-pub struct ParquetFeed {
+struct ParquetTape {
     /// The validated, strictly `ts`-ordered snapshots (the replay tape).
-    tape: Vec<ChainSnapshot>,
-    /// The next index [`DataFeed::next`] yields.
-    cursor: usize,
+    snapshots: Vec<ChainSnapshot>,
     /// The pinned tape metadata (identity, non-empty, first ts, final step).
     meta: TapeMeta,
     /// The source path, recorded verbatim in the manifest provenance.
     path: String,
     /// The file `sha256` (hex) — the tape's data identity.
     sha256: String,
+}
+
+/// The historical Parquet [`DataFeed`] — a materialised, validated, immutable
+/// tape over one columnar chain file.
+///
+/// Construct with [`ParquetFeed::open`] (or [`ParquetFeed::open_verified`] to
+/// also check the file hash against a recorded identity); all I/O happens there.
+/// [`DataFeed::next`] is a pure in-memory read that never blocks or `.await`s.
+///
+/// The tape itself is an [`Arc<ParquetTape>`](Arc): a single-run open owns its
+/// `Arc` uniquely, and the batch runner shares one parsed tape across a sweep
+/// via a `SharedParquetTape` — the shared view drives byte-identically to a
+/// fresh open, so the cache never changes results.
+#[derive(Debug)]
+#[must_use = "a ParquetFeed does nothing unless its snapshots are consumed via DataFeed::next"]
+pub struct ParquetFeed {
+    /// The shared immutable tape (parsed once, cheap to clone as an `Arc`).
+    tape: Arc<ParquetTape>,
+    /// The next index [`DataFeed::next`] yields.
+    cursor: usize,
 }
 
 impl ParquetFeed {
@@ -311,20 +332,52 @@ impl ParquetFeed {
         let meta = TapeMeta::from_tape(sha256.clone(), &tape)?;
 
         Ok(Self {
-            tape,
+            tape: Arc::new(ParquetTape {
+                snapshots: tape,
+                meta,
+                path: path_str,
+                sha256,
+            }),
             cursor: 0,
-            meta,
-            path: path_str,
-            sha256,
         })
+    }
+
+    /// Open a Parquet chain file and verify it hashes to `expected_sha256` — the
+    /// re-read verifier for a recorded [`DataSourceSpec::Parquet`] identity, the
+    /// symmetric counterpart to [`CsvFeed::open_verified`].
+    ///
+    /// An empty `expected_sha256` (a not-yet-pinned config value) skips the check
+    /// and simply pins the computed hash. A non-empty value that does not match
+    /// the recomputed file hash fails with [`BacktestError::Conversion`] — a
+    /// re-read divergence is never a silent divergent run.
+    ///
+    /// # Errors
+    ///
+    /// Every error [`Self::open`] can raise (including [`BacktestError::DataIo`]
+    /// for a missing or unreadable file), plus [`BacktestError::Conversion`] when
+    /// `expected_sha256` is non-empty and does not equal the recomputed file
+    /// hash.
+    pub fn open_verified(
+        path: impl AsRef<Path>,
+        expected_sha256: &str,
+        limits: &ResourceLimits,
+    ) -> Result<Self, BacktestError> {
+        let feed = Self::open(path, limits)?;
+        if !expected_sha256.is_empty() && feed.tape.sha256 != expected_sha256 {
+            return Err(BacktestError::Conversion(format!(
+                "parquet file sha256 mismatch: recorded {expected_sha256}, recomputed {}",
+                feed.tape.sha256
+            )));
+        }
+        Ok(feed)
     }
 }
 
 impl DataFeed for ParquetFeed {
     fn next(&mut self) -> Result<Option<ChainSnapshot>, BacktestError> {
-        match self.tape.get(self.cursor) {
+        match self.tape.snapshots.get(self.cursor) {
             Some(snapshot) => {
-                // `get` matched, so `cursor < tape.len() <= isize::MAX` — the
+                // `get` matched, so `cursor < snapshots.len() <= isize::MAX` — the
                 // increment cannot overflow; plain `+= 1` keeps the codebase's
                 // no-saturating/wrapping convention.
                 self.cursor += 1;
@@ -336,13 +389,70 @@ impl DataFeed for ParquetFeed {
 
     fn meta(&self) -> DataSourceSpec {
         DataSourceSpec::Parquet {
-            path: self.path.clone(),
-            sha256: self.sha256.clone(),
+            path: self.tape.path.clone(),
+            sha256: self.tape.sha256.clone(),
         }
     }
 
     fn tape_meta(&self) -> &TapeMeta {
-        &self.meta
+        &self.tape.meta
+    }
+}
+
+/// A read-only, shareable materialised Parquet tape — the **batch parse cache**
+/// ([docs/03 §8](../../../docs/03-data-layer.md#8-caching)).
+///
+/// One [`Arc`] over an immutable [`ParquetTape`]; cloning it is an atomic
+/// refcount bump, so a batch of `N` runs over the **same** Parquet path parses
+/// the file once and hands each run a cheap view via [`Self::feed`]. The cache
+/// is a pure parse-time optimisation and **never changes results**: a feed built
+/// from a shared tape yields byte-identically to a fresh [`ParquetFeed::open`]
+/// (each `next` clones the same snapshot either way), so sharing is
+/// observationally invisible to the run.
+///
+/// It stays **off** the single-run path ([`crate::run::run_backtest`] opens a
+/// per-run [`ParquetFeed`]); only the batch runner shares a tape across a sweep.
+#[derive(Debug, Clone)]
+pub(crate) struct SharedParquetTape {
+    /// The shared immutable tape — the same `Arc` every run's feed borrows.
+    tape: Arc<ParquetTape>,
+}
+
+impl SharedParquetTape {
+    /// Materialise a Parquet tape once, verifying the recorded `sha256`, ready to
+    /// share read-only across a batch.
+    ///
+    /// Same validation and verification as [`ParquetFeed::open_verified`]; the
+    /// returned handle is cheap to clone (an `Arc` bump).
+    ///
+    /// # Errors
+    ///
+    /// Every error [`ParquetFeed::open_verified`] can raise — a missing / oversized
+    /// / malformed file, or a recorded-`sha256` mismatch.
+    pub(crate) fn materialise(
+        path: impl AsRef<Path>,
+        expected_sha256: &str,
+        limits: &ResourceLimits,
+    ) -> Result<Self, BacktestError> {
+        let feed = ParquetFeed::open_verified(path, expected_sha256, limits)?;
+        Ok(Self { tape: feed.tape })
+    }
+
+    /// The tape's pinned data identity (the file `sha256`).
+    #[must_use]
+    pub(crate) fn data_identity(&self) -> &str {
+        &self.tape.sha256
+    }
+
+    /// Open a fresh [`ParquetFeed`] view over the shared tape — a cheap `Arc`
+    /// clone with its own cursor at the start. It drives identically to a per-run
+    /// [`ParquetFeed::open`] of the same file. (`ParquetFeed` is itself
+    /// `#[must_use]`, so the returned feed must be consumed.)
+    pub(crate) fn feed(&self) -> ParquetFeed {
+        ParquetFeed {
+            tape: Arc::clone(&self.tape),
+            cursor: 0,
+        }
     }
 }
 
@@ -1424,9 +1534,10 @@ mod tests {
     use parquet::arrow::ArrowWriter;
     use tempfile::TempDir;
 
-    use super::ParquetFeed;
+    use super::{ParquetFeed, SharedParquetTape, file_sha256};
     use crate::config::ResourceLimits;
     use crate::data::feed::DataFeed;
+    use crate::domain::ChainSnapshot;
     use crate::error::BacktestError;
 
     const TS0: i64 = 1_750_291_200_000_000_000;
@@ -1893,6 +2004,87 @@ mod tests {
                 crate::data::DataSourceSpec::Parquet { sha256: sb, .. }
             ) if sa == sb && sa == a.tape_meta().data_identity
         ));
+    }
+
+    #[test]
+    fn test_open_verified_accepts_match_skips_empty_rejects_mismatch() {
+        let mut chain = Chain::default();
+        condor_step(&mut chain, 0, TS0);
+        let Ok((_dir, path)) = write_standard(&chain) else {
+            panic!("fixture must write");
+        };
+        let Ok(sha) = file_sha256(&path) else {
+            panic!("the fixture must hash");
+        };
+        let limits = ResourceLimits::default();
+        // Empty expected sha skips the check; the real sha passes; a wrong sha is
+        // a typed Conversion error, never a silent divergent open.
+        assert!(ParquetFeed::open_verified(&path, "", &limits).is_ok());
+        assert!(ParquetFeed::open_verified(&path, &sha, &limits).is_ok());
+        assert!(matches!(
+            ParquetFeed::open_verified(&path, "deadbeef", &limits),
+            Err(BacktestError::Conversion(_))
+        ));
+        // A missing file is a typed DataIo error, not a panic.
+        assert!(matches!(
+            ParquetFeed::open_verified(_dir.path().join("absent.parquet"), "", &limits),
+            Err(BacktestError::DataIo(_))
+        ));
+    }
+
+    /// The batch parse cache never changes results: a feed built from a shared
+    /// tape yields byte-identical snapshots (and the same identity) to a fresh
+    /// per-run `open`, and two shared feeds carry independent cursors. This is the
+    /// feed-level cache-bypass equivalence guard (data / engine seam).
+    #[test]
+    fn test_shared_tape_feed_yields_identically_to_a_fresh_open() {
+        fn drain(mut feed: ParquetFeed) -> Vec<ChainSnapshot> {
+            let mut out = Vec::new();
+            loop {
+                match feed.next() {
+                    Ok(Some(snap)) => out.push(snap),
+                    Ok(None) => break,
+                    Err(e) => panic!("a well-formed tape must yield Ok: {e}"),
+                }
+            }
+            out
+        }
+
+        let mut chain = Chain::default();
+        condor_step(&mut chain, 0, TS0);
+        condor_step(&mut chain, 1, TS0 + NANOS_PER_DAY);
+        condor_step(&mut chain, 2, TS0 + 2 * NANOS_PER_DAY);
+        let Ok((_dir, path)) = write_standard(&chain) else {
+            panic!("fixture must write");
+        };
+        let limits = ResourceLimits::default();
+
+        // Fresh per-run open (cache bypass).
+        let Ok(fresh) = ParquetFeed::open(&path, &limits) else {
+            panic!("fresh open must succeed");
+        };
+        // Shared tape (cache on) — parsed once, two independent feed views.
+        let Ok(shared) = SharedParquetTape::materialise(&path, "", &limits) else {
+            panic!("shared materialise must succeed");
+        };
+        let view_a = shared.feed();
+        let view_b = shared.feed();
+
+        // Identity and provenance match the fresh open exactly.
+        assert_eq!(shared.data_identity(), fresh.tape_meta().data_identity);
+        assert_eq!(view_a.tape_meta(), fresh.tape_meta());
+        assert_eq!(view_a.meta(), fresh.meta());
+
+        // The yielded snapshot sequences are identical across cache-on and bypass,
+        // and the two shared views yield the same sequence (independent cursors).
+        let fresh_snaps = drain(fresh);
+        let a_snaps = drain(view_a);
+        let b_snaps = drain(view_b);
+        assert_eq!(
+            a_snaps, fresh_snaps,
+            "shared feed == fresh open, snapshot-wise"
+        );
+        assert_eq!(b_snaps, fresh_snaps, "second shared view is independent");
     }
 
     #[test]

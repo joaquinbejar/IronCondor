@@ -21,6 +21,9 @@ pub use convert::chain_response_to_snapshot;
 pub use convert::{RawQuote, SnapshotMeta, raw_quotes_to_snapshot, snapshot_to_option_chain};
 pub use feed::{DataFeed, FeedKind, TapeMeta, feed_catalogue};
 pub use historical::{CsvFeed, ParquetFeed};
+// The batch parse cache (a shareable read-only Parquet tape) is an internal
+// optimisation for the scenario batch runner — not part of the public surface.
+pub(crate) use historical::SharedParquetTape;
 #[cfg(feature = "simulator")]
 pub use simulator::SimulatorFeed;
 
