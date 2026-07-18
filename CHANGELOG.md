@@ -10,6 +10,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The `criterion` + `hdrhistogram` bench suite (`benches/`, the `bench-hdr`
+  convention) and the first **measured** performance baseline in `BENCH.md`:
+  the naive-mode throughput bench (`benches/naive_throughput.rs`) drives the
+  full `run_backtest` over a canonical 2048-step × 4-leg iron-condor Parquet
+  chain, single strategy / single core, and reports `hdrhistogram`
+  p50/p99/p99.9/p99.99 of per-run and per-step latency (not criterion's mean),
+  with warmup and an explicit coordinated-omission disclosure (closed-loop
+  back-to-back — CO does not apply). `BENCH.md` records the measured baseline,
+  the full run-conditions block (CPU/cores/memory/OS/toolchain/`Cargo.lock`
+  hash), and an interpretation block versus the docs/07 §3 PB-2 design target.
+  This is the v0.1 baseline the #019 zero-alloc gate and the #051
+  percentile-regression gate build on. `criterion` / `hdrhistogram` are
+  dev-only (kept out of `cargo build`/`cargo test`), carry an audit note in
+  `Cargo.toml` (both Apache-2.0 OR MIT), and leave `#![forbid(unsafe_code)]`
+  in the crate intact (#18).
 - The golden determinism test over the v0.1 artifacts
   (`tests/golden/iron_condor_naive/`): the committed equity curve and minimal
   metrics for the canonical `IronCondor` naive run, the single reusable

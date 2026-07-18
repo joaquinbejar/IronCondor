@@ -74,3 +74,27 @@ serde_json = "1"
 # Scratch Parquet fixtures are generated into a tempdir in-test — no committed
 # binary. Licence: MIT OR Apache-2.0.
 tempfile = "3"
+# Benchmark harness for the `benches/` suite (#18). `criterion` drives warmup +
+# sample scheduling; the naive-throughput bench collects per-iteration latencies
+# into an `hdrhistogram` and reports p50/p99/p99.9/p99.99 itself (the `bench-hdr`
+# convention, docs/07 §5) rather than criterion's mean/median. Both are
+# dev-only — never compiled by `cargo build`/`cargo test`, only under
+# `cargo bench` — and neither reaches the shipped crate or the PyO3 boundary.
+# Audit note: `criterion` — Apache-2.0 OR MIT; `hdrhistogram` — MIT OR
+# Apache-2.0. `cargo audit` / `cargo deny` stay green; `#![forbid(unsafe_code)]`
+# in `ironcondor` itself is unaffected (both are dev-deps, outside the crate).
+# `criterion` with `default-features = false` drops the optional
+# `plotters`/HTML-report and `rayon` stacks; `cargo_bench_support` is kept so
+# `cargo bench` still drives the harness. Keeps the added surface minimal.
+criterion = { version = "0.5", default-features = false, features = [
+    "cargo_bench_support",
+] }
+hdrhistogram = "7"
+
+# The naive-mode throughput baseline (#18): full `run_backtest` over a canonical
+# Parquet iron-condor chain, single strategy, single core. `harness = false` so
+# criterion's own `main` runs (this bench provides `criterion_main!`), not the
+# libtest harness.
+[[bench]]
+name = "naive_throughput"
+harness = false
