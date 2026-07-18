@@ -1,13 +1,14 @@
 //! Chain data feeds.
 //!
 //! The `DataFeed` seam, the historical Parquet/CSV loaders, the
-//! OptionChain-Simulator session client (feature `simulator`), and the single
-//! `ChainResponse` → `OptionChain` conversion boundary (roadmap issues #7–#9,
-//! #27, #44, #45). The [`DataFeed`] trait, its [`TapeMeta`], the
-//! [`DataSourceSpec`] provenance enum, and the [`FeedKind`] / [`feed_catalogue`]
-//! seam land here (issue #8); the migrated session `simulator` client (issue
-//! #6) sits behind the `simulator` feature; the concrete feed loaders land with
-//! the remaining issues.
+//! OptionChain-Simulator session client and its materialised-tape feed
+//! (feature `simulator`), and the single `ChainResponse` → `OptionChain`
+//! conversion boundary (roadmap issues #7–#9, #27, #44, #45). The
+//! [`DataFeed`] trait, its [`TapeMeta`], the [`DataSourceSpec`] provenance
+//! enum, and the [`FeedKind`] / [`feed_catalogue`] seam land here (issue #8);
+//! the migrated session `simulator` client (issue #6), and the
+//! `SimulatorFeed` that materialises a whole session to a validated tape
+//! before the loop (issue #45), sit behind the `simulator` feature.
 
 pub mod convert;
 pub mod feed;
@@ -20,6 +21,8 @@ pub use convert::chain_response_to_snapshot;
 pub use convert::{RawQuote, SnapshotMeta, raw_quotes_to_snapshot, snapshot_to_option_chain};
 pub use feed::{DataFeed, FeedKind, TapeMeta, feed_catalogue};
 pub use historical::{CsvFeed, ParquetFeed};
+#[cfg(feature = "simulator")]
+pub use simulator::SimulatorFeed;
 
 use serde::{Deserialize, Serialize};
 

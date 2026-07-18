@@ -37,7 +37,8 @@
 //! - [`execution`] — fill models: naive (mid/spread + slippage) and realistic
 //!   (order-book matching, feature `orderbook`).
 //! - [`data`] — chain feeds: historical Parquet/CSV loaders and the
-//!   OptionChain-Simulator client (feature `simulator`).
+//!   OptionChain-Simulator client + materialised-tape feed
+//!   (feature `simulator`).
 //! - [`analytics`] — P&L attribution by Greek and summary metrics.
 //! - [`bundle`] — the result-bundle writer (manifest + Parquet tables).
 //! - `python` — PyO3 bindings (feature `python`).
@@ -120,10 +121,13 @@ pub use run::run_backtest;
 #[cfg(feature = "simulator")]
 pub use data::SimulatorSourceSpec;
 /// The migrated OptionChain-Simulator session surface (feature `simulator`):
-/// the async [`data::simulator::ApiClient`] and the bug-fixed
-/// [`data::simulator::MarketSimulator`] step wrapper, plus the local wire DTOs.
+/// the async [`data::simulator::ApiClient`], the bug-fixed
+/// [`data::simulator::MarketSimulator`] step wrapper, the local wire DTOs,
+/// and the materialised-tape [`data::simulator::SimulatorFeed`] (#45).
 #[cfg(feature = "simulator")]
 pub use data::chain_response_to_snapshot;
+#[cfg(feature = "simulator")]
+pub use data::simulator::SimulatorFeed;
 #[cfg(feature = "simulator")]
 pub use data::simulator::{
     ApiClient, ChainResponse, CreateSessionRequest, ErrorResponse, MarketSimulator, MarketState,

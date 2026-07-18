@@ -189,11 +189,19 @@ impl FeedKind {
     /// Whether this feed reproduces the same tape from the same source today.
     ///
     /// File feeds are byte-reproducible (their `sha256` pins the input). The
-    /// simulator feed is **not yet claimed reproducible**: the upstream seed
-    /// channel exists (simulator v0.1.0, sent as `CreateSessionRequest::seed`)
-    /// but same-seed tape identity end-to-end is asserted by the issue #45
-    /// materialisation closing test — this flag flips only when that test
-    /// lands green
+    /// simulator feed is **not yet claimed reproducible**, and the honest
+    /// split is (#45): the seed channel flows end-to-end (materialisation
+    /// sends `data_seed` as `CreateSessionRequest::seed` and records the
+    /// echoed effective seed), and the offline harness proves the
+    /// materialiser itself adds no nondeterminism (identical recorded
+    /// responses ⇒ identical tape `sha256`); but same-seed **tape identity**
+    /// across live sessions is server behaviour, and upstream v0.1.0 stamps
+    /// each `ChainResponse.timestamp` (and renders relative expiries) from
+    /// the wall clock (verified 2026-07-17), so two same-seed sessions repeat
+    /// the *walk* without repeating the tape bytes. The SIM_LIVE-gated
+    /// closing tests in `tests/simulator_live.rs` pin both halves; this flag
+    /// flips only when full same-seed tape identity is verified against a
+    /// live server
     /// ([docs/03 §3](../../../docs/03-data-layer.md#3-feed-catalogue),
     /// [docs/03 §6](../../../docs/03-data-layer.md#6-synthetic-feed--optionchain-simulator)).
     #[must_use]
