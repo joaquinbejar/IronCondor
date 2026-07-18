@@ -83,6 +83,23 @@ is no long-term-support branch before 1.0.
   error to a Python exception.
 - **Fuzz targets** for the CSV / Parquet / bundle-read-back parsers land
   before v1.0.
+- **Secrets never reach a bundle, manifest, log, or error** — the sole
+  credential channel is the optional simulator client, and a credential
+  embedded as URL userinfo (`http://user:token@host`) is **redacted at
+  serialisation** before any recorded copy (the manifest `data_source`, the
+  nested `config.data_source`, or the `run_id` preimage) is written; the
+  manifest records only the data-source **identity** (host URL + tape
+  `sha256`). Proven by the captured-log credential test.
+
+**v1.0 posture affirmation.** At the 1.0 cut the three security legs are in
+place and verified fresh: untrusted-input hardening with fuzz targets over the
+CSV / Parquet / bundle parsers (no panic, hang, or OOM on malformed bytes);
+secrets non-leakage (the captured-log credential test above); and the
+supply-chain / host-integrity controls — `cargo audit` and
+`cargo deny --all-features check` both green, suppressing only the documented
+`RUSTSEC-2024-0436` (`paste` unmaintained, a notice not a vulnerability, mirrored
+in `.cargo/audit.toml` and `deny.toml`), with `#![forbid(unsafe_code)]` intact
+and the no-panic-across-FFI control asserted by the Python test suite.
 
 The full threat model, untrusted-input hardening table, and secrets-handling
 rules live in

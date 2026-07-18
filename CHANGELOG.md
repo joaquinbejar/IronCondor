@@ -10,6 +10,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Captured-log credential test proving a simulator credential never leaks, and
+  the supply-chain / no-panic-across-FFI controls reaffirmed at the 1.0 cut
+  (#53).** The current `simulator` surface (frozen at #49) has **no auth-token
+  field**; the only channel a credential can take is URL userinfo
+  (`http://user:token@host`), which `reqwest` turns into a transport
+  `Authorization` header. A new `tests/secrets_log.rs` (feature `simulator`)
+  drives a dummy credential through a full materialise → provenance → manifest
+  path **and** a failure path, capturing every `tracing` event, the resulting
+  manifest provenance, the derived `run_id`, and the returned error, and asserts
+  the credential substring appears **nowhere**.
+  - **One real leak found and fixed.** `SimulatorSourceSpec.base_url` was
+    recorded **verbatim** in the manifest (both the top-level `data_source` and
+    the nested `config.data_source`) and in the `run_id` preimage, so a
+    userinfo-embedded credential would have been written to disk. Closed with a
+    custom `Serialize` on `SimulatorSourceSpec` that **redacts URL userinfo at
+    serialisation** — the single chokepoint through which every recorded copy
+    passes — while the in-memory value the transport client authenticates with
+    keeps the credential. Redaction is a no-op for every credential-free URL, so
+    all existing goldens/fixtures are byte-unchanged; two configs differing only
+    in the embedded credential now derive the **identical** `run_id`. The
+    manifest records only data-source **identity** (host URL + tape `sha256`),
+    never a credential ([docs/07 §9](docs/07-performance-and-security.md#9-secrets-handling)).
+  - **No leak on the error/log path (verified, no fix needed).** `reqwest`
+    0.12.28 already redacts URL userinfo from its error `Display`, and the crate
+    never embeds `base_url` in an error string or a `tracing` field — so
+    `BacktestError::Session` messages and the bounded-retry warnings carry
+    structured context, not a credential.
+  - **Supply-chain gates reaffirmed green at the cut.** `cargo audit --deny
+    warnings` and `cargo deny --all-features check` both pass; the **only**
+    suppressed advisory is `RUSTSEC-2024-0436` (`paste 1.0.15` **unmaintained** —
+    a notice, not a vulnerability; transitive through the upstream numeric
+    stack), documented identically in `.cargo/audit.toml` and `deny.toml`. No
+    suppression masks an unfixed advisory; the duplicate-version entries are
+    surfaced as non-failing warnings by design. No new runtime dependency (the
+    test's HTTP responder and `tracing`-capture subscriber are zero-dep).
+  - **`#![forbid(unsafe_code)]` intact** and the **no-panic-across-FFI** control
+    (#40) stays asserted by `python/tests/test_errors.py`
+    (`test_induced_panic_surfaces_as_engine_error`,
+    `test_induced_panic_is_caught_by_the_base_clause_and_interpreter_survives`) —
+    the third leg of the posture.
 - **Fuzz targets landed for the three untrusted-byte parser surfaces — CSV
   feed, Parquet feed, and bundle read-back (#52).** A `fuzz/` `cargo-fuzz`
   subcrate (its own workspace, so the main `Cargo.lock` and `cargo deny` graph

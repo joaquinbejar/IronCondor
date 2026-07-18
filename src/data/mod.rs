@@ -95,12 +95,20 @@ pub enum DataSourceSpec {
 /// manifest or config carrying a mistyped or unexpected key fails loudly at
 /// the boundary instead of being silently dropped.
 #[cfg(feature = "simulator")]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SimulatorSourceSpec {
     /// The walk parameters sent to the simulator on `create_session`.
     pub session: CreateSessionRequest,
     /// Which simulator instance served the session (its base URL).
+    ///
+    /// A credential embedded here as URL userinfo (`http://user:token@host`)
+    /// is what `reqwest` turns into a transport `Authorization` header, so the
+    /// in-memory value the client is built from **keeps** it — but it is
+    /// **redacted on serialisation** (custom [`Serialize`] impl below), so no
+    /// recorded copy (the manifest `data_source`, the nested
+    /// `config.data_source`, or the `run_id` preimage) ever carries the
+    /// plaintext credential ([docs/07 §9](../../../docs/07-performance-and-security.md#9-secrets-handling)).
     pub base_url: String,
     /// The **data** seed — distinct from the engine seed (`config.seed`).
     /// Since upstream v0.1.0 the simulator accepts a walk seed
@@ -116,6 +124,66 @@ pub struct SimulatorSourceSpec {
     pub tape_sha256: String,
     /// The server build id when it exposes one; `None` otherwise.
     pub simulator_version: Option<String>,
+}
+
+/// Strip any `userinfo@` (embedded HTTP basic-auth credentials) from a URL,
+/// keeping `scheme://host[:port][/path…]`. A credential embedded in a
+/// simulator base URL (`http://user:token@host`) is honoured by `reqwest` for
+/// transport, but the plaintext URL must never reach a manifest, a log, or an
+/// error ([docs/07 §9](../../../docs/07-performance-and-security.md#9-secrets-handling)).
+///
+/// Applied at serialisation, so every recorded copy is redacted uniformly.
+/// Fail-closed: any input that does not parse as `scheme://authority…` and
+/// still cannot be shown credential-free collapses to `"[redacted-url]"`
+/// rather than risk leaking. A URL with no userinfo is returned unchanged.
+#[cfg(feature = "simulator")]
+fn redact_url_userinfo(url: &str) -> String {
+    let Some(scheme_sep) = url.find("://") else {
+        // No authority component — nothing that can hold userinfo credentials.
+        return url.to_string();
+    };
+    let authority_start = scheme_sep + "://".len();
+    let (Some(prefix), Some(rest)) = (url.get(..authority_start), url.get(authority_start..))
+    else {
+        return "[redacted-url]".to_string();
+    };
+    // The authority runs until the first '/', '?' or '#' (or end of string).
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let Some(authority) = rest.get(..authority_end) else {
+        return "[redacted-url]".to_string();
+    };
+    let Some(at) = authority.rfind('@') else {
+        // No userinfo — the URL is already credential-free.
+        return url.to_string();
+    };
+    // Everything after the last '@' in the authority is host[:port], and the
+    // path/query/fragment tail beyond it is preserved verbatim.
+    match rest.get(at + 1..) {
+        Some(host_and_tail) => format!("{prefix}{host_and_tail}"),
+        None => "[redacted-url]".to_string(),
+    }
+}
+
+/// Custom [`Serialize`] mirroring the derived shape exactly (same five fields,
+/// same order, `deny_unknown_fields` still governs deserialisation), except
+/// `base_url` is passed through `redact_url_userinfo` so a credential embedded
+/// as URL userinfo never lands in a manifest, a bundle, or a `run_id` preimage.
+/// Deserialisation stays derived — a redacted URL round-trips to itself.
+#[cfg(feature = "simulator")]
+impl Serialize for SimulatorSourceSpec {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("SimulatorSourceSpec", 5)?;
+        state.serialize_field("session", &self.session)?;
+        state.serialize_field("base_url", &redact_url_userinfo(&self.base_url))?;
+        state.serialize_field("data_seed", &self.data_seed)?;
+        state.serialize_field("tape_sha256", &self.tape_sha256)?;
+        state.serialize_field("simulator_version", &self.simulator_version)?;
+        state.end()
+    }
 }
 
 #[cfg(test)]
@@ -222,5 +290,96 @@ mod tests {
             back.is_err(),
             "an unknown key nested in the session request must be rejected"
         );
+    }
+
+    #[cfg(feature = "simulator")]
+    #[test]
+    fn test_redact_url_userinfo_strips_credentials_but_keeps_identity() {
+        use super::redact_url_userinfo;
+        // user:token@ credentials are stripped; scheme/host/port/path survive.
+        assert_eq!(
+            redact_url_userinfo("http://ci-bot:s3cr3t@sim.internal:7070/api/v1/chain"),
+            "http://sim.internal:7070/api/v1/chain"
+        );
+        // A lone user (no password) is still stripped.
+        assert_eq!(
+            redact_url_userinfo("https://token@host:443"),
+            "https://host:443"
+        );
+        // The last '@' delimits host, so a '@' inside the userinfo is dropped too.
+        assert_eq!(
+            redact_url_userinfo("http://user:p@ss@host:7070"),
+            "http://host:7070"
+        );
+        // A credential-free URL is returned byte-for-byte unchanged (the common
+        // case — every existing golden / offline fixture takes this path).
+        assert_eq!(
+            redact_url_userinfo("http://localhost:7070"),
+            "http://localhost:7070"
+        );
+        assert_eq!(
+            redact_url_userinfo("http://127.0.0.1:59440"),
+            "http://127.0.0.1:59440"
+        );
+        // No scheme separator: left as-is (no authority that can hold a secret).
+        assert_eq!(redact_url_userinfo("localhost:7070"), "localhost:7070");
+    }
+
+    #[cfg(feature = "simulator")]
+    #[test]
+    fn test_simulator_spec_serialisation_redacts_userinfo_credential() {
+        use crate::data::simulator::CreateSessionRequest;
+        use serde_json::json;
+
+        const SECRET: &str = "SUPERSECRETTOKEN123";
+        let spec = DataSourceSpec::Simulator(super::SimulatorSourceSpec {
+            session: CreateSessionRequest {
+                symbol: "SPX".to_string(),
+                steps: 5,
+                initial_price: 100.0,
+                days_to_expiration: 30.0,
+                volatility: 0.2,
+                risk_free_rate: 0.03,
+                dividend_yield: 0.0,
+                method: json!({"GeometricBrownian": {"dt": 0.004, "drift": 0.0, "volatility": 0.2}}),
+                time_frame: "Day".to_string(),
+                chain_size: Some(15),
+                strike_interval: Some(5.0),
+                skew_slope: None,
+                smile_curve: None,
+                spread: Some(0.02),
+                seed: Some(42),
+            },
+            base_url: format!("http://ci-bot:{SECRET}@sim.internal:7070"),
+            data_seed: 42,
+            tape_sha256: "cafef00d".to_string(),
+            simulator_version: None,
+        });
+        let json = serde_json::to_string(&spec).unwrap_or_default();
+        assert!(
+            !json.contains(SECRET),
+            "the credential must never reach a serialised (manifest) copy: {json}"
+        );
+        assert!(
+            !json.contains('@'),
+            "no userinfo separator survives: {json}"
+        );
+        assert!(
+            json.contains("sim.internal:7070"),
+            "the host identity is still recorded: {json}"
+        );
+        assert!(
+            json.contains("cafef00d"),
+            "the tape identity is still recorded: {json}"
+        );
+        // The redacted form round-trips to itself (deserialise stays derived).
+        let back: DataSourceSpec = match serde_json::from_str(&json) {
+            Ok(spec) => spec,
+            Err(e) => panic!("redacted simulator spec must round-trip: {e}"),
+        };
+        let super::DataSourceSpec::Simulator(back) = back else {
+            panic!("a simulator spec must round-trip to a simulator spec");
+        };
+        assert_eq!(back.base_url, "http://sim.internal:7070");
     }
 }
