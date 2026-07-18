@@ -8,6 +8,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Resting-order (GTC) lifecycle in realistic mode + batch error caching
+  (#110).** A GTC limit that fills partially or not at all is now a first-class
+  working order: the engine pre-mints order ids and passes them through the
+  execution seam (`ExecutionModel::fill` gains `submit_ids`), a pending-order
+  registry tracks each resting order across steps, and refresh-generated fills
+  are correlated back through the new `carry_fills()` sidecar
+  (`CarryGroup { order_id, fill_count }` describing the e1 prefix) — a carried
+  open pushes a new inventory leg under the order's original trade with a
+  continuing `fill_seq`, a carried close reduces its target leg with the reason
+  captured at scheduling. `Cancel`/`Replace` are live: validated against the
+  step-start registry (an id never pending is a typed error; one consumed by
+  the same step's refresh is a benign no-op), resolved through the new
+  domain-`OrderId` → book-id bridge, with `Replace` as cancel-plus-fresh-submit
+  under a new identity. `ChainContext::pending` is now populated, so
+  `assert_owned` enforces ownership and `close_all` reconciles against resting
+  closes (an unfilled resting close leaves the leg honestly `open_at_end`; a
+  pending open at end of data is dropped, never phantom-filled). Books whose
+  contract left the snapshot universe are evicted unless they hold a live
+  strategy order (bounded per-refresh work under a rolling universe); a taker
+  intent crossing the strategy's own resting order fails closed (typed error)
+  until maker-side e2 capture is designed. Batch shared-tape materialisation
+  failures are cached per path as an error descriptor, so every run sharing a
+  bad path records the identical typed error without re-parsing it.
+  IOC-only runs derive byte-identical ids and bundles — all goldens unchanged.
+
 ### Fixed
 
 - **24 stack-review findings closed in one pass (PRs #55–#109 review response).**

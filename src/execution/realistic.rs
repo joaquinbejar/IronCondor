@@ -86,12 +86,14 @@ use optionstratlib_ob::OptionStyle as ObOptionStyle;
 
 use crate::config::{FeeSchedule, LiquidityProfile};
 use crate::domain::{
-    ChainSnapshot, ContractKey, ExecutionMode, Fill, OrderCommand, OrderIntent, PriceCents,
-    Quantity, QuoteView, TimeInForce,
+    ChainSnapshot, ContractKey, ExecutionMode, Fill, OrderCommand, OrderId, OrderIntent,
+    PriceCents, Quantity, QuoteView, TimeInForce,
 };
 use crate::error::BacktestError;
 
-use super::{ExecutionModel, FeeCharge, FillDraft, FillGroup, assemble_fill, liquidity};
+use super::{
+    CarryGroup, ExecutionModel, FeeCharge, FillDraft, FillGroup, assemble_fill, liquidity,
+};
 
 /// The first strategy `OrderId`. Strategy ids occupy the low range
 /// `[STRATEGY_ID_BASE, MAKER_ID_BASE)`; a handle at or above [`MAKER_ID_BASE`]
@@ -154,16 +156,17 @@ pub struct RealisticFill {
     /// been charged the per-order fee. Never a `HashMap` — a `BTreeMap` keeps the
     /// refresh deterministic. An entry is removed once fully consumed **by a
     /// refresh cross** (the e1 path).
-    ///
-    /// Eviction is deliberately partial while strategy-order lifecycle is
-    /// deferred: an entry a *taker intent* consumes (e2 `fill_submit`) or that a
-    /// logical cancel removes is not evicted here, so this map is bounded only by
-    /// the count of resting strategy limits until Cancel/Replace lands. This is
-    /// unreachable today — every shipped strategy is marketable-IOC and never
-    /// rests a GTC limit, so the map stays empty — but the eviction path and the
-    /// e2-consumed-maker fill (its maker-side `Fill` is currently only emitted on
-    /// the e1 path) must be closed together with that lifecycle work.
     resting_strategy: BTreeMap<u64, RestingStrategyOrder>,
+    /// The engine-`OrderId` → book-sequence bridge for resting strategy orders
+    /// (#110): `Cancel`/`Replace` name the engine id, the book knows only its
+    /// own `Sequential` value, and this map joins them. Entries live exactly as
+    /// long as the mirrored [`RestingStrategyOrder`] they point at.
+    order_index: BTreeMap<OrderId, u64>,
+    /// The refresh-fill → resting-order correlation for the most recent
+    /// [`Self::fill`] call — one [`CarryGroup`] per refresh-generated fill, in
+    /// emission order (the contiguous e1 prefix of `out_fills`). **Reusable
+    /// scratch:** cleared in place each `fill` (capacity retained).
+    carry_groups: Vec<CarryGroup>,
     /// Reusable scratch for the per-step reseed plan — sized once, cleared in
     /// place by [`liquidity::plan_seed_into`] each refresh, so the refresh's own
     /// plan buffer never reallocates ([docs/07 §4](../../../docs/07-performance-and-security.md)).
@@ -191,8 +194,15 @@ pub struct RealisticFill {
 /// resting size (to know when the order is exhausted) and `first_fill_done` (so
 /// the once-per-order fee is charged exactly once, on the order's first fill,
 /// whether that happened at submit or on a later refresh).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct RestingStrategyOrder {
+    /// The engine-minted domain [`OrderId`] this resting order answers to — the
+    /// identity a [`CarryGroup`] names so the engine can apply a refresh fill to
+    /// the leg the order opens or closes (#110).
+    order_id: OrderId,
+    /// The order's contract — locates its leaf book for `Cancel`/`Replace` and
+    /// gates eviction (a book holding a live strategy order is never evicted).
+    contract: ContractKey,
     /// The order's trade side (`Long` = buy, `Short` = sell) — the slippage sign
     /// and the assembled fill's side.
     side: Side,
@@ -218,6 +228,8 @@ impl std::fmt::Debug for RealisticFill {
             .field("liquidity_profile", &self.liquidity_profile)
             .field("resting_seed_ids", &self.resting_seed_ids.len())
             .field("resting_strategy", &self.resting_strategy.len())
+            .field("order_index", &self.order_index.len())
+            .field("carry_groups", &self.carry_groups.len())
             .field("fill_groups", &self.fill_groups.len())
             .field("books", &self.books.len())
             .finish()
@@ -246,6 +258,8 @@ impl RealisticFill {
             liquidity_profile: None,
             resting_seed_ids: BTreeMap::new(),
             resting_strategy: BTreeMap::new(),
+            order_index: BTreeMap::new(),
+            carry_groups: Vec::new(),
             seed_plan: Vec::new(),
             fill_groups: Vec::new(),
             books: BTreeMap::new(),
@@ -281,6 +295,8 @@ impl RealisticFill {
             liquidity_profile: Some(profile),
             resting_seed_ids: BTreeMap::new(),
             resting_strategy: BTreeMap::new(),
+            order_index: BTreeMap::new(),
+            carry_groups: Vec::new(),
             seed_plan: Vec::new(),
             fill_groups: Vec::new(),
             books: BTreeMap::new(),
@@ -430,6 +446,31 @@ impl RealisticFill {
         // 1. Cancel every stale seeded-maker order (empty on the first snapshot
         //    ⇒ a plain initial seed). Strategy ids are never touched.
         self.cancel_stale_seed()?;
+        // 1b. Evict departed contracts (#110): a book whose contract left the
+        //     snapshot universe AND holds no live resting strategy order is
+        //     removed (with its seed-id slot), so a rolling option universe
+        //     bounds per-refresh work at O(active universe + live orders). A
+        //     book with a live strategy order is NEVER evicted — the working
+        //     order (and its aged price-time priority) lives inside it. The
+        //     retain predicates scan `resting_strategy` per key instead of
+        //     building a scratch set: allocation-free, and both maps are
+        //     bounded by the active universe after this very step.
+        {
+            let Self {
+                books,
+                resting_seed_ids,
+                resting_strategy,
+                ..
+            } = self;
+            books.retain(|contract, _| {
+                snap.quotes.contains_key(contract)
+                    || resting_strategy.values().any(|m| &m.contract == contract)
+            });
+            resting_seed_ids.retain(|contract, _| {
+                snap.quotes.contains_key(contract)
+                    || resting_strategy.values().any(|m| &m.contract == contract)
+            });
+        }
         // 2. Reseed fresh depth in the fixed plan order, capturing any
         //    refresh-generated fills of resting strategy limits the reseed
         //    crosses. The scratch plan buffer is moved out and back so the
@@ -572,7 +613,7 @@ impl RealisticFill {
         let quantity = Quantity::new(matched)?;
         // Read + update the strategy order's state in a scoped borrow so the fee
         // schedule (a disjoint field) is free for `assemble_fill` afterwards.
-        let (side, decision_mid, charge, exhausted) = {
+        let (engine_order_id, side, decision_mid, charge, exhausted) = {
             let Some(meta) = self.resting_strategy.get_mut(&maker_seq) else {
                 return Ok(());
             };
@@ -594,7 +635,13 @@ impl RealisticFill {
                         .to_string(),
                 )
             })?;
-            (meta.side, meta.decision_mid, charge, meta.remaining == 0)
+            (
+                meta.order_id,
+                meta.side,
+                meta.decision_mid,
+                charge,
+                meta.remaining == 0,
+            )
         };
         let draft = FillDraft {
             ts: snap.ts,
@@ -611,8 +658,28 @@ impl RealisticFill {
             &self.fees,
             charge,
         )?);
+        // Coalesce contiguous same-order refresh fills into ONE carry group
+        // (one resting order crossed by several reseed levels in a single
+        // refresh — its crossings are contiguous in `out_fills` because a
+        // contract's ladder is contiguous in the plan): the engine then
+        // VWAP-aggregates the group into one leg / one close, matching the e2
+        // command path's granularity.
+        if let Some(last) = self.carry_groups.last_mut()
+            && last.order_id == engine_order_id
+        {
+            last.fill_count = last
+                .fill_count
+                .checked_add(1)
+                .ok_or(BacktestError::ArithmeticOverflow)?;
+        } else {
+            self.carry_groups.push(CarryGroup {
+                order_id: engine_order_id,
+                fill_count: 1,
+            });
+        }
         if exhausted {
             self.resting_strategy.remove(&maker_seq);
+            self.order_index.remove(&engine_order_id);
         }
         Ok(())
     }
@@ -631,6 +698,7 @@ impl RealisticFill {
     fn fill_submit(
         &mut self,
         intent: &OrderIntent,
+        engine_order_id: OrderId,
         snap: &ChainSnapshot,
         out_fills: &mut Vec<Fill>,
     ) -> Result<(), BacktestError> {
@@ -686,6 +754,24 @@ impl RealisticFill {
 
         // One `Fill` per executed price level, in queue-consumption order:
         // fill 0 carries the once-per-order fee, later fills only per-contract.
+        // Fail closed on a strategy self-cross (#110), BEFORE emitting any of
+        // this order's fills: a taker intent whose trade consumed a RESTING
+        // STRATEGY maker would leave that maker's mirror desynced (its
+        // maker-side fill has no emission slot in the e2 stream — the carry
+        // channel is an e1-prefix contract). No shipped strategy crosses its own
+        // resting orders; surface it as a typed error rather than a silent
+        // desync until maker-side e2 capture is designed.
+        for trade in trade_result.match_result.trades().as_vec() {
+            if let ObOrderId::Sequential(maker_seq) = trade.maker_order_id()
+                && self.resting_strategy.contains_key(&maker_seq)
+            {
+                return Err(BacktestError::Execution(
+                    "taker intent crossed a resting strategy order (strategy \
+                     self-cross); maker-side e2 capture is unsupported"
+                        .to_string(),
+                ));
+            }
+        }
         for (level, trade) in trade_result
             .match_result
             .trades()
@@ -733,13 +819,44 @@ impl RealisticFill {
             self.resting_strategy.insert(
                 seq,
                 RestingStrategyOrder {
+                    order_id: engine_order_id,
+                    contract: intent.contract.clone(),
                     side: intent.side,
                     decision_mid: intent.decision_mid,
                     remaining,
                     first_fill_done: remaining < qty,
                 },
             );
+            self.order_index.insert(engine_order_id, seq);
         }
+        Ok(())
+    }
+
+    /// Cancel the resting strategy order the engine knows as `order_id`: cancel
+    /// it in its leaf book, then drop the mirror and the id-bridge entry.
+    ///
+    /// An id with no live resting entry is a **benign no-op**: the engine
+    /// validates ownership against its pending registry at the top of the step,
+    /// so an absent entry here means the order was consumed by this very step's
+    /// refresh (e1 runs before the commands) or by a taker cross — not a caller
+    /// error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BacktestError::OrderBook`] when the book rejects the cancel.
+    fn cancel_resting(&mut self, order_id: OrderId) -> Result<(), BacktestError> {
+        let Some(seq) = self.order_index.get(&order_id).copied() else {
+            return Ok(());
+        };
+        if let Some(meta) = self.resting_strategy.get(&seq)
+            && let Some(book) = self.books.get(&meta.contract)
+        {
+            // `Ok(false)` = already gone in the book (a benign race); `Err`
+            // propagates as a typed book rejection.
+            let _cancelled = book.cancel_order(ObOrderId::Sequential(seq))?;
+        }
+        self.resting_strategy.remove(&seq);
+        self.order_index.remove(&order_id);
         Ok(())
     }
 }
@@ -758,42 +875,65 @@ impl ExecutionModel for RealisticFill {
     /// market moved onto fills exactly once, in this step, ahead of the new
     /// intents. See [`Self::refresh_books`].
     ///
-    /// **`Cancel`/`Replace` remain deferred.** Cancelling or replacing a resting
-    /// strategy order needs the domain-`OrderId` → book-`Id` map a later issue
-    /// establishes; this routes `Submit` only. The trait's "process
-    /// `Cancel`/`Replace` before `Submit`" ordering is honoured **vacuously** —
-    /// their effect is empty, so the output is identical whatever the command
-    /// order. The refresh never touches strategy orders, so a resting strategy
-    /// limit keeps its price-time priority across steps regardless.
+    /// **`Cancel`/`Replace` are live (#110).** A `Cancel` resolves the engine
+    /// [`OrderId`] through the id bridge and cancels the resting order in its
+    /// leaf book; a `Replace` cancels the old order and routes its replacement as
+    /// a fresh submit under the replacement's own pre-minted id. An id with no
+    /// live resting entry is a benign no-op — the engine validates ownership
+    /// against its pending registry, so absence here means the order was consumed
+    /// by this very step's refresh (e1 runs first). Lifecycle commands are
+    /// processed in command order alongside submits; the refresh never touches
+    /// strategy orders, so a resting strategy limit keeps its price-time priority
+    /// across steps until filled, cancelled, or replaced.
     ///
     /// # Errors
     ///
-    /// Propagates every error from [`Self::refresh_books`] and
-    /// [`Self::fill_submit`].
+    /// Propagates every error from [`Self::refresh_books`],
+    /// [`Self::fill_submit`], and [`Self::cancel_resting`], and returns
+    /// [`BacktestError::Execution`] when `submit_ids` under-covers the step's
+    /// `Submit`/`Replace` commands.
     fn fill(
         &mut self,
         commands: &[OrderCommand],
+        submit_ids: &[OrderId],
         snap: &ChainSnapshot,
         out_fills: &mut Vec<Fill>,
     ) -> Result<(), BacktestError> {
-        // The fill→order grouping is rebuilt every call: clear in place (capacity
-        // retained ⇒ no steady-state allocation), then record one group per
-        // filling `Submit` (e2) below. e1 refresh fills carry no group.
+        // Both correlation channels are rebuilt every call: clear in place
+        // (capacity retained ⇒ no steady-state allocation). Refresh fills (e1)
+        // record one CarryGroup each; command fills (e2) record FillGroups.
         self.fill_groups.clear();
+        self.carry_groups.clear();
         // e1: refresh the per-strike books from `snap` (cancel the stale seed,
         // reseed fresh depth) and append any refresh-generated fills BEFORE the
         // intent fills. On the first snapshot this degenerates to the #023
         // initial seed; a no-op for the raw adapter (no profile).
         self.refresh_books(snap, out_fills)?;
         // e2: route the step's commands against the freshly reseeded book. For
-        // each `Submit`, record how many fills it produced so the engine can
-        // group them back to one order and assign each fill its `fill_seq`
-        // (a marketable order walking `n` levels ⇒ one group of `fill_count = n`).
+        // each `Submit` (or `Replace` replacement), record how many fills it
+        // produced so the engine can group them back to one order and assign each
+        // fill its `fill_seq` (an order walking `n` levels ⇒ one group of
+        // `fill_count = n`). `submit_ids` carries one pre-minted engine id per
+        // `Submit`/`Replace` in command order — the identity the resting mirror
+        // records (#110).
+        let mut next_submit_id: usize = 0;
+        let mut take_submit_id = |ids: &[OrderId]| -> Result<OrderId, BacktestError> {
+            let id = ids.get(next_submit_id).copied().ok_or_else(|| {
+                BacktestError::Execution(
+                    "submit_ids under-covers the step's Submit/Replace commands".to_string(),
+                )
+            })?;
+            next_submit_id = next_submit_id
+                .checked_add(1)
+                .ok_or(BacktestError::ArithmeticOverflow)?;
+            Ok(id)
+        };
         for (command_index, command) in commands.iter().enumerate() {
             match command {
                 OrderCommand::Submit(intent) => {
+                    let engine_order_id = take_submit_id(submit_ids)?;
                     let before = out_fills.len();
-                    self.fill_submit(intent, snap, out_fills)?;
+                    self.fill_submit(intent, engine_order_id, snap, out_fills)?;
                     // `fill_submit` only appends, so `len >= before` always holds;
                     // `checked_sub` (never `saturating_sub` on a counter, per the
                     // repo's Category-E rule) surfaces any future refactor that
@@ -812,11 +952,45 @@ impl ExecutionModel for RealisticFill {
                         });
                     }
                 }
-                // Resting-order cancel/replace lifecycle is deferred (see docs).
-                OrderCommand::Cancel(_) | OrderCommand::Replace { .. } => {}
+                OrderCommand::Cancel(order_id) => {
+                    self.cancel_resting(*order_id)?;
+                }
+                OrderCommand::Replace {
+                    order_id,
+                    replacement,
+                } => {
+                    // Cancel-then-submit: the old order dies (benign no-op if the
+                    // refresh already consumed it), the replacement routes as a
+                    // fresh submit under its own pre-minted id — a new order, a
+                    // new queue position, never an in-place amend.
+                    self.cancel_resting(*order_id)?;
+                    let replacement_id = take_submit_id(submit_ids)?;
+                    let before = out_fills.len();
+                    self.fill_submit(replacement, replacement_id, snap, out_fills)?;
+                    let produced = out_fills.len().checked_sub(before).ok_or_else(|| {
+                        BacktestError::Execution(
+                            "fill buffer shrank during fill_submit".to_string(),
+                        )
+                    })?;
+                    if produced > 0 {
+                        let fill_count = u32::try_from(produced)
+                            .map_err(|_| BacktestError::ArithmeticOverflow)?;
+                        self.fill_groups.push(FillGroup {
+                            command_index,
+                            fill_count,
+                        });
+                    }
+                }
             }
         }
         Ok(())
+    }
+
+    #[inline]
+    fn carry_fills(&self) -> &[CarryGroup] {
+        // The e1 refresh-fill prefix correlation (#110): one group per refresh
+        // fill, naming the prior-step resting order's engine id.
+        &self.carry_groups
     }
 
     #[inline]
@@ -986,6 +1160,19 @@ fn marketable_limit_cents(
 
 #[cfg(test)]
 mod tests {
+    /// Pre-minted engine order ids for driving `fill` directly in tests: ample
+    /// for any test's Submit/Replace count; values are arbitrary identities.
+    const TEST_SUBMIT_IDS: &[OrderId] = &[
+        OrderId::new(9001),
+        OrderId::new(9002),
+        OrderId::new(9003),
+        OrderId::new(9004),
+        OrderId::new(9005),
+        OrderId::new(9006),
+        OrderId::new(9007),
+        OrderId::new(9008),
+    ];
+
     use std::collections::BTreeMap;
 
     use chrono::DateTime;
@@ -1000,12 +1187,12 @@ mod tests {
     };
     use crate::config::{FeeSchedule, LiquidityProfile, TouchSize};
     use crate::domain::{
-        ChainSnapshot, ContractKey, ExecutionMode, Fill, InstrumentSpec, OrderCommand, OrderIntent,
-        PositionAction, PositionId, PriceCents, Quantity, QuoteView, SimTime, StepIndex,
-        TimeInForce, Underlying,
+        ChainSnapshot, ContractKey, ExecutionMode, Fill, InstrumentSpec, OrderCommand, OrderId,
+        OrderIntent, PositionAction, PositionId, PriceCents, Quantity, QuoteView, SimTime,
+        StepIndex, TimeInForce, Underlying,
     };
     use crate::error::BacktestError;
-    use crate::execution::ExecutionModel;
+    use crate::execution::{CarryGroup, ExecutionModel};
 
     const TS0: i64 = 1_750_291_200_000_000_000;
     const TICK: u64 = 5;
@@ -1114,6 +1301,25 @@ mod tests {
             underlying_price: PriceCents::new(510_000),
             spec,
             quotes,
+        }
+    }
+
+    /// A snapshot with NO quoted contracts at `step` — the departed-universe
+    /// case the eviction path (#110) reacts to.
+    fn empty_snapshot_step(step: u32) -> ChainSnapshot {
+        let Ok(underlying) = Underlying::new("SPX") else {
+            panic!("SPX is a valid underlying");
+        };
+        let Ok(spec) = InstrumentSpec::new(PriceCents::new(TICK), 100) else {
+            panic!("valid spec");
+        };
+        ChainSnapshot {
+            ts: SimTime::new(TS0 + i64::from(step)),
+            step: StepIndex::new(step),
+            underlying,
+            underlying_price: PriceCents::new(510_000),
+            spec,
+            quotes: BTreeMap::new(),
         }
     }
 
@@ -1283,6 +1489,7 @@ mod tests {
         let mut out: Vec<Fill> = Vec::new();
         let result = model.fill(
             &[marketable(Side::Long, PositionAction::Open, 5, 500)],
+            TEST_SUBMIT_IDS,
             &snapshot(490, 500),
             &mut out,
         );
@@ -1326,6 +1533,7 @@ mod tests {
         let mut out: Vec<Fill> = Vec::new();
         let result = model.fill(
             &[marketable(Side::Long, PositionAction::Open, 9, 500)],
+            TEST_SUBMIT_IDS,
             &snapshot(490, 500),
             &mut out,
         );
@@ -1371,7 +1579,7 @@ mod tests {
             decision_mid: PriceCents::new(500),
         });
         let mut out: Vec<Fill> = Vec::new();
-        let result = model.fill(&[close], &snapshot(490, 510), &mut out);
+        let result = model.fill(&[close], TEST_SUBMIT_IDS, &snapshot(490, 510), &mut out);
         assert!(matches!(result, Ok(())));
         let Some(fill) = out.first() else {
             panic!("the buy-to-close must fill against the ask");
@@ -1413,7 +1621,7 @@ mod tests {
             decision_mid: PriceCents::new(500),
         });
         let mut out: Vec<Fill> = Vec::new();
-        let result = model.fill(&[close], &snapshot(490, 510), &mut out);
+        let result = model.fill(&[close], TEST_SUBMIT_IDS, &snapshot(490, 510), &mut out);
         assert!(matches!(result, Ok(())));
         let Some(fill) = out.first() else {
             panic!("the sell-to-close must fill against the bid");
@@ -1434,8 +1642,15 @@ mod tests {
     /// the strategy order queued behind the seeded depth at its level.
     #[test]
     fn test_queue_position_strategy_limit_fills_behind_seeded_depth() {
+        // Pre-#110 this scenario let the marketable buy silently consume the
+        // strategy's own resting sell (queue position observable, mirror left
+        // desynced). With the resting-order lifecycle the self-cross fails
+        // CLOSED: the maker-side fill has no e2 emission slot, so the model
+        // rejects the taker with a typed error before emitting anything. The
+        // book's price-time queue priority itself remains covered by the e1
+        // aging test (`test_resting_strategy_limit_fills_exactly_when_later_
+        // snapshot_crosses`) and upstream's own matching tests.
         let mut model = RealisticFill::new(fees(), 10, 5);
-        // Seeded ask of 3 @ 500 — added first, so it is ahead in the queue.
         let seeded = model.seed_maker_limit(
             &contract(),
             true,
@@ -1444,8 +1659,6 @@ mod tests {
             PriceCents::new(TICK),
         );
         assert!(matches!(seeded, Ok(())));
-        // A strategy sell limit of 2 @ 500 rests BEHIND the seeded ask (same
-        // price, later time), then a marketable buy for 5 consumes both.
         let rest_then_walk = [
             OrderCommand::Submit(OrderIntent {
                 contract: contract(),
@@ -1459,18 +1672,18 @@ mod tests {
             marketable(Side::Long, PositionAction::Open, 5, 500),
         ];
         let mut out: Vec<Fill> = Vec::new();
-        let result = model.fill(&rest_then_walk, &snapshot(490, 500), &mut out);
-        assert!(matches!(result, Ok(())));
-        // The resting sell produced no fill; the buy produced two per-maker
-        // trades at 500: the seeded 3 first, the strategy 2 second.
-        let levels: Vec<(u64, u32)> = out
-            .iter()
-            .map(|f| (f.price.value(), f.quantity.value()))
-            .collect();
-        assert_eq!(
-            levels,
-            vec![(500, 3), (500, 2)],
-            "seeded depth (3) fills before the strategy limit (2) at the same price"
+        let result = model.fill(
+            &rest_then_walk,
+            TEST_SUBMIT_IDS,
+            &snapshot(490, 500),
+            &mut out,
+        );
+        let Err(BacktestError::Execution(message)) = result else {
+            panic!("a strategy self-cross must fail closed, got {result:?}");
+        };
+        assert!(
+            message.contains("self-cross"),
+            "the error names the self-cross: {message}"
         );
     }
 
@@ -1493,6 +1706,7 @@ mod tests {
         let mut out: Vec<Fill> = Vec::new();
         let result = model.fill(
             &[marketable(Side::Long, PositionAction::Open, 5, 500)],
+            TEST_SUBMIT_IDS,
             &snapshot(490, 500),
             &mut out,
         );
@@ -1510,6 +1724,7 @@ mod tests {
         let mut out: Vec<Fill> = Vec::new();
         let result = model.fill(
             &[marketable(Side::Long, PositionAction::Open, 5, 500)],
+            TEST_SUBMIT_IDS,
             &snapshot(490, 500),
             &mut out,
         );
@@ -1533,6 +1748,7 @@ mod tests {
         let mut out: Vec<Fill> = Vec::new();
         let result = model.fill(
             &[marketable(Side::Long, PositionAction::Open, 5, 500)],
+            TEST_SUBMIT_IDS,
             &snapshot(490, 500),
             &mut out,
         );
@@ -1566,6 +1782,7 @@ mod tests {
         let mut out: Vec<Fill> = Vec::new();
         let result = model.fill(
             &[marketable(Side::Long, PositionAction::Open, 6, 500)],
+            TEST_SUBMIT_IDS,
             &snapshot(490, 500),
             &mut out,
         );
@@ -1593,6 +1810,7 @@ mod tests {
         let mut out: Vec<Fill> = Vec::new();
         let result = model.fill(
             &[marketable(Side::Long, PositionAction::Open, 4, 500)],
+            TEST_SUBMIT_IDS,
             &snapshot(490, 500),
             &mut out,
         );
@@ -1634,6 +1852,7 @@ mod tests {
         // marketable buy for 12 walks 10@500 then 2@505 (cap 10 reaches 510).
         let result = model.fill(
             &[marketable(Side::Long, PositionAction::Open, 12, 500)],
+            TEST_SUBMIT_IDS,
             &snapshot(490, 500),
             &mut out,
         );
@@ -1654,6 +1873,7 @@ mod tests {
         let mut out: Vec<Fill> = Vec::new();
         let result = model.fill(
             &[marketable(Side::Long, PositionAction::Open, 5, 500)],
+            TEST_SUBMIT_IDS,
             &snapshot(490, 500),
             &mut out,
         );
@@ -1683,7 +1903,7 @@ mod tests {
             tif: TimeInForce::Gtc,
             decision_mid: PriceCents::new(495),
         });
-        let result = model.fill(&[submit], &snapshot(490, 500), &mut out);
+        let result = model.fill(&[submit], TEST_SUBMIT_IDS, &snapshot(490, 500), &mut out);
         assert!(matches!(result, Ok(())));
         // Next maker id is in the high range (seeding consumed several);
         // next strategy id is in the low range and advanced past the base.
@@ -1726,7 +1946,7 @@ mod tests {
             decision_mid: PriceCents::new(502),
         });
         let mut out: Vec<Fill> = Vec::new();
-        let result = model.fill(&[submit], &snapshot(490, 505), &mut out);
+        let result = model.fill(&[submit], TEST_SUBMIT_IDS, &snapshot(490, 505), &mut out);
         assert!(matches!(result, Ok(())));
         assert!(out.is_empty(), "a non-crossing resting limit does not fill");
     }
@@ -1746,7 +1966,7 @@ mod tests {
             decision_mid: PriceCents::new(500),
         });
         let mut out: Vec<Fill> = Vec::new();
-        let result = model.fill(&[submit], &snapshot(490, 500), &mut out);
+        let result = model.fill(&[submit], TEST_SUBMIT_IDS, &snapshot(490, 500), &mut out);
         assert!(matches!(
             result,
             Err(BacktestError::PriceNotTickAligned {
@@ -1767,6 +1987,7 @@ mod tests {
         let mut out: Vec<Fill> = Vec::new();
         let result = model.fill(
             &[marketable(Side::Long, PositionAction::Open, 1, 500)],
+            TEST_SUBMIT_IDS,
             &snap,
             &mut out,
         );
@@ -1815,7 +2036,7 @@ mod tests {
             },
         ];
         let mut out: Vec<Fill> = Vec::new();
-        let result = model.fill(&commands, &snapshot(490, 500), &mut out);
+        let result = model.fill(&commands, TEST_SUBMIT_IDS, &snapshot(490, 500), &mut out);
         assert!(matches!(result, Ok(())));
         assert!(
             out.is_empty(),
@@ -1835,13 +2056,19 @@ mod tests {
         let mut model = RealisticFill::with_liquidity_profile(fees(), 10, 5, touch_only_profile());
         let mut out: Vec<Fill> = Vec::new();
         // snap1: ask 505, deep ask_size 100 — seeded, no order routed.
-        let r1 = model.fill(&[], &snapshot_full(0, 495, 505, 100, 100), &mut out);
+        let r1 = model.fill(
+            &[],
+            TEST_SUBMIT_IDS,
+            &snapshot_full(0, 495, 505, 100, 100),
+            &mut out,
+        );
         assert!(matches!(r1, Ok(())));
         assert!(out.is_empty(), "seeding snap1 alone produces no fill");
         // snap2: ask 500, thin ask_size 3. A marketable buy for 10.
         out.clear();
         let r2 = model.fill(
             &[marketable(Side::Long, PositionAction::Open, 10, 500)],
+            TEST_SUBMIT_IDS,
             &snapshot_full(1, 490, 500, 3, 3),
             &mut out,
         );
@@ -1870,6 +2097,7 @@ mod tests {
         let mut out: Vec<Fill> = Vec::new();
         let r1 = model.fill(
             &[gtc_buy(500, 1, 550)],
+            TEST_SUBMIT_IDS,
             &snapshot_full(0, 490, 600, 20, 20),
             &mut out,
         );
@@ -1878,7 +2106,12 @@ mod tests {
         // snap2: ask moves down to 500. The reseed ask touch at 500 crosses the
         // resting strategy buy — a refresh-generated fill at the buy's price.
         out.clear();
-        let r2 = model.fill(&[], &snapshot_full(1, 490, 500, 20, 20), &mut out);
+        let r2 = model.fill(
+            &[],
+            TEST_SUBMIT_IDS,
+            &snapshot_full(1, 490, 500, 20, 20),
+            &mut out,
+        );
         assert!(matches!(r2, Ok(())));
         assert_eq!(
             out.len(),
@@ -1911,6 +2144,7 @@ mod tests {
         // snap0: rest a strategy buy at 500 under a wide 600 ask.
         let r0 = model.fill(
             &[gtc_buy(500, 1, 560)],
+            TEST_SUBMIT_IDS,
             &snapshot_full(0, 490, 600, 20, 20),
             &mut out,
         );
@@ -1919,7 +2153,12 @@ mod tests {
         // snap1: ask still wide (580). The refresh cancels+reseeds the seed but
         // must NOT touch the strategy order, so it still does not fill.
         out.clear();
-        let r1 = model.fill(&[], &snapshot_full(1, 490, 580, 20, 20), &mut out);
+        let r1 = model.fill(
+            &[],
+            TEST_SUBMIT_IDS,
+            &snapshot_full(1, 490, 580, 20, 20),
+            &mut out,
+        );
         assert!(matches!(r1, Ok(())));
         assert!(
             out.is_empty(),
@@ -1927,7 +2166,12 @@ mod tests {
         );
         // snap2: ask finally crosses at 500 — the surviving order fills now.
         out.clear();
-        let r2 = model.fill(&[], &snapshot_full(2, 490, 500, 20, 20), &mut out);
+        let r2 = model.fill(
+            &[],
+            TEST_SUBMIT_IDS,
+            &snapshot_full(2, 490, 500, 20, 20),
+            &mut out,
+        );
         assert!(matches!(r2, Ok(())));
         assert_eq!(out.len(), 1);
         let Some(fill) = out.first() else {
@@ -1950,6 +2194,7 @@ mod tests {
         // snap1: rest a strategy buy at 500 under a wide 600 ask.
         let r1 = model.fill(
             &[gtc_buy(500, 1, 550)],
+            TEST_SUBMIT_IDS,
             &snapshot_full(0, 490, 600, 20, 20),
             &mut out,
         );
@@ -1959,6 +2204,7 @@ mod tests {
         out.clear();
         let r2 = model.fill(
             &[marketable(Side::Short, PositionAction::Open, 2, 500)],
+            TEST_SUBMIT_IDS,
             &snapshot_full(1, 490, 500, 20, 20),
             &mut out,
         );
@@ -1995,7 +2241,7 @@ mod tests {
             for (i, snap) in snaps.iter().enumerate() {
                 out.clear();
                 let step_cmds: &[OrderCommand] = if i == 0 { &cmds } else { &[] };
-                match model.fill(step_cmds, snap, &mut out) {
+                match model.fill(step_cmds, TEST_SUBMIT_IDS, snap, &mut out) {
                     Ok(()) => {}
                     Err(e) => panic!("the refresh run must succeed: {e}"),
                 }
@@ -2016,5 +2262,180 @@ mod tests {
             run(),
             "the same tape yields byte-identical refresh fills"
         );
+    }
+
+    // --- #110 resting-order lifecycle (Cancel/Replace, eviction, carry ids) ---
+
+    /// A cancelled resting GTC never fills, even when a later snapshot crosses
+    /// its price: the cancel removes it from the book and the mirror, so the
+    /// crossing refresh produces no fill and no carry group.
+    #[test]
+    fn test_cancel_then_cross_never_fills() {
+        let mut model = RealisticFill::with_liquidity_profile(fees(), 10, 5, touch_only_profile());
+        // Step 0: GTC buy 2 @ 500 rests under the 600 ask.
+        let mut out: Vec<Fill> = Vec::new();
+        let r0 = model.fill(
+            &[gtc_buy(500, 2, 550)],
+            TEST_SUBMIT_IDS,
+            &snapshot_full(0, 480, 600, 5, 5),
+            &mut out,
+        );
+        assert!(matches!(r0, Ok(())));
+        assert!(out.is_empty(), "the buy rests, no fill");
+        // Step 1 (no cross): the strategy cancels its order.
+        let cancel = [OrderCommand::Cancel(TEST_SUBMIT_IDS[0])];
+        let r1 = model.fill(&cancel, &[], &snapshot_full(1, 480, 600, 5, 5), &mut out);
+        assert!(matches!(r1, Ok(())));
+        assert!(out.is_empty());
+        assert!(
+            model.resting_strategy.is_empty(),
+            "the mirror entry is gone"
+        );
+        assert!(model.order_index.is_empty(), "the id bridge entry is gone");
+        // Step 2: the ask drops to 500 — the cancelled order must NOT fill.
+        let r2 = model.fill(&[], &[], &snapshot_full(2, 480, 500, 5, 5), &mut out);
+        assert!(matches!(r2, Ok(())));
+        assert!(out.is_empty(), "a cancelled order never fills");
+        assert!(model.carry_fills().is_empty());
+    }
+
+    /// Replace kills the old resting order and routes the replacement as a
+    /// fresh submit under its own id: a cross at the OLD price no longer fills,
+    /// a cross at the NEW price fills carrying the replacement's id.
+    #[test]
+    fn test_replace_moves_the_resting_order() {
+        let mut model = RealisticFill::with_liquidity_profile(fees(), 10, 5, touch_only_profile());
+        let mut out: Vec<Fill> = Vec::new();
+        let r0 = model.fill(
+            &[gtc_buy(500, 2, 550)],
+            TEST_SUBMIT_IDS,
+            &snapshot_full(0, 480, 600, 5, 5),
+            &mut out,
+        );
+        assert!(matches!(r0, Ok(())));
+        // Step 1: replace the 500 buy with a LOWER 480 buy (new identity).
+        let OrderCommand::Submit(replacement_intent) = gtc_buy(480, 2, 550) else {
+            panic!("gtc_buy builds a Submit");
+        };
+        let replace = [OrderCommand::Replace {
+            order_id: TEST_SUBMIT_IDS[0],
+            replacement: replacement_intent,
+        }];
+        // The Replace consumes the FIRST pre-minted id of ITS step.
+        let step1_ids = [TEST_SUBMIT_IDS[1]];
+        let r1 = model.fill(
+            &replace,
+            &step1_ids,
+            &snapshot_full(1, 460, 600, 5, 5),
+            &mut out,
+        );
+        assert!(matches!(r1, Ok(())));
+        assert!(out.is_empty(), "the replacement rests at 480");
+        // Step 2: ask drops to 500 — the OLD price would have crossed; the new
+        // 480 limit must not fill.
+        let r2 = model.fill(&[], &[], &snapshot_full(2, 460, 500, 5, 5), &mut out);
+        assert!(matches!(r2, Ok(())));
+        assert!(out.is_empty(), "the replaced-away 500 order is dead");
+        // Step 3: ask reaches 480 — the replacement fills, carrying ITS id.
+        let r3 = model.fill(&[], &[], &snapshot_full(3, 460, 480, 5, 5), &mut out);
+        assert!(matches!(r3, Ok(())));
+        assert_eq!(out.len(), 1, "the replacement fills once");
+        let carries = model.carry_fills();
+        assert_eq!(carries.len(), 1);
+        let Some(carry) = carries.first() else {
+            panic!("one carry group");
+        };
+        assert_eq!(carry.order_id, TEST_SUBMIT_IDS[1], "the REPLACEMENT id");
+        assert_eq!(carry.fill_count, 1);
+    }
+
+    /// A departed contract with no live strategy order is evicted from `books`
+    /// and `resting_seed_ids`; a departed contract WITH a live resting strategy
+    /// order is retained.
+    #[test]
+    fn test_eviction_departed_contract_book_removed_live_order_book_retained() {
+        let mut model = RealisticFill::with_liquidity_profile(fees(), 10, 5, touch_only_profile());
+        let mut out: Vec<Fill> = Vec::new();
+        // Step 0: the contract is quoted (book seeded) and a GTC rests in it.
+        let r0 = model.fill(
+            &[gtc_buy(500, 2, 550)],
+            TEST_SUBMIT_IDS,
+            &snapshot_full(0, 480, 600, 5, 5),
+            &mut out,
+        );
+        assert!(matches!(r0, Ok(())));
+        assert_eq!(model.books.len(), 1);
+        // Step 1: the contract leaves the universe (empty snapshot) — the book
+        // holds a live strategy order, so it is RETAINED.
+        let r1 = model.fill(&[], &[], &empty_snapshot_step(1), &mut out);
+        assert!(matches!(r1, Ok(())));
+        assert_eq!(model.books.len(), 1, "a live-order book is never evicted");
+        // Cancel the order; the next departed-universe refresh evicts the book.
+        let cancel = [OrderCommand::Cancel(TEST_SUBMIT_IDS[0])];
+        let r2 = model.fill(&cancel, &[], &empty_snapshot_step(2), &mut out);
+        assert!(matches!(r2, Ok(())));
+        let r3 = model.fill(&[], &[], &empty_snapshot_step(3), &mut out);
+        assert!(matches!(r3, Ok(())));
+        assert!(model.books.is_empty(), "the dead book is evicted");
+        assert!(model.resting_seed_ids.is_empty());
+        assert!(out.is_empty(), "no fill was ever produced");
+    }
+
+    /// One resting order crossed by SEVERAL reseed levels in a single refresh
+    /// coalesces into ONE carry group (fill_count = levels), so the engine
+    /// VWAP-aggregates it into one leg — the e2 command path's granularity.
+    #[test]
+    fn test_multi_level_refresh_cross_coalesces_into_one_carry_group() {
+        // Ladder: touch + 1 deeper level, uniform size (decay 1) — the ask
+        // seeds at 500 (size 2) and 505 (size 2), both under the 510 buy.
+        let ladder = profile(TouchSize::QuotedSize, 1, dec!(1));
+        let mut model = RealisticFill::with_liquidity_profile(fees(), 10, 5, ladder);
+        let mut out: Vec<Fill> = Vec::new();
+        // Step 0: GTC buy 4 @ 510 rests under the 600 ask.
+        let r0 = model.fill(
+            &[gtc_buy(510, 4, 550)],
+            TEST_SUBMIT_IDS,
+            &snapshot_full(0, 480, 600, 2, 2),
+            &mut out,
+        );
+        assert!(matches!(r0, Ok(())));
+        assert!(out.is_empty(), "the buy rests");
+        // Step 1: ask drops to 500 — BOTH ladder levels (500, 505) cross the
+        // 510 buy: two fills, ONE coalesced carry group.
+        let r1 = model.fill(&[], &[], &snapshot_full(1, 480, 500, 2, 2), &mut out);
+        assert!(matches!(r1, Ok(())));
+        assert_eq!(out.len(), 2, "two levels crossed ⇒ two fills");
+        let carries = model.carry_fills();
+        assert_eq!(carries.len(), 1, "contiguous same-order fills coalesce");
+        let Some(carry) = carries.first() else {
+            panic!("one carry group");
+        };
+        assert_eq!(carry.order_id, TEST_SUBMIT_IDS[0]);
+        assert_eq!(carry.fill_count, 2);
+    }
+
+    /// The full lifecycle sequence is deterministic: two identically-driven
+    /// models produce byte-identical fills and carry groups.
+    #[test]
+    fn test_lifecycle_sequence_is_deterministic_across_two_runs() {
+        let run = || -> (Vec<Fill>, Vec<CarryGroup>) {
+            let mut model =
+                RealisticFill::with_liquidity_profile(fees(), 10, 5, touch_only_profile());
+            let mut out: Vec<Fill> = Vec::new();
+            let r0 = model.fill(
+                &[gtc_buy(500, 3, 550)],
+                TEST_SUBMIT_IDS,
+                &snapshot_full(0, 480, 600, 5, 5),
+                &mut out,
+            );
+            assert!(matches!(r0, Ok(())));
+            let r1 = model.fill(&[], &[], &snapshot_full(1, 480, 500, 5, 5), &mut out);
+            assert!(matches!(r1, Ok(())));
+            (out, model.carry_fills().to_vec())
+        };
+        let (fills_a, carries_a) = run();
+        let (fills_b, carries_b) = run();
+        assert_eq!(fills_a, fills_b, "byte-identical fills");
+        assert_eq!(carries_a, carries_b, "byte-identical carry groups");
     }
 }

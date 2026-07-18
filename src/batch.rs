@@ -289,21 +289,27 @@ struct PlannedRun {
 /// shared read-only across every run over it ([docs/03 §8](../../docs/03-data-layer.md#8-caching)).
 ///
 /// Keyed by source path; deterministic (a [`BTreeMap`] populated in planned
-/// order, read-only during fan-out). A path absent from the cache — a failed
-/// pre-materialisation (missing / oversized / tampered file) — is **not** an
-/// error: the run falls back to a per-run verified open, which surfaces the same
-/// typed error into that run's index entry. So the cache is observationally
-/// invisible: it never hides a divergence and never changes a bundle.
-type SharedTapes = BTreeMap<String, SharedParquetTape>;
+/// order, read-only during fan-out). A failed pre-materialisation (missing /
+/// oversized / tampered file) is cached as an `Err` DESCRIPTOR (#110): every
+/// run over that path replays the identical typed error from the cache without
+/// re-opening the file, so one hostile input costs one parse, not one per
+/// worker. The cache stays observationally invisible on the success path: an
+/// `Ok` hit is sha-guarded and never changes a bundle.
+/// Path → materialise outcome. An `Err` caches the error DESCRIPTOR (the typed
+/// error's rendered message — [`crate::error::BacktestError`] is not `Clone`),
+/// so every run sharing a bad path records the identical error without
+/// re-opening or re-parsing the file (#110): one hostile input costs one parse,
+/// not one per worker.
+type SharedTapes = BTreeMap<String, Result<SharedParquetTape, String>>;
 
 /// Materialise each distinct Parquet source path once (single-threaded), pinning
 /// and verifying its recorded `sha256`, into the read-only batch cache.
 ///
-/// A materialisation failure is deliberately skipped rather than propagated: the
-/// batch does not abort on one bad input, and the affected run re-attempts its
-/// own [`ParquetFeed::open_verified`] in [`open_and_run`], recording the identical
-/// typed error. Non-Parquet sources (the simulator feed) are not shared — each
-/// session materialises its own tape per run.
+/// A materialisation failure does not abort the batch: the rendered error is
+/// cached per path (#110) and [`open_and_run`] replays it into each affected
+/// run's index entry without re-opening the file. Non-Parquet sources (the
+/// simulator feed) are not shared — each session materialises its own tape per
+/// run.
 ///
 /// INVARIANT (uniform limits per path): the cache is keyed by path with a sha
 /// guard at hit time, NOT by `(path, limits)`. That is safe only because
@@ -317,9 +323,13 @@ fn materialise_shared_tapes(planned: &[PlannedRun]) -> SharedTapes {
     for run in planned {
         if let DataSourceSpec::Parquet { path, sha256 } = &run.config.data_source
             && !shared.contains_key(path)
-            && let Ok(tape) = SharedParquetTape::materialise(path, sha256, &run.config.limits)
         {
-            shared.insert(path.clone(), tape);
+            // An Err caches the rendered error per path (#110): every run
+            // sharing the path records the identical descriptor below without
+            // re-opening a file known to fail.
+            let outcome = SharedParquetTape::materialise(path, sha256, &run.config.limits)
+                .map_err(|error| error.to_string());
+            shared.insert(path.clone(), outcome);
         }
     }
     shared
@@ -488,7 +498,19 @@ fn open_and_run(
                 // once-parsed tape (an empty `sha256` pins whatever was read, as
                 // `open` does). A mismatch cannot slip past: it falls through to
                 // the verified re-read, which fails typed.
-                Some(tape) if sha256.is_empty() || tape.data_identity() == sha256 => tape.feed(),
+                Some(Ok(tape)) if sha256.is_empty() || tape.data_identity() == sha256 => {
+                    tape.feed()
+                }
+                // Cached materialise FAILURE (#110): replay the descriptor as
+                // the run's typed error without re-opening the bad path. The
+                // re-wrap in `Data` prefixes the recorded string with its
+                // Display ("malformed data: …") — the original KIND is not
+                // reconstructible (BacktestError is not Clone); the descriptor
+                // itself carries the original kind's message, and every cached
+                // run records the identical string.
+                Some(Err(descriptor)) => {
+                    return Err(BacktestError::Data(descriptor.clone()));
+                }
                 // Cache miss / bypass — a per-run verified open (identical tape).
                 _ => ParquetFeed::open_verified(path, sha256, &config.limits)?,
             };
