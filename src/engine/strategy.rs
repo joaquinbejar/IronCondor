@@ -20,11 +20,15 @@
 //! # Exit ownership
 //!
 //! The [`OptStratAdapter`] is the **single** owner of exit-policy evaluation:
-//! its [`Strategy::exits`] reprices the wrapped strategy from the current
-//! snapshot and evaluates the configured
+//! its [`Strategy::exits`] evaluates the configured
 //! [`optionstratlib::simulation::ExitPolicy`] via
-//! [`optionstratlib::simulation::check_exit_policy`], appending **closing**
-//! commands only. The engine never calls `check_exit_policy` itself
+//! [`optionstratlib::simulation::check_exit_policy`] over snapshot-derived
+//! scalars, appending **closing** commands only. The engine never calls
+//! `check_exit_policy` itself. In v0.1 the exit decision reads no repriced
+//! `inner` state, so `exits` does **not** rebuild an `OptionChain` per step;
+//! the reprice of `inner` is deferred until a Greek-driven policy is wired (see
+//! [`Strategy::exits`] and `policy_reads_inner`), a zero-alloc/step and
+//! wall-clock-free step path
 //! ([docs/02 §4.1](../../../docs/02-engine-architecture.md#41-the-optionstratlib-adapter)).
 
 use rand_chacha::ChaCha8Rng;
@@ -37,7 +41,7 @@ use optionstratlib::simulation::{ExitPolicy, check_exit_policy};
 use optionstratlib::strategies::base::{Optimizable, Positionable};
 use optionstratlib::strategies::{IronCondor, Strategies};
 
-use crate::data::convert::snapshot_to_option_chain;
+use crate::data::convert::{positive_from_price, snapshot_to_option_chain};
 use crate::domain::{
     ChainSnapshot, ContractKey, IronCondorSpec, OpenPosition, OrderCommand, OrderId, OrderIntent,
     PendingOrder, PositionAction, PriceCents, Quantity, SimTime, StepIndex, StrategySpec,
@@ -180,8 +184,11 @@ const NANOS_PER_DAY: i128 = 86_400_000_000_000;
 /// `new` takes an **already-constructed** strategy by value (there is no
 /// `Default` bound), so a strategy with required constructor arguments — e.g.
 /// `IronCondor::new`, which takes seventeen — wraps unchanged. Entry runs once,
-/// guarded by `entered`; exit evaluation reprices `inner` from each snapshot
-/// and applies the configured [`ExitPolicy`].
+/// guarded by `entered`; exit evaluation applies the configured [`ExitPolicy`]
+/// over snapshot-derived scalars. In v0.1 no policy reads `inner`'s repriced
+/// state, so `exits` skips the per-step `OptionChain` rebuild and the reprice of
+/// `inner` (deferred to [`Self::reprice_inner`] until a Greek-driven policy is
+/// wired, gated by `policy_reads_inner`).
 ///
 /// # `IronCondor` `Optimizable` bound (resolved)
 ///
@@ -321,6 +328,37 @@ impl<S: PositionableStrategy> OptStratAdapter<S> {
             out.push(close_command(snapshot, leg));
         }
     }
+
+    /// Reprice `inner` from `snapshot` so a Greek-driven exit policy can read
+    /// the wrapped strategy's updated state.
+    ///
+    /// **v0.1 never calls this.** [`Strategy::exits`] gates it behind
+    /// [`policy_reads_inner`], which is `false` for every v0.1 policy, so the
+    /// per-step `OptionChain` rebuild here — and the upstream `Utc::now()`
+    /// expiry check it reaches — stays OFF the v0.1 step path. It exists so that
+    /// wiring a Greek-driven policy (e.g. a supported [`ExitPolicy::DeltaThreshold`],
+    /// #11/#14) re-enables the reprice by flipping that gate `true`, at which
+    /// point a reprice failure must PROPAGATE (it would change which legs
+    /// trigger) — which this method does via `?`, unlike the v0.1 drop.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BacktestError::Conversion`] if the snapshot cannot be converted
+    /// to an `OptionChain`, and [`BacktestError::Strategy`] if the upstream
+    /// reprice of `inner` (underlying price or implied volatility) is rejected.
+    fn reprice_inner(&mut self, snapshot: &ChainSnapshot) -> Result<(), BacktestError> {
+        let chain = snapshot_to_option_chain(snapshot)?;
+        self.inner
+            .set_underlying_price(&chain.underlying_price)
+            .map_err(|e| BacktestError::Strategy(format!("reprice underlying failed: {e}")))?;
+        let iv = *chain
+            .get_atm_implied_volatility()
+            .map_err(|e| BacktestError::Strategy(format!("atm implied volatility failed: {e}")))?;
+        self.inner.set_implied_volatility(&iv).map_err(|e| {
+            BacktestError::Strategy(format!("reprice implied volatility failed: {e}"))
+        })?;
+        Ok(())
+    }
 }
 
 impl OptStratAdapter<IronCondor> {
@@ -447,31 +485,34 @@ impl<S: PositionableStrategy> Strategy for OptStratAdapter<S> {
         if ctx.open.is_empty() {
             return Ok(());
         }
-        // Build the fresh OptionChain that reprices `inner` — the unavoidable
-        // per-step allocation the seam needs (benched by issue #18). The chain
-        // is repricing INPUT only; it is never mutated. A conversion failure is
-        // a genuine data error and propagates.
-        let chain = snapshot_to_option_chain(ctx.snapshot)?;
-        let underlying = chain.underlying_price;
-        // Reprice `inner` best-effort: it keeps the wrapped strategy's internal
-        // state current for Greeks-driven policies (future work). The v0.1 exit
-        // DECISION reads current premiums from the market snapshot
-        // (docs/specs/optionstratlib.md §9) via `check_exit_policy`, which
-        // consumes only snapshot-derived scalars and never reads the repriced
-        // `inner`, so a reprice failure — e.g. the upstream wall-clock expiry
-        // check rejecting a historical-dated leg — does not change the
-        // deterministic exit outcome and must not abort the run. Errors are
-        // therefore dropped here, not propagated.
+        // `underlying` is the ONLY repricing output the v0.1 exit DECISION
+        // reads: `check_exit_policy` (docs/specs/optionstratlib.md §9) consumes
+        // snapshot-derived scalars only and never reads the wrapped `inner`'s
+        // repriced Greeks. Source it directly from the snapshot scalar through
+        // the SAME derivation `convert.rs` uses for `chain.underlying_price`
+        // (`positive_from_price`), so the value is byte-identical to the old
+        // `snapshot_to_option_chain(ctx.snapshot)?.underlying_price` — without
+        // rebuilding the whole `OptionChain` each step (~44 alloc events/step,
+        // #18/#19) or reaching the upstream `Utc::now()` expiry-check
+        // wall-clock. A conversion failure is a genuine data error and
+        // propagates.
+        let underlying = positive_from_price("underlying", ctx.snapshot.underlying_price)?;
+
+        // Reprice `inner` ONLY when the configured policy reads its repriced
+        // state. No v0.1 policy does — `policy_reads_inner` is `false` for all
+        // of them (`ExitPolicy::DeltaThreshold` is unsupported and never
+        // triggers) — so the reprice, and its upstream `Utc::now()` wall-clock
+        // reach, is SKIPPED in v0.1. This is output-preserving: the dropped
+        // reprice never fed the deterministic exit decision, and skipping it
+        // also removes a wall-clock read (a determinism win).
         //
         // INVARIANT (revisit when `ExitPolicy::DeltaThreshold` is wired,
-        // #11/#14): this drop is only sound while no exit policy reads
-        // `inner`'s repriced state. The instant a Greek-driven policy does, a
-        // silently-failed reprice would change which legs trigger — propagate
-        // the error there instead of dropping it.
-        let _ = self.inner.set_underlying_price(&underlying);
-        if let Ok(iv) = chain.get_atm_implied_volatility() {
-            let iv = *iv;
-            let _ = self.inner.set_implied_volatility(&iv);
+        // #11/#14): the instant a Greek-driven policy reads `inner`'s repriced
+        // state, `policy_reads_inner` returns `true` for it, the reprice runs,
+        // and a reprice failure PROPAGATES (it would change which legs trigger)
+        // rather than being dropped.
+        if policy_reads_inner(&self.exit) {
+            self.reprice_inner(ctx.snapshot)?;
         }
 
         let step = ctx.step.value() as usize;
@@ -586,6 +627,31 @@ fn days_to_expiry(contract: &ContractKey, ts: SimTime) -> Result<Positive, Backt
         .map_err(|e| BacktestError::Strategy(format!("days-to-expiry {days} is not positive: {e}")))
 }
 
+/// Whether the configured [`ExitPolicy`] reads the wrapped strategy's repriced
+/// `inner` state (its Greeks), which would require a per-step reprice of `inner`.
+///
+/// **`false` for every v0.1 policy.** The v0.1 exit decision consumes
+/// snapshot-derived scalars only via [`check_exit_policy`], and
+/// [`ExitPolicy::DeltaThreshold`] is unsupported (it never triggers, so it reads
+/// nothing). Gating the reprice on this keeps the v0.1 step path free of the
+/// per-step `OptionChain` rebuild — and its upstream `Utc::now()` reach — while
+/// leaving the door open for a future Greek-driven policy: wiring a supported
+/// `DeltaThreshold` (reading `inner`'s per-leg delta, #11/#14) flips this to
+/// `true` for that policy, re-enabling [`OptStratAdapter::reprice_inner`] in
+/// [`Strategy::exits`].
+#[must_use]
+fn policy_reads_inner(policy: &ExitPolicy) -> bool {
+    match policy {
+        // Composites read `inner` iff any child does.
+        ExitPolicy::And(policies) | ExitPolicy::Or(policies) => {
+            policies.iter().any(policy_reads_inner)
+        }
+        // No v0.1 leaf reads `inner`. `DeltaThreshold` is unsupported today
+        // (never triggers); the future supported variant returns `true` here.
+        _ => false,
+    }
+}
+
 /// Evaluate the configured [`ExitPolicy`] for one leg.
 ///
 /// Delegates scalar leaves to [`check_exit_policy`] and composes `And`/`Or`
@@ -657,7 +723,10 @@ mod tests {
     use optionstratlib::strategies::{IronCondor, ShortStrangle};
     use optionstratlib::{ExpirationDate, OptionStyle, Side};
 
-    use super::{ChainContext, OptStratAdapter, PositionableStrategy, Strategy, policy_triggered};
+    use super::{
+        ChainContext, OptStratAdapter, PositionableStrategy, Strategy, policy_reads_inner,
+        policy_triggered,
+    };
     use crate::domain::{
         ChainSnapshot, ContractKey, InstrumentSpec, IronCondorSpec, OpenPosition, OrderCommand,
         OrderId, OrderIntent, PendingOrder, PositionAction, PositionId, PriceCents, Quantity,
@@ -983,8 +1052,8 @@ mod tests {
             rng: &mut rng,
             step: StepIndex::new(7),
         };
-        // TimeSteps(0) always triggers; exits reprices inner (best-effort,
-        // wall-clock error dropped) then decides from snapshot scalars.
+        // TimeSteps(0) always triggers; v0.1 exits decides from snapshot
+        // scalars only (no per-step inner reprice — `policy_reads_inner` false).
         let Ok(mut adapter) = adapter_from_spec(ExitPolicy::TimeSteps(0)) else {
             panic!("the iron condor spec builds a valid adapter");
         };
@@ -1259,6 +1328,34 @@ mod tests {
             pos(dec!(5000)),
             false,
         ));
+    }
+
+    #[test]
+    fn test_policy_reads_inner_is_false_for_all_v01_policies() {
+        // The v0.1 exit decision reads snapshot scalars only: no policy reads
+        // `inner`'s repriced state, so `exits` skips the per-step reprice. This
+        // guards the FOLD-THE-FIX invariant (#19) — the instant this returns
+        // `true` for a wired Greek-driven policy, the reprice re-enables.
+        for policy in [
+            ExitPolicy::Expiration,
+            ExitPolicy::DeltaThreshold(dec!(0.1)),
+            ExitPolicy::TimeSteps(0),
+            ExitPolicy::ProfitPercent(dec!(0.5)),
+            ExitPolicy::LossPercent(dec!(1.0)),
+            ExitPolicy::And(vec![
+                ExitPolicy::ProfitPercent(dec!(0.5)),
+                ExitPolicy::Expiration,
+            ]),
+            ExitPolicy::Or(vec![
+                ExitPolicy::TimeSteps(10),
+                ExitPolicy::DeltaThreshold(dec!(0.2)),
+            ]),
+        ] {
+            assert!(
+                !policy_reads_inner(&policy),
+                "no v0.1 policy reads inner: {policy:?}"
+            );
+        }
     }
 
     #[test]

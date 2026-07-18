@@ -52,6 +52,18 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --test golden
 
+  zero-alloc:
+    name: zero-alloc
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: Swatinem/rust-cache@v2
+      # PB-1 hard invariant gate: per-step replay-loop allocations must not grow
+      # with step count. A non-zero warmup(K)->last delta fails the build.
+      # Distinct from the throughput bench (#18) and the golden job (#17).
+      - run: cargo test --test zero_alloc
+
   build-release:
     name: build-release
     runs-on: ubuntu-24.04
