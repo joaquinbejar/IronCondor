@@ -366,11 +366,9 @@ fn data_source_strings(spec: &DataSourceSpec) -> Vec<&str> {
             vec![path.as_str(), sha256.as_str()]
         }
         #[cfg(feature = "simulator")]
-        DataSourceSpec::Simulator {
-            base_url,
-            tape_sha256,
-            ..
-        } => vec![base_url.as_str(), tape_sha256.as_str()],
+        DataSourceSpec::Simulator(sim) => {
+            vec![sim.base_url.as_str(), sim.tape_sha256.as_str()]
+        }
     }
 }
 

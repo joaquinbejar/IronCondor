@@ -117,6 +117,8 @@ pub use execution::RealisticFill;
 pub use execution::{ExecutionModel, FillGroup, NaiveFill};
 pub use run::run_backtest;
 
+#[cfg(feature = "simulator")]
+pub use data::SimulatorSourceSpec;
 /// The migrated OptionChain-Simulator session surface (feature `simulator`):
 /// the async [`data::simulator::ApiClient`] and the bug-fixed
 /// [`data::simulator::MarketSimulator`] step wrapper, plus the local wire DTOs.
@@ -125,8 +127,8 @@ pub use data::chain_response_to_snapshot;
 #[cfg(feature = "simulator")]
 pub use data::simulator::{
     ApiClient, ChainResponse, CreateSessionRequest, ErrorResponse, MarketSimulator, MarketState,
-    OptionContractResponse, OptionPriceResponse, SessionInfoResponse, SessionResponse,
-    SessionState, UpdateSessionRequest,
+    OptionContractResponse, OptionPriceResponse, SessionInfoResponse, SessionParametersResponse,
+    SessionResponse, SessionState, UpdateSessionRequest,
 };
 
 #[cfg(test)]
