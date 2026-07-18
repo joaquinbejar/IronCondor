@@ -4,16 +4,61 @@ Python bindings for [`ironcondor`](https://github.com/joaquinbejar/IronCondor),
 a high-performance options-strategy backtester with order-book-level fill
 simulation, built on [`optionstratlib`](https://crates.io/crates/optionstratlib).
 
-> **Status: scaffold (v0.4, #38).** This is the empty-but-real PyO3 shell — it
-> builds a `cp310-abi3` wheel that imports and reports `ironcondor.__version__`.
-> The backtest API (`BacktestConfig`, `run`, `Bundle`) lands in later v0.4
-> issues (#39/#40). PyPI wheels are a v0.4 deliverable and are **not published
-> yet** — the distribution name `ironcondor` is unregistered on PyPI.
+> **Status: v0.4, #39.** The working backtest API — `BacktestConfig`, `run`,
+> and `Bundle` — is wired over the same Rust engine. The typed exception
+> hierarchy is #40 (errors currently surface as `ValueError` / `RuntimeError`);
+> PyPI wheels are a v0.4 deliverable and are **not published yet** — the
+> distribution name `ironcondor` is unregistered on PyPI.
 
 ```python
-import ironcondor
-print(ironcondor.__version__)
+import ironcondor as ic
+
+cfg = (
+    ic.BacktestConfig(seed=42, capital_cents=1_000_000)   # $10,000, integer cents
+      .data_parquet("chains/spx_2025.parquet")
+      .strategy_iron_condor(
+          underlying="SPX",
+          underlying_price_cents=500_000,
+          short_call_strike_cents=510_000, long_call_strike_cents=520_000,
+          short_put_strike_cents=490_000,  long_put_strike_cents=480_000,
+          expiration_ns=1_752_883_200_000_000_000,
+          quantity=1,
+          premium_short_call_cents=2_000, premium_short_put_cents=1_800,
+          premium_long_call_cents=800,    premium_long_put_cents=700,
+      )
+      .exit_profit_percent(0.5)            # optionstratlib ExitPolicy
+      .execution_naive(slippage_cents=5)   # or .execution_realistic()
+      .fees(per_contract_cents=65, per_order_cents=100)
+)
+
+bundle  = ic.run(cfg)              # releases the GIL; runs the Rust engine AND
+                                   # atomically writes <output_dir>/<run_id>/
+print(bundle.path)                 # the on-disk bundle directory run() published
+equity  = bundle.equity_curve()    # -> pandas.DataFrame  (needs the [pandas] extra)
+metrics = bundle.metrics()         # -> dict (from manifest.json)
+
+reopened = ic.load_bundle(bundle.path)   # validated through the hardened reader
 ```
+
+Money crosses the boundary as **integer cents** (`*_cents`); the only floats are
+the analytic exception (implied volatility, the two rates, `ExitPolicy`
+percentages). Only what the engine wires end to end is exposed — a **Parquet**
+source and the **iron condor** strategy; a CSV source and the short strangle are
+not yet reachable through the binding.
+
+## DataFrame accessors (optional pandas extra)
+
+`bundle.fills()`, `.equity_curve()`, `.positions()`, `.greeks_attribution()`
+return **pandas DataFrames** read lazily from the on-disk Parquet. pandas (and
+its `pyarrow` engine) is an **optional soft dependency**:
+
+```bash
+pip install ironcondor[pandas]
+```
+
+`run()`, `load_bundle`, `metrics()`, and `bundle.path` work without it — and
+because the bundle is plain Parquet + JSON, `polars` / `pyarrow` can read
+`bundle.path` directly instead.
 
 ## Building locally
 
@@ -22,9 +67,9 @@ stable ABI, so one `cp310-abi3` wheel per platform serves Python 3.10+:
 
 ```bash
 # from this directory (python/)
-maturin build --release --features python
+maturin build --release --features "python orderbook"
 # or, for an editable install into the current interpreter:
-maturin develop --features python
+maturin develop --features "python orderbook"
 ```
 
 The crate manifest lives at the repository root; `pyproject.toml` points maturin

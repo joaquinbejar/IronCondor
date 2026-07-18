@@ -35,6 +35,15 @@ classifiers = [
     "Private :: Do Not Upload",
 ]
 
+[project.optional-dependencies]
+# The `Bundle` DataFrame accessors call `pandas.read_parquet` on demand, so
+# pandas (+ its pyarrow engine) is an OPTIONAL soft dependency, not a hard wheel
+# requirement: `run()` / `load_bundle` / `metrics()` work without it, and a
+# missing pandas raises a clear ImportError naming this extra (docs/06 §6). The
+# bundle is plain Parquet + JSON, so polars / pyarrow can read `bundle.path`
+# directly instead.
+pandas = ["pandas>=1.5", "pyarrow>=10"]
+
 [project.urls]
 Homepage = "https://github.com/joaquinbejar/IronCondor"
 Repository = "https://github.com/joaquinbejar/IronCondor"
@@ -42,12 +51,16 @@ Repository = "https://github.com/joaquinbejar/IronCondor"
 [tool.maturin]
 # The crate manifest lives at the repository root, one level up.
 manifest-path = "../Cargo.toml"
-# Enable the binding code (`python`) plus `pyo3/extension-module` for the wheel
-# build ONLY. extension-module suppresses the libpython link (correct for the
+# Enable the binding code (`python`) plus `orderbook` (so the wheel is a
+# self-contained naive+realistic backtester, docs/06 §7 — `execution_realistic`
+# genuinely runs in the wheel) plus `pyo3/extension-module` for the wheel build
+# ONLY. extension-module suppresses the libpython link (correct for the
 # importable cdylib); keeping it out of the `python` cargo feature is what lets
 # `cargo test --all-features` still link and run (see Cargo.toml). abi3 is
 # inferred from the crate's `pyo3` `abi3-py310` feature → a `cp310-abi3` wheel.
-features = ["python", "pyo3/extension-module"]
+# `orderbook` adds no new lockfile entry (its deps are already resolved), so the
+# `lockfile_sha256` build identity — and the goldens — are unaffected.
+features = ["python", "orderbook", "pyo3/extension-module"]
 # The importable module name; matches the crate `[lib] name` and the
 # `#[pymodule] fn ironcondor` entry point.
 module-name = "ironcondor"

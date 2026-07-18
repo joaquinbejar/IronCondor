@@ -28,10 +28,23 @@
 //!
 //! ## No panic across the FFI boundary
 //!
-//! Later issues map every `BacktestError` to a typed Python exception and wrap
-//! the run in `catch_unwind`, so no panic ever crosses the boundary
-//! ([docs/06 §5](../../docs/06-python-bindings.md)). This scaffold exposes no
-//! fallible call yet.
+//! Every fallible boundary entry point ([`run::run`], [`bundle::load_bundle`],
+//! the [`bundle::Bundle`] accessors, [`config::PyBacktestConfig::to_rust`])
+//! drives the pure-Rust API — which returns [`Result`]s — and maps every error
+//! to a Python exception through [`errors::to_pyerr`] with `?` / `map_err`, so
+//! no panic crosses the boundary. The **typed** exception hierarchy and the
+//! `catch_unwind` net are #40 ([docs/06 §5](../../docs/06-python-bindings.md));
+//! [`errors::to_pyerr`] is the interim seam.
+//!
+//! ## What is exposed (and what is deferred)
+//!
+//! #39 fills the working surface: [`config::PyBacktestConfig`] (Python
+//! `BacktestConfig`) with integer-cents builders, [`run::run`], and
+//! [`bundle::Bundle`] with lazy DataFrame accessors + [`bundle::load_bundle`].
+//! Only what [`crate::run_backtest`] genuinely wires end to end is reachable: a
+//! **Parquet** source and the **iron condor** strategy (a CSV source or a short
+//! strangle spec is a deferred composition-root dispatch, so no `data_csv` /
+//! `strategy_short_strangle` builder exists). Both execution modes work (#26).
 
 use pyo3::prelude::*;
 
@@ -53,17 +66,23 @@ pub(crate) fn crate_version() -> &'static str {
 /// The `ironcondor` Python extension module.
 ///
 /// The function name matches the crate's `[lib] name`, so PyO3 emits the
-/// `PyInit_ironcondor` symbol maturin packages as an importable module. This
-/// scaffold registers only `__version__`; the backtest surface (`run`,
-/// `BacktestConfig`, `Bundle`, the exception hierarchy) is added by #39/#40.
+/// `PyInit_ironcondor` symbol maturin packages as an importable module. It
+/// registers `__version__`, the `BacktestConfig` builder and `Bundle` handle
+/// classes, and the `run` / `load_bundle` functions (#39). The typed exception
+/// hierarchy is added by #40.
 ///
 /// # Errors
 ///
-/// Returns a [`PyErr`] if registering an attribute on the module fails (the
-/// interpreter is out of memory or the module object is invalid).
+/// Returns a [`PyErr`] if registering an attribute, class, or function on the
+/// module fails (the interpreter is out of memory or the module object is
+/// invalid).
 #[pymodule]
 fn ironcondor(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("__version__", crate_version())?;
+    module.add_class::<config::PyBacktestConfig>()?;
+    module.add_class::<bundle::Bundle>()?;
+    module.add_function(wrap_pyfunction!(run::run, module)?)?;
+    module.add_function(wrap_pyfunction!(bundle::load_bundle, module)?)?;
     Ok(())
 }
 
