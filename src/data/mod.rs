@@ -3,8 +3,12 @@
 //! The `DataFeed` seam, the historical Parquet/CSV loaders, the
 //! OptionChain-Simulator session client (feature `simulator`), and the single
 //! `ChainResponse` → `OptionChain` conversion boundary (roadmap issues #7–#9,
-//! #27, #44, #45). Only [`DataSourceSpec`] exists so far — the feed seam and
-//! loaders land with those issues.
+//! #27, #44, #45). [`DataSourceSpec`] and — behind the `simulator` feature —
+//! the migrated session `simulator` client (issue #6) exist so far; the feed
+//! seam and loaders land with the remaining issues.
+
+#[cfg(feature = "simulator")]
+pub mod simulator;
 
 use serde::{Deserialize, Serialize};
 

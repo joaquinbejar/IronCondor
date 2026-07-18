@@ -25,7 +25,9 @@ default = []
 # orderbook — realistic execution via option-chain-orderbook.
 orderbook = []
 # simulator — synthetic chain sessions via OptionChain-Simulator over HTTP.
-simulator = []
+# Pulls the async transport (reqwest) + a minimal tokio runtime + serde_json
+# for the wire DTOs; NONE of these compile in the default build.
+simulator = ["dep:reqwest", "dep:tokio", "dep:serde_json"]
 # python — PyO3 bindings built with maturin.
 python = []
 
@@ -35,6 +37,19 @@ optionstratlib = { version = "0.18", default-features = false }
 rust_decimal = { version = "1", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
+# simulator feed transport — feature-gated, absent from the default build.
+# reqwest: pure-Rust rustls TLS (no system OpenSSL, reproducible CI) + json.
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+], optional = true }
+# tokio: only the pieces the async client + its test harness need.
+tokio = { version = "1", default-features = false, features = [
+    "rt",
+    "macros",
+], optional = true }
+# serde_json: the tagged `method`/`parameters` wire fields carry raw JSON.
+serde_json = { version = "1", optional = true }
 
 [dev-dependencies]
 positive = "0.5"
