@@ -639,6 +639,120 @@ fn test_result_bundle_end_to_end_produces_complete_readable_bundle() {
 }
 
 #[test]
+fn test_read_bundle_round_trips_the_written_tables_and_manifest() {
+    // Write a bundle, read it back through the #35 reader, and assert the decoded
+    // rows equal what was written (the write→read→equal round-trip; the golden
+    // freeze is #36).
+    use ironcondor::{ResourceLimits, read_bundle};
+
+    let Ok(dir) = tempfile::tempdir() else {
+        panic!("tempdir must create");
+    };
+    let path = dir.path().join("condor.parquet");
+    let rows = common::condor_rows(6, None);
+    if let Err(e) = common::write_parquet(&path, &rows) {
+        panic!("the condor fixture must write: {e}");
+    }
+    let output = dir.path().join("bundles");
+    let (dest, run) = write_condor_bundle(&path, &output, 7, false);
+
+    let Ok(read) = read_bundle(&dest, &ResourceLimits::default()) else {
+        panic!("the written bundle must read back cleanly");
+    };
+
+    // The manifest validated with `metrics` kept opaque and `row_counts` echoing
+    // the decoded lengths (the reader already cross-checked them).
+    assert_eq!(read.manifest.schema, "ironcondor.bundle.v1");
+    assert!(
+        read.manifest.metrics.is_object(),
+        "metrics stays opaque JSON"
+    );
+    let Some(run_id) = dest.file_name().and_then(|n| n.to_str()) else {
+        panic!("bundle dir is named by the run_id");
+    };
+    assert_eq!(read.manifest.run_id, run_id);
+    assert_eq!(read.manifest.seed, 7);
+
+    // The two per-step tables share the reader's wire type with the run, so they
+    // compare exactly after the reader's canonical sort.
+    assert_eq!(
+        read.equity_curve, run.equity_curve,
+        "equity curve round-trips"
+    );
+    assert_eq!(
+        read.greeks_attribution, run.greeks_attribution,
+        "attribution round-trips"
+    );
+
+    // The fills / positions decode into the canonical wire rows with counts that
+    // match the run, every `strategy_run_id` stamped, and — validated by the
+    // reader — every `contract_id` round-trippable.
+    assert_eq!(read.fills.len(), run.fills.len());
+    assert_eq!(read.positions.len(), run.positions.len());
+    assert!(
+        read.fills.iter().all(|f| f.strategy_run_id == run_id),
+        "every fills row carries the run_id"
+    );
+    // fills is sorted by the unique key (step, order_id, fill_seq).
+    let keyed: Vec<(u32, u64, u32)> = read
+        .fills
+        .iter()
+        .map(|f| (f.step, f.order_id, f.fill_seq))
+        .collect();
+    let mut sorted = keyed.clone();
+    sorted.sort_unstable();
+    assert_eq!(keyed, sorted, "fills come back in canonical sort order");
+}
+
+#[test]
+fn test_read_bundle_referenced_input_sha_mismatch_yields_error() {
+    // The manifest's data_source points at the still-present chain file, so the
+    // reader re-hashes it; a tampered recorded sha256 is a typed error, never a
+    // silent divergent run.
+    use ironcondor::{BacktestError, ResourceLimits, read_bundle};
+
+    let Ok(dir) = tempfile::tempdir() else {
+        panic!("tempdir must create");
+    };
+    let path = dir.path().join("condor.parquet");
+    let rows = common::condor_rows(6, None);
+    if let Err(e) = common::write_parquet(&path, &rows) {
+        panic!("the condor fixture must write: {e}");
+    }
+    let output = dir.path().join("bundles");
+    let (dest, _run) = write_condor_bundle(&path, &output, 7, false);
+
+    // Rewrite the manifest's recorded data_source sha256 to a wrong value while
+    // the referenced chain stays reachable.
+    let manifest_path = dest.join("manifest.json");
+    let Ok(text) = std::fs::read_to_string(&manifest_path) else {
+        panic!("manifest readable");
+    };
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        panic!("manifest is JSON");
+    };
+    if let Some(ds) = value.get_mut("data_source").and_then(|v| v.as_object_mut()) {
+        ds.insert(
+            "sha256".to_string(),
+            serde_json::Value::String(
+                "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+            ),
+        );
+    }
+    let Ok(bytes) = serde_json::to_vec(&value) else {
+        panic!("manifest re-serialises");
+    };
+    if std::fs::write(&manifest_path, bytes).is_err() {
+        panic!("manifest re-writes");
+    }
+
+    assert!(matches!(
+        read_bundle(&dest, &ResourceLimits::default()),
+        Err(BacktestError::Bundle(_))
+    ));
+}
+
+#[test]
 fn test_result_bundle_run_twice_is_byte_identical_modulo_created_utc() {
     // Same environment, two IDENTICAL runs (same seed, config — including the
     // output_dir and overwrite embedded verbatim — and data) ⇒ the four Parquet

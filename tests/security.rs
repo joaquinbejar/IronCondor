@@ -32,7 +32,7 @@ mod common;
 #[path = "fixtures/adversarial/mod.rs"]
 mod adversarial;
 
-use ironcondor::{BacktestError, CsvFeed, ParquetFeed, ResourceLimits};
+use ironcondor::{BacktestError, CsvFeed, ParquetFeed, ResourceLimits, read_bundle};
 
 /// Crossed quote → the specific typed `CrossedQuote` variant the conversion
 /// core raises (§12.1 groups it under `Conversion`).
@@ -324,6 +324,102 @@ fn test_security_csv_over_max_total_bytes_yields_tape_too_large() {
         CsvFeed::open(&path, &limits),
         Err(BacktestError::TapeTooLarge {
             limit: "max_total_bytes",
+            ..
+        })
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// Bundle read-back adversarial fixtures (issue #35) — a hostile bundle handed
+// back yields a TYPED `BacktestError`, never a panic / hang / OOM.
+// ---------------------------------------------------------------------------
+
+/// Wrong `schema` tag → `Bundle`, rejected before any table is parsed.
+#[test]
+fn test_security_bundle_wrong_schema_tag_yields_bundle_error() {
+    let Ok((_dir, bundle)) = adversarial::bundle_wrong_schema_tag() else {
+        panic!("wrong-schema-tag bundle fixture must build");
+    };
+    match read_bundle(&bundle, &ResourceLimits::default()) {
+        Err(BacktestError::Bundle(msg)) => {
+            assert!(msg.contains("schema tag"), "schema tag error: {msg}");
+        }
+        other => panic!("expected a Bundle schema-tag error, got {other:?}"),
+    }
+}
+
+/// Oversized `row_counts` → `Bundle` (decoded length ≠ manifest count).
+#[test]
+fn test_security_bundle_oversized_row_counts_yields_bundle_error() {
+    let Ok((_dir, bundle)) = adversarial::bundle_oversized_row_counts() else {
+        panic!("oversized-row-counts bundle fixture must build");
+    };
+    assert!(matches!(
+        read_bundle(&bundle, &ResourceLimits::default()),
+        Err(BacktestError::Bundle(_))
+    ));
+}
+
+/// Truncated Parquet footer → `Bundle` (metadata read fails cleanly, no panic).
+#[test]
+fn test_security_bundle_truncated_footer_yields_bundle_error() {
+    let Ok((_dir, bundle)) = adversarial::bundle_truncated_parquet_footer() else {
+        panic!("truncated-footer bundle fixture must build");
+    };
+    assert!(matches!(
+        read_bundle(&bundle, &ResourceLimits::default()),
+        Err(BacktestError::Bundle(_))
+    ));
+}
+
+/// Non-round-trippable `contract_id` → `Bundle` (rejected before it is a join key).
+#[test]
+fn test_security_bundle_non_round_trippable_contract_id_yields_bundle_error() {
+    let Ok((_dir, bundle)) = adversarial::bundle_non_round_trippable_contract_id() else {
+        panic!("non-round-trippable contract_id bundle fixture must build");
+    };
+    assert!(matches!(
+        read_bundle(&bundle, &ResourceLimits::default()),
+        Err(BacktestError::Bundle(_))
+    ));
+}
+
+/// Well-formed bundle + a 1-byte `max_manifest_bytes` →
+/// `TapeTooLarge { max_manifest_bytes }`, cut off from the filesystem metadata
+/// before the manifest is read (a small fixture proves the cut-off, never OOM).
+#[test]
+fn test_security_bundle_over_max_manifest_bytes_yields_tape_too_large() {
+    let Ok((_dir, bundle)) = adversarial::bundle_well_formed() else {
+        panic!("well-formed bundle fixture must build");
+    };
+    let limits = ResourceLimits {
+        max_manifest_bytes: 1,
+        ..ResourceLimits::default()
+    };
+    assert!(matches!(
+        read_bundle(&bundle, &limits),
+        Err(BacktestError::TapeTooLarge {
+            limit: "max_manifest_bytes",
+            ..
+        })
+    ));
+}
+
+/// Well-formed bundle + a 0-row `max_rows_per_table` →
+/// `TapeTooLarge { max_rows_per_table }`, cut off before a row Vec is sized.
+#[test]
+fn test_security_bundle_over_max_rows_per_table_yields_tape_too_large() {
+    let Ok((_dir, bundle)) = adversarial::bundle_well_formed() else {
+        panic!("well-formed bundle fixture must build");
+    };
+    let limits = ResourceLimits {
+        max_rows_per_table: 0,
+        ..ResourceLimits::default()
+    };
+    assert!(matches!(
+        read_bundle(&bundle, &limits),
+        Err(BacktestError::TapeTooLarge {
+            limit: "max_rows_per_table",
             ..
         })
     ));

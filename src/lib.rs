@@ -88,8 +88,8 @@ pub mod run;
 pub use analytics::Metrics;
 pub use bundle::{
     BUNDLE_SCHEMA, EQUITY_CURVE_SORT_COLUMNS, FILLS_SORT_COLUMNS, GREEKS_ATTRIBUTION_SORT_COLUMNS,
-    Manifest, POSITIONS_SORT_COLUMNS, RowCounts, RunId, equity_sort_key, fill_sort_key,
-    greeks_sort_key, position_sort_key, write_bundle,
+    Manifest, POSITIONS_SORT_COLUMNS, RowCounts, RunId, ValidatedBundle, ValidatedManifest,
+    equity_sort_key, fill_sort_key, greeks_sort_key, position_sort_key, read_bundle, write_bundle,
 };
 pub use config::{
     BacktestConfig, FeeSchedule, LiquidityProfile, ResourceLimits, SlippageModel, TouchSize,

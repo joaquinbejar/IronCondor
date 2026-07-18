@@ -301,6 +301,176 @@ pub fn csv_oversized_steps() -> Result<(TempDir, PathBuf), String> {
     write_csv_files(&files)
 }
 
+// ---------------------------------------------------------------------------
+// Bundle read-back adversarial generators (issue #35): each builds a VALID
+// `ironcondor.bundle.v1` directory (writer #34), then tampers exactly one facet
+// so `ironcondor::read_bundle` rejects it with a typed error — never a panic /
+// hang / OOM. Committed as reviewable deterministic generators, not blobs.
+// ---------------------------------------------------------------------------
+
+/// Build a valid result bundle: run a small iron condor over a canonical Parquet
+/// chain, then publish the bundle. Returns the tempdir (kept alive by the caller)
+/// and the published `<run_id>/` directory.
+fn build_valid_bundle() -> Result<(TempDir, PathBuf), String> {
+    use optionstratlib::simulation::ExitPolicy;
+
+    let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let chain = dir.path().join("chain.parquet");
+    common::write_parquet(&chain, &common::condor_rows(6, None))?;
+    let mut config = common::condor_config(&chain, 7);
+    config.output_dir = dir.path().join("bundles");
+    let spec = common::iron_condor_spec();
+    let run = ironcondor::run_backtest(&config, &spec, ExitPolicy::TimeSteps(1_000_000))
+        .map_err(|e| e.to_string())?;
+    let bundle = ironcondor::write_bundle(&run, &config, &spec).map_err(|e| e.to_string())?;
+    Ok((dir, bundle))
+}
+
+/// Mutate `manifest.json` in place through its top-level object.
+fn patch_bundle_manifest(
+    bundle: &Path,
+    mutate: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
+) -> Result<(), String> {
+    let text = std::fs::read_to_string(bundle.join("manifest.json")).map_err(|e| e.to_string())?;
+    let mut value: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    let obj = value
+        .as_object_mut()
+        .ok_or_else(|| "manifest is not an object".to_string())?;
+    mutate(obj);
+    let bytes = serde_json::to_vec(&value).map_err(|e| e.to_string())?;
+    std::fs::write(bundle.join("manifest.json"), bytes).map_err(|e| e.to_string())
+}
+
+/// Overwrite `fills.parquet` with a single row whose `contract_id` carries a
+/// lowercase underlying — a violation of the `UNDERLYING` grammar, so the id
+/// cannot round-trip back to a `ContractKey`.
+fn write_one_bad_contract_fill(bundle: &Path, run_id: &str) -> Result<(), String> {
+    use std::sync::Arc;
+
+    use arrow::array::{ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use parquet::arrow::ArrowWriter;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("step", DataType::Int32, false),
+        Field::new("ts_ns", DataType::Int64, false),
+        Field::new("strategy_run_id", DataType::Utf8, false),
+        Field::new("trade_id", DataType::Int64, false),
+        Field::new("position_id", DataType::Int64, false),
+        Field::new("order_id", DataType::Int64, false),
+        Field::new("fill_seq", DataType::Int32, false),
+        Field::new("underlying", DataType::Utf8, false),
+        Field::new("expiration_ns", DataType::Int64, false),
+        Field::new("contract_id", DataType::Utf8, false),
+        Field::new("strike_cents", DataType::Int64, false),
+        Field::new("style", DataType::Utf8, false),
+        Field::new("side", DataType::Utf8, false),
+        Field::new("quantity", DataType::Int32, false),
+        Field::new("price_cents", DataType::Int64, false),
+        Field::new("fees_cents", DataType::Int64, false),
+        Field::new("slippage_cents", DataType::Int64, false),
+        Field::new("mode", DataType::Utf8, false),
+    ]));
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(Int32Array::from(vec![0i32])) as ArrayRef,
+        Arc::new(Int64Array::from(vec![common::TS0])),
+        Arc::new(StringArray::from(vec![run_id])),
+        Arc::new(Int64Array::from(vec![1i64])),
+        Arc::new(Int64Array::from(vec![1i64])),
+        Arc::new(Int64Array::from(vec![1i64])),
+        Arc::new(Int32Array::from(vec![0i32])),
+        Arc::new(StringArray::from(vec!["SPX"])),
+        Arc::new(Int64Array::from(vec![common::EXPIRY])),
+        // Lowercase underlying ⇒ non-round-trippable contract_id.
+        Arc::new(StringArray::from(vec![format!(
+            "v1:spx:{}:510000:C",
+            common::EXPIRY
+        )])),
+        Arc::new(Int64Array::from(vec![510_000i64])),
+        Arc::new(StringArray::from(vec!["call"])),
+        Arc::new(StringArray::from(vec!["short"])),
+        Arc::new(Int32Array::from(vec![1i32])),
+        Arc::new(Int64Array::from(vec![2_000i64])),
+        Arc::new(Int64Array::from(vec![65i64])),
+        Arc::new(Int64Array::from(vec![0i64])),
+        Arc::new(StringArray::from(vec!["naive"])),
+    ];
+    let batch = RecordBatch::try_new(schema.clone(), columns).map_err(|e| e.to_string())?;
+    let file = std::fs::File::create(bundle.join("fills.parquet")).map_err(|e| e.to_string())?;
+    let mut writer = ArrowWriter::try_new(file, schema, None).map_err(|e| e.to_string())?;
+    writer.write(&batch).map_err(|e| e.to_string())?;
+    writer.close().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// A well-formed bundle — the valid base for a read-back ceiling cut-off test.
+pub fn bundle_well_formed() -> Result<(TempDir, PathBuf), String> {
+    build_valid_bundle()
+}
+
+/// A bundle whose `manifest.schema` is an unknown major tag. Expected:
+/// `BacktestError::Bundle`, rejected **before** any table is parsed.
+pub fn bundle_wrong_schema_tag() -> Result<(TempDir, PathBuf), String> {
+    let (dir, bundle) = build_valid_bundle()?;
+    patch_bundle_manifest(&bundle, |obj| {
+        obj.insert(
+            "schema".to_string(),
+            serde_json::Value::String("ironcondor.bundle.v2".to_string()),
+        );
+    })?;
+    Ok((dir, bundle))
+}
+
+/// A bundle whose `manifest.row_counts.fills` is inflated far past the decoded
+/// table length. Expected: `BacktestError::Bundle` (`row_counts` mismatch).
+pub fn bundle_oversized_row_counts() -> Result<(TempDir, PathBuf), String> {
+    let (dir, bundle) = build_valid_bundle()?;
+    patch_bundle_manifest(&bundle, |obj| {
+        if let Some(counts) = obj.get_mut("row_counts").and_then(|v| v.as_object_mut()) {
+            counts.insert(
+                "fills".to_string(),
+                serde_json::Value::from(1_000_000_000_u64),
+            );
+        }
+    })?;
+    Ok((dir, bundle))
+}
+
+/// A bundle whose `fills.parquet` is truncated to half its bytes (a chopped
+/// footer). Expected: `BacktestError::Bundle` (metadata read fails cleanly).
+pub fn bundle_truncated_parquet_footer() -> Result<(TempDir, PathBuf), String> {
+    let (dir, bundle) = build_valid_bundle()?;
+    let table = bundle.join("fills.parquet");
+    let bytes = std::fs::read(&table).map_err(|e| e.to_string())?;
+    let half = bytes.len() / 2;
+    let truncated = bytes
+        .get(..half)
+        .ok_or_else(|| "truncation slice out of range".to_string())?;
+    std::fs::write(&table, truncated).map_err(|e| e.to_string())?;
+    Ok((dir, bundle))
+}
+
+/// A bundle whose `fills.parquet` carries a non-round-trippable `contract_id`
+/// (a lowercase underlying). Expected: `BacktestError::Bundle` (round-trip fails
+/// before the id is used as a join key).
+pub fn bundle_non_round_trippable_contract_id() -> Result<(TempDir, PathBuf), String> {
+    let (dir, bundle) = build_valid_bundle()?;
+    let run_id = bundle
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| "bundle dir name".to_string())?
+        .to_string();
+    write_one_bad_contract_fill(&bundle, &run_id)?;
+    // Keep row_counts consistent with the single replacement row, so the failure
+    // is specifically the contract_id round-trip (not a row_counts mismatch).
+    patch_bundle_manifest(&bundle, |obj| {
+        if let Some(counts) = obj.get_mut("row_counts").and_then(|v| v.as_object_mut()) {
+            counts.insert("fills".to_string(), serde_json::Value::from(1_u64));
+        }
+    })?;
+    Ok((dir, bundle))
+}
+
 /// Write one valid canonical row but with `iv` in the `implied_volatility`
 /// column — used to inject a NaN analytic the shared builder cannot express.
 fn write_single_row_with_iv(path: &Path, iv: f64) -> Result<(), String> {
