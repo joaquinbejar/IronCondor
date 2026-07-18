@@ -10,6 +10,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The `ironcondor.bundle.v1` wire contract is FROZEN (#36).** The result-bundle
+  schema is now a **versioned wire contract**, not a proposal: the tag
+  `"ironcondor.bundle.v1"` is the consumer's primary version pin, and any
+  post-freeze change to a `manifest.json` field, a Parquet column
+  name/type/nullability, a sort/unique key, or an identifier grammar **bumps the
+  tag** (`v1` → `v2`, a major SemVer event), is ChainView-coordinated in the same
+  week, regenerates the goldens, and adds a `CHANGELOG.md` entry
+  (`docs/SEMVER.md#result-bundle-versioning`, `docs/05-analytics-and-reporting.md`
+  §12 now marked FROZEN). The freeze is pinned by:
+  - a **golden bundle** (`tests/golden/iron_condor_naive/expected/`:
+    `manifest.json` + the four Parquet tables) asserted **write → read → equal**
+    under the single comparison oracle — decode, sort by each table's pinned key,
+    integer cents compared **exactly**, `drawdown` within the fixed tolerance,
+    canonical-JSON manifest with `created_utc` excluded — plus a same-environment
+    **run-twice byte-identical** test (four tables byte-for-byte, manifest after
+    stripping `created_utc`); a value-changing engine / attribution / schema
+    change that leaves the golden untouched fails CI (`tests/bundle_golden.rs`,
+    `tests/oracle/mod.rs` extended with the four-table + canonical-manifest
+    oracle).
+  - the **shared conformance fixture** (`tests/fixtures/conformance/`) — a
+    realistic thin-book four-leg condor whose legs share one `trade_id`, with one
+    leg closed mid-run (a non-null `exit_reason`), three legs left `open_at_end`,
+    and multi-level realistic fills exercising the `(step, order_id, fill_seq)`
+    unique key — asserting **every cell** of the `docs/05` §12 producer-side
+    contract matrix, loaded identically by ChainView's tests
+    (`tests/conformance.rs`; the producer/regeneration side is feature-gated
+    `orderbook`, the matrix guard runs on the default build via `read_bundle`).
+
+### Changed
+
+- **Bundle build identity is `code_version + lockfile_sha256`, with no
+  per-commit git sha (#36).** `docs/01` §10, `docs/05` §6, and `src/bundle/schema.rs`
+  had promised `code_version` = "crate version + git short sha", while the writer
+  only ever set `env!("CARGO_PKG_VERSION")`. Aligned the contract to the code: a
+  per-commit git sha in the `run_id` build identity would change the golden's
+  `run_id` (its directory name) and manifest **every commit**, so a frozen golden
+  could never exist. Build identity is now documented as crate version +
+  `Cargo.lock` sha256 (both stable across commits); git provenance, if ever
+  wanted, would be a manifest-only field excluded from the `run_id` and byte
+  comparison, like `created_utc`.
+- **The bundle writer builds `FillRow`/`PositionRow` at encode time (#36).**
+  `src/bundle/writer.rs` (termination-phase, free to allocate) now constructs the
+  flat wire rows (`FillRow`/`PositionRow`, the reader's decode target) from the
+  in-loop collector carriers (`FillRecord`/`PositionSnapshot`) and sorts them
+  through the pinned `fill_sort_key`/`position_sort_key` helpers, unifying the
+  wire-row representation (write = encode-time build, read = decode target) and
+  removing the previous inline-sort duplication. The produced Parquet bytes are
+  **unchanged** (proven byte-identical against the goldens).
+
+### Fixed
+
+- **Attribution mis-scale proptests no longer flake on a rounds-to-zero input
+  (#36).** `theta_term_uses_daily_greek_and_day_delta` and
+  `vega_term_uses_per_point_greek_and_pp_delta` (`tests/property.rs`) guard the
+  `prop_assert_ne!(correct, mis)` discriminator with `prop_assume!(correct != 0)`:
+  a term that rounds to `0` cents cannot distinguish the mis-scale (both round to
+  `0`), so the degenerate case was a false failure. The primary value-equality
+  assertion still runs for every case (including degenerate ones), and the guard
+  still bites under the ×365 / ×100 / N² mis-scale, so the mis-scaling intent is
+  intact; no failing seed is committed to `proptest-regressions/`.
+
 - Result-bundle record types + `manifest.json` schema — the typed shape of the
   frozen `ironcondor.bundle.v1` contract ChainView consumes (#33). The two
   remaining bundle rows land next to the existing pair in `src/domain/result.rs`:

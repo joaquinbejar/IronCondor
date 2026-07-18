@@ -1,0 +1,183 @@
+{
+  "code_version": "0.0.1",
+  "config": {
+    "data_source": {
+      "kind": "parquet",
+      "path": "conformance_condor.parquet",
+      "sha256": ""
+    },
+    "fees": {
+      "per_contract_cents": 65,
+      "per_order_cents": 100
+    },
+    "initial_capital": 10000000,
+    "limits": {
+      "max_contracts_per_snapshot": 50000,
+      "max_decompressed_bytes": 8589934592,
+      "max_file_bytes": 4294967296,
+      "max_manifest_bytes": 16777216,
+      "max_rows_per_table": 100000000,
+      "max_steps": 100000,
+      "max_string_len": 65536,
+      "max_total_bytes": 2147483648
+    },
+    "liquidity_profile": {
+      "decay": "1",
+      "depth_levels": 2,
+      "touch_size": {
+        "contracts": 3,
+        "kind": "flat"
+      }
+    },
+    "marketable_cap_ticks": 10,
+    "mode": "realistic",
+    "output_dir": "conformance-out",
+    "overwrite": false,
+    "seed": 7,
+    "slippage": {
+      "model": "none"
+    }
+  },
+  "created_utc": "1970-01-01T00:00:00+00:00",
+  "data_source": {
+    "kind": "parquet",
+    "path": "conformance_condor.parquet",
+    "sha256": ""
+  },
+  "lockfile_sha256": "95e2a25afe8e4322e3a4bfcfdfc1f590af579d175f4db4e033e7e6d3a2e4ab0b",
+  "metrics": {
+    "capital_utilization": {
+      "avg_capital_used": "0",
+      "avg_margin_used": "0",
+      "avg_position_size": "0",
+      "capital_efficiency": "0",
+      "max_capital_used": "0",
+      "max_margin_used": "0",
+      "max_position_size": "0",
+      "net_premium": "89.65",
+      "total_margin_used": "0",
+      "total_premium_paid": "0.00",
+      "total_premium_received": "89.65"
+    },
+    "custom_metrics": {
+      "long_legs_realized_cents": "0",
+      "max_drawdown_cents": "19625",
+      "max_drawdown_ratio": "-0.0019624999999999998348543251",
+      "net_premium_cents": "11360",
+      "realized_pnl_cents": "-7425",
+      "short_legs_realized_cents": "-7425"
+    },
+    "drawdown_analysis": {
+      "avg_drawdown": "0.0019624999999999998348543251",
+      "avg_recovery_time": null,
+      "drawdowns": [
+        {
+          "bottom_date": "2025-06-21T00:00:00",
+          "duration": 2,
+          "magnitude": "0.0019624999999999998348543251",
+          "recovery_date": null,
+          "recovery_duration": null,
+          "start_date": "2025-06-19T00:00:00"
+        }
+      ],
+      "max_drawdown": "0.0019624999999999998348543251",
+      "max_drawdown_duration": 2,
+      "recovery_duration": null,
+      "time_to_max_drawdown": 0,
+      "total_underwater_days": 4,
+      "underwater_percentage": "1"
+    },
+    "general_performance": {
+      "annualized_return": "0",
+      "avg_gain": null,
+      "avg_loss": "-74.25",
+      "calmar_ratio": null,
+      "downside_deviation": 0.00019655859699728575,
+      "gain_loss_ratio": null,
+      "profit_factor": "0",
+      "sharpe_ratio": "-0.577350269189625731058868041",
+      "sortino_ratio": "-0.5",
+      "total_return": "-0.0019625",
+      "volatility": 0.00017022473833187718,
+      "win_rate": "0"
+    },
+    "options_metrics": {
+      "avg_charm_exposure": null,
+      "avg_color_exposure": null,
+      "avg_delta_exposure": null,
+      "avg_gamma_exposure": null,
+      "avg_theta_exposure": null,
+      "avg_vanna_exposure": null,
+      "avg_vega_exposure": null,
+      "avg_veta_exposure": null,
+      "avg_vomma_exposure": null,
+      "calls_percentage": "0",
+      "long_percentage": "0",
+      "premium_capture": "-0.828220858895705521472392638",
+      "puts_percentage": "1",
+      "return_on_margin": null,
+      "return_on_premium": "-0.828220858895705521472392638",
+      "short_percentage": "1"
+    },
+    "risk_metrics": {
+      "expected_shortfall": null,
+      "max_consecutive_losses": 1,
+      "pain_index": "0.0018054999999999998133715096",
+      "tail_ratio": null,
+      "ulcer_index": "0.0018157102604765991676200043",
+      "value_at_risk_95": null,
+      "value_at_risk_99": null
+    },
+    "trade_statistics": {
+      "average_holding_period": 2,
+      "average_trade_return": "-74.25",
+      "break_even": 0,
+      "call_trades": 0,
+      "largest_loss": "-74.25",
+      "largest_win": null,
+      "long_trades": 0,
+      "losers": 1,
+      "max_holding_period": 2,
+      "median_holding_period": 2,
+      "median_trade_return": "-74.25",
+      "min_holding_period": 2,
+      "number_of_trades": 1,
+      "put_trades": 1,
+      "short_trades": 1,
+      "spread_trades": 0,
+      "winners": 0
+    }
+  },
+  "row_counts": {
+    "equity_curve": 5,
+    "fills": 10,
+    "greeks_attribution": 5,
+    "positions": 18
+  },
+  "run_id": "bacf0ae3b5a8992f6f39af57b338db339c4e6f58082bc7644c4e98ae608235c9",
+  "schema": "ironcondor.bundle.v1",
+  "seed": 7,
+  "strategy": {
+    "IronCondor": {
+      "close_fee": 65,
+      "dividend_yield": "0",
+      "expiration": {
+        "datetime": "2025-07-19T00:00:00Z"
+      },
+      "implied_volatility": "0.20",
+      "long_call_strike": 520000,
+      "long_put_strike": 480000,
+      "open_fee": 65,
+      "premium_long_call": 800,
+      "premium_long_put": 700,
+      "premium_short_call": 2000,
+      "premium_short_put": 1800,
+      "quantity": 5,
+      "risk_free_rate": "0.05",
+      "short_call_strike": 510000,
+      "short_put_strike": 490000,
+      "underlying": "SPX",
+      "underlying_price": 500000
+    }
+  }
+}

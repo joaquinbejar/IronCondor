@@ -37,10 +37,13 @@
 
 use std::fmt;
 
-use ironcondor::EquityPoint;
 use ironcondor::analytics::metrics::{
     LONG_LEGS_REALIZED_CENTS_KEY, MAX_DRAWDOWN_CENTS_KEY, MAX_DRAWDOWN_RATIO_KEY,
     NET_PREMIUM_CENTS_KEY, REALIZED_PNL_CENTS_KEY, SHORT_LEGS_REALIZED_CENTS_KEY,
+};
+use ironcondor::{
+    EquityPoint, FillRow, GreeksAttributionRow, PositionRow, ValidatedBundle, fill_sort_key,
+    greeks_sort_key, position_sort_key,
 };
 use optionstratlib::backtesting::BacktestResult;
 use rust_decimal::Decimal;
@@ -431,6 +434,485 @@ fn cmp_opt_dec_tol(
 
 fn opt_dec_str(value: Option<Decimal>) -> String {
     value.map_or_else(|| "None".to_string(), |d| d.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// The result-bundle oracle (#36): the four Parquet tables + the canonical-JSON
+// manifest. The **single** cross-environment logical-equivalence oracle for the
+// result bundle (docs/05 §12.5): decode (done by `read_bundle`), sort by each
+// table's pinned key, compare money/id columns EXACTLY as integer cents, the
+// one float column (`drawdown`) within the tolerance, and the manifest as
+// canonical JSON with the provenance/operational fields excluded.
+// ---------------------------------------------------------------------------
+
+/// Compare two decoded [`ValidatedBundle`]s' four tables under the oracle:
+/// each table sorted by its pinned key, every integer/id/string column exact,
+/// and `equity_curve.drawdown` within the tolerance. The manifest is compared
+/// separately by [`compare_manifest_json`] (canonical JSON, `created_utc`
+/// excluded), because [`ValidatedBundle`]'s manifest keeps `metrics` opaque.
+///
+/// # Errors
+///
+/// The first [`OracleDiff`] across the four tables, naming the diverging
+/// table + step + field.
+pub fn compare_bundle_tables(
+    produced: &ValidatedBundle,
+    expected: &ValidatedBundle,
+) -> Result<(), OracleDiff> {
+    compare_fills(&produced.fills, &expected.fills)?;
+    compare_equity_curves(&produced.equity_curve, &expected.equity_curve)?;
+    compare_positions(&produced.positions, &expected.positions)?;
+    compare_greeks(&produced.greeks_attribution, &expected.greeks_attribution)?;
+    Ok(())
+}
+
+/// Compare two `fills.parquet` decodings: sort by `(step, order_id, fill_seq)`
+/// (the unique key), then every column exact (no float columns).
+///
+/// # Errors
+///
+/// The first diverging `(step, field)` as an [`OracleDiff`].
+pub fn compare_fills(produced: &[FillRow], expected: &[FillRow]) -> Result<(), OracleDiff> {
+    let produced = sorted(produced, fill_sort_key);
+    let expected = sorted(expected, fill_sort_key);
+    len_check("fills", produced.len(), expected.len())?;
+    for (p, e) in produced.iter().zip(expected.iter()) {
+        let step = Some(p.step);
+        cmp_int("fills", step, "step", i64::from(p.step), i64::from(e.step))?;
+        cmp_int("fills", step, "ts_ns", p.ts_ns, e.ts_ns)?;
+        cmp_str(
+            "fills",
+            step,
+            "strategy_run_id",
+            &p.strategy_run_id,
+            &e.strategy_run_id,
+        )?;
+        cmp_u64("fills", step, "trade_id", p.trade_id, e.trade_id)?;
+        cmp_u64("fills", step, "position_id", p.position_id, e.position_id)?;
+        cmp_u64("fills", step, "order_id", p.order_id, e.order_id)?;
+        cmp_int(
+            "fills",
+            step,
+            "fill_seq",
+            i64::from(p.fill_seq),
+            i64::from(e.fill_seq),
+        )?;
+        cmp_str("fills", step, "underlying", &p.underlying, &e.underlying)?;
+        cmp_int(
+            "fills",
+            step,
+            "expiration_ns",
+            p.expiration_ns,
+            e.expiration_ns,
+        )?;
+        cmp_str("fills", step, "contract_id", &p.contract_id, &e.contract_id)?;
+        cmp_u64(
+            "fills",
+            step,
+            "strike_cents",
+            p.strike_cents,
+            e.strike_cents,
+        )?;
+        cmp_str("fills", step, "style", &p.style, &e.style)?;
+        cmp_str("fills", step, "side", &p.side, &e.side)?;
+        cmp_int(
+            "fills",
+            step,
+            "quantity",
+            i64::from(p.quantity),
+            i64::from(e.quantity),
+        )?;
+        cmp_u64("fills", step, "price_cents", p.price_cents, e.price_cents)?;
+        cmp_int("fills", step, "fees_cents", p.fees_cents, e.fees_cents)?;
+        cmp_int(
+            "fills",
+            step,
+            "slippage_cents",
+            p.slippage_cents,
+            e.slippage_cents,
+        )?;
+        cmp_str("fills", step, "mode", &p.mode, &e.mode)?;
+    }
+    Ok(())
+}
+
+/// Compare two `positions.parquet` decodings: sort by `(step, position_id)`,
+/// then every column exact (`exit_reason` the only nullable column; no floats).
+///
+/// # Errors
+///
+/// The first diverging `(step, field)` as an [`OracleDiff`].
+pub fn compare_positions(
+    produced: &[PositionRow],
+    expected: &[PositionRow],
+) -> Result<(), OracleDiff> {
+    let produced = sorted(produced, position_sort_key);
+    let expected = sorted(expected, position_sort_key);
+    len_check("positions", produced.len(), expected.len())?;
+    for (p, e) in produced.iter().zip(expected.iter()) {
+        let step = Some(p.step);
+        cmp_int(
+            "positions",
+            step,
+            "step",
+            i64::from(p.step),
+            i64::from(e.step),
+        )?;
+        cmp_int("positions", step, "ts_ns", p.ts_ns, e.ts_ns)?;
+        cmp_u64(
+            "positions",
+            step,
+            "position_id",
+            p.position_id,
+            e.position_id,
+        )?;
+        cmp_u64("positions", step, "trade_id", p.trade_id, e.trade_id)?;
+        cmp_str(
+            "positions",
+            step,
+            "contract_id",
+            &p.contract_id,
+            &e.contract_id,
+        )?;
+        cmp_str("positions", step, "side", &p.side, &e.side)?;
+        cmp_int(
+            "positions",
+            step,
+            "quantity",
+            i64::from(p.quantity),
+            i64::from(e.quantity),
+        )?;
+        cmp_u64(
+            "positions",
+            step,
+            "avg_price_cents",
+            p.avg_price_cents,
+            e.avg_price_cents,
+        )?;
+        cmp_u64("positions", step, "mark_cents", p.mark_cents, e.mark_cents)?;
+        cmp_int(
+            "positions",
+            step,
+            "unrealized_cents",
+            p.unrealized_cents,
+            e.unrealized_cents,
+        )?;
+        cmp_bool("positions", step, "stale_mark", p.stale_mark, e.stale_mark)?;
+        cmp_opt_str(
+            "positions",
+            step,
+            "exit_reason",
+            p.exit_reason.as_deref(),
+            e.exit_reason.as_deref(),
+        )?;
+        cmp_bool(
+            "positions",
+            step,
+            "open_at_end",
+            p.open_at_end,
+            e.open_at_end,
+        )?;
+    }
+    Ok(())
+}
+
+/// Compare two `greeks_attribution.parquet` decodings: sort by `step`, every
+/// integer-cents term exact.
+///
+/// # Errors
+///
+/// The first diverging `(step, field)` as an [`OracleDiff`].
+pub fn compare_greeks(
+    produced: &[GreeksAttributionRow],
+    expected: &[GreeksAttributionRow],
+) -> Result<(), OracleDiff> {
+    let produced = sorted(produced, greeks_sort_key);
+    let expected = sorted(expected, greeks_sort_key);
+    len_check("greeks_attribution", produced.len(), expected.len())?;
+    for (p, e) in produced.iter().zip(expected.iter()) {
+        let step = Some(p.step);
+        cmp_int(
+            "greeks_attribution",
+            step,
+            "step",
+            i64::from(p.step),
+            i64::from(e.step),
+        )?;
+        cmp_int("greeks_attribution", step, "ts_ns", p.ts_ns, e.ts_ns)?;
+        cmp_int(
+            "greeks_attribution",
+            step,
+            "theta_pnl_cents",
+            p.theta_pnl_cents,
+            e.theta_pnl_cents,
+        )?;
+        cmp_int(
+            "greeks_attribution",
+            step,
+            "delta_pnl_cents",
+            p.delta_pnl_cents,
+            e.delta_pnl_cents,
+        )?;
+        cmp_int(
+            "greeks_attribution",
+            step,
+            "vega_pnl_cents",
+            p.vega_pnl_cents,
+            e.vega_pnl_cents,
+        )?;
+        cmp_int(
+            "greeks_attribution",
+            step,
+            "spread_capture_cents",
+            p.spread_capture_cents,
+            e.spread_capture_cents,
+        )?;
+        cmp_int(
+            "greeks_attribution",
+            step,
+            "fees_cents",
+            p.fees_cents,
+            e.fees_cents,
+        )?;
+        cmp_int(
+            "greeks_attribution",
+            step,
+            "residual_cents",
+            p.residual_cents,
+            e.residual_cents,
+        )?;
+    }
+    Ok(())
+}
+
+/// Compare two raw `manifest.json` values as **canonical JSON** under the
+/// **cross-environment** equality oracle (docs/05 §12.5, the CONSUMER role — the
+/// same comparison ChainView does). Excluded from the comparison:
+///
+/// - `created_utc` — the sole wall-clock field, provenance only (§6);
+/// - `config.output_dir` — the operational output path, non-semantic and
+///   excluded from the `run_id` (§11) — canonicalised;
+/// - **`metrics`** — a **versioned, opaque** object cross-environment (§12.5):
+///   the consumer never compares it field-by-field, and some of its fields
+///   (`optionstratlib`'s `Positive` — e.g. `volatility`, `downside_deviation`)
+///   serialise as **bare `f64`**, which must not be compared for exact equality
+///   across environments (`rules/global_rules.md` float discipline). `metrics`
+///   byte-stability is instead pinned **same-environment** by the run-twice test
+///   (the PRODUCER role, §12.5); its value-correctness is pinned by the v0.1
+///   metrics golden (tolerance-based `MetricsSummary`) and the metrics unit tests.
+///
+/// Everything else — `run_id`, `code_version`, `lockfile_sha256`, `seed`, the
+/// semantic `config`, `strategy`, `data_source`, `row_counts` (all strings /
+/// integers, no raw `f64`) — is compared exactly.
+///
+/// # Errors
+///
+/// An [`OracleDiff`] naming the first divergence (the canonical strings differ).
+pub fn compare_manifest_json(
+    produced: &serde_json::Value,
+    expected: &serde_json::Value,
+) -> Result<(), OracleDiff> {
+    let p = strip_opaque_metrics(canonical_manifest(produced));
+    let e = strip_opaque_metrics(canonical_manifest(expected));
+    if p == e {
+        return Ok(());
+    }
+    // Locate the first differing top-level key for a self-locating message.
+    let (pobj, eobj) = (as_object(&p), as_object(&e));
+    let mut field = "manifest";
+    for key in pobj.keys().chain(eobj.keys()) {
+        if pobj.get(key) != eobj.get(key) {
+            field = leak(key.clone());
+            break;
+        }
+    }
+    Err(OracleDiff::new(
+        "manifest",
+        None,
+        field,
+        p.get(field)
+            .map_or_else(|| "∅".to_string(), ToString::to_string),
+        e.get(field)
+            .map_or_else(|| "∅".to_string(), ToString::to_string),
+    ))
+}
+
+/// Normalise a raw `manifest.json` value for the **same-environment** byte
+/// comparison (the run-twice test, PRODUCER role, docs/05 §12.5): drop the
+/// wall-clock `created_utc` and canonicalise the operational `config.output_dir`
+/// (both non-semantic, §11). It **keeps `metrics`**, so two same-environment runs
+/// must be byte-identical including the metrics object (`Positive` bare-`f64`
+/// fields have identical bits in the same environment). The cross-environment
+/// golden comparison ([`compare_manifest_json`]) additionally drops the opaque
+/// `metrics`. `serde_json::Map` is `BTreeMap`-backed (sorted keys) with the
+/// crate's default features, so the result is order-independent and
+/// `==`-comparable.
+#[must_use]
+pub fn canonical_manifest(value: &serde_json::Value) -> serde_json::Value {
+    let mut value = value.clone();
+    if let Some(obj) = value.as_object_mut() {
+        obj.remove("created_utc");
+        if let Some(config) = obj
+            .get_mut("config")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            // Operational output path — non-semantic, excluded from run_id
+            // (docs/05 §11); canonicalise so a tempdir write target never
+            // reaches the comparison.
+            if config.contains_key("output_dir") {
+                config.insert(
+                    "output_dir".to_string(),
+                    serde_json::Value::String("<output_dir>".to_string()),
+                );
+            }
+        }
+    }
+    value
+}
+
+/// Drop the **versioned-opaque** `metrics` object — the cross-environment
+/// consumer never compares it field-by-field (docs/05 §12.5), and some of its
+/// fields serialise as bare `f64`, which the float-discipline rule forbids
+/// comparing for exact equality across environments.
+#[must_use]
+fn strip_opaque_metrics(mut value: serde_json::Value) -> serde_json::Value {
+    if let Some(obj) = value.as_object_mut() {
+        obj.remove("metrics");
+    }
+    value
+}
+
+/// Read `dir/manifest.json` as a JSON value (test helper; panics on a failure —
+/// a golden fixture that will not read is a hard test failure).
+#[must_use]
+pub fn read_manifest_json(dir: &std::path::Path) -> serde_json::Value {
+    let path = dir.join("manifest.json");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        panic!("the bundle manifest.json must be readable at {path:?}");
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        panic!("the bundle manifest.json must be valid JSON at {path:?}");
+    };
+    value
+}
+
+/// A stable-sorted copy of `rows` by `key` — the oracle's per-table
+/// normalisation before comparison (mirrors [`sorted_by_step`]).
+fn sorted<T: Clone, K: Ord>(rows: &[T], key: impl Fn(&T) -> K) -> Vec<T> {
+    let mut out = rows.to_vec();
+    out.sort_by_key(|row| key(row));
+    out
+}
+
+/// A located `usize`-length divergence for a bundle table.
+fn len_check(context: &'static str, produced: usize, expected: usize) -> Result<(), OracleDiff> {
+    if produced == expected {
+        Ok(())
+    } else {
+        Err(OracleDiff::new(
+            context,
+            None,
+            "len",
+            produced.to_string(),
+            expected.to_string(),
+        ))
+    }
+}
+
+/// Compare two `u64` id/cents columns exactly.
+fn cmp_u64(
+    context: &'static str,
+    step: Option<u32>,
+    field: &'static str,
+    a: u64,
+    b: u64,
+) -> Result<(), OracleDiff> {
+    if a == b {
+        Ok(())
+    } else {
+        Err(OracleDiff::new(
+            context,
+            step,
+            field,
+            a.to_string(),
+            b.to_string(),
+        ))
+    }
+}
+
+/// Compare two string columns exactly.
+fn cmp_str(
+    context: &'static str,
+    step: Option<u32>,
+    field: &'static str,
+    a: &str,
+    b: &str,
+) -> Result<(), OracleDiff> {
+    if a == b {
+        Ok(())
+    } else {
+        Err(OracleDiff::new(
+            context,
+            step,
+            field,
+            a.to_string(),
+            b.to_string(),
+        ))
+    }
+}
+
+/// Compare the only nullable column (`exit_reason`) exactly.
+fn cmp_opt_str(
+    context: &'static str,
+    step: Option<u32>,
+    field: &'static str,
+    a: Option<&str>,
+    b: Option<&str>,
+) -> Result<(), OracleDiff> {
+    if a == b {
+        Ok(())
+    } else {
+        Err(OracleDiff::new(
+            context,
+            step,
+            field,
+            a.map_or_else(|| "null".to_string(), ToString::to_string),
+            b.map_or_else(|| "null".to_string(), ToString::to_string),
+        ))
+    }
+}
+
+/// Compare two boolean columns exactly.
+fn cmp_bool(
+    context: &'static str,
+    step: Option<u32>,
+    field: &'static str,
+    a: bool,
+    b: bool,
+) -> Result<(), OracleDiff> {
+    if a == b {
+        Ok(())
+    } else {
+        Err(OracleDiff::new(
+            context,
+            step,
+            field,
+            a.to_string(),
+            b.to_string(),
+        ))
+    }
+}
+
+/// A `serde_json::Value`'s object map, or an empty map for a non-object (a
+/// malformed manifest is caught by `read_bundle`, not here).
+fn as_object(value: &serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+    value.as_object().cloned().unwrap_or_default()
+}
+
+/// Leak a `String` into a `&'static str` for an [`OracleDiff::field`] label —
+/// test-only, bounded by the fixed manifest key set.
+fn leak(s: String) -> &'static str {
+    Box::leak(s.into_boxed_str())
 }
 
 #[cfg(test)]

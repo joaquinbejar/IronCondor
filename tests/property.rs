@@ -1587,8 +1587,14 @@ proptest! {
             theta * dt_years * Decimal::from(DOLLARS_TO_CENTS as i64)
                 * Decimal::from(i64::try_from(weight).unwrap_or(i64::MAX)),
         );
-        // The daily and annual scalings must differ (proves the guard bites);
-        // the daily term is large enough here that ÷365 always changes it.
+        // The discriminator only bites on a NON-degenerate term: a term that
+        // rounds to 0 cents cannot distinguish the mis-scale (both round to 0),
+        // so `correct == mis == 0` is a false failure, not a mis-scale escaping.
+        // Guard it (never commit that degenerate seed); `correct != 0` ⇒
+        // `|mis| ≈ |correct|/365` differs, so the guard still fails under the
+        // ~365× annual mis-scale. The value equality above still runs for every
+        // case, including the degenerate ones.
+        prop_assume!(correct != 0);
         prop_assert_ne!(correct, mis, "a ~365× annual mis-scale would change the term");
     }
 
@@ -1633,6 +1639,14 @@ proptest! {
         let mis = attr_round_cents(
             vega * iv_move_decimal * Decimal::from(DOLLARS_TO_CENTS as i64) * weight_dec,
         );
+        // The discriminator only bites on a NON-degenerate term: a term that
+        // rounds to 0 cents cannot distinguish the mis-scale (the 100×-smaller
+        // `mis` also rounds to 0), so `correct == mis == 0` is a false failure,
+        // not a mis-scale escaping. Guard it (never commit that degenerate seed);
+        // `correct != 0` ⇒ `|mis| ≈ |correct|/100` differs, so the guard still
+        // fails under the 100× mis-scale. The value equality above still runs for
+        // every case, including the degenerate ones.
+        prop_assume!(correct != 0);
         prop_assert_ne!(correct, mis, "a 100× decimal-IV mis-scale would change the term");
     }
 

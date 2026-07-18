@@ -308,8 +308,13 @@ pub struct Manifest {
     /// RFC 3339 wall-clock — **provenance only**, never read back by the engine
     /// and excluded from the `run_id` hash and the byte comparison.
     pub created_utc: String,
-    /// `ironcondor` crate version + git short sha — build identity (hashed into
-    /// `run_id`).
+    /// `ironcondor` crate version (`CARGO_PKG_VERSION`) — build identity (hashed
+    /// into `run_id`). Deliberately **not** a per-commit git sha: a sha would
+    /// change the `run_id` (the bundle directory name) every commit and make a
+    /// frozen golden impossible. Build identity is `code_version +
+    /// lockfile_sha256`, both stable across commits; git provenance, if ever
+    /// wanted, would be a manifest-only field excluded from `run_id` (and from
+    /// the byte comparison, like `created_utc`).
     pub code_version: String,
     /// sha256 of `Cargo.lock` at build — build identity (hashed into `run_id`).
     pub lockfile_sha256: String,
@@ -356,7 +361,7 @@ mod tests {
     use optionstratlib::ExpirationDate;
     use optionstratlib::backtesting::BacktestResult;
 
-    const CODE_VERSION: &str = "0.3.0+deadbee";
+    const CODE_VERSION: &str = "0.3.0";
     const LOCKFILE_SHA: &str = "0000000000000000000000000000000000000000000000000000000000000000";
     const TAPE_SHA: &str = "1111111111111111111111111111111111111111111111111111111111111111";
 
@@ -550,7 +555,7 @@ mod tests {
             &config,
             &strategy(),
             TAPE_SHA,
-            "0.3.1+cafef00",
+            "0.3.1",
             LOCKFILE_SHA,
         ) {
             Ok(id) => id,
