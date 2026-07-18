@@ -10,6 +10,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `BacktestError` (thiserror): the single typed error boundary — every
+  documented kind from the domain model, with lowercase messages carrying the
+  offending value; upstream errors convert into these kinds in `src/error.rs`
+  and nowhere else (#2).
+- `BacktestConfig` skeleton with `validate()` as the untrusted-config seam
+  (positive capital, per-field `ResourceLimits` hard caps, non-negative
+  slippage fraction, no directory-escaping output path), `ResourceLimits`
+  with documented defaults and hard caps, `FeeSchedule`, `SlippageModel`,
+  `ExecutionMode`, and a minimal `DataSourceSpec` (Csv/Parquet) — all
+  `deny_unknown_fields`; money fields are integer cents, never `f64` (#2).
+
 - Crate skeleton: the layered `src/` module tree (`domain`, `engine`,
   `execution`, `data`, `analytics`, `bundle`, `python`, `error`, `config`) as
   compiling placeholders, `#![forbid(unsafe_code)]` + `#![warn(missing_docs)]`
