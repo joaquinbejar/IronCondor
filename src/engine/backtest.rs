@@ -704,6 +704,7 @@ mod tests {
             },
             slippage: SlippageModel::None,
             marketable_cap_ticks: 10,
+            liquidity_profile: crate::config::LiquidityProfile::default(),
             limits: crate::config::ResourceLimits::default(),
             output_dir: "runs/out".into(),
             overwrite: false,

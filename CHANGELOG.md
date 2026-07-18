@@ -10,6 +10,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Per-strike book seeding for realistic mode (`src/execution/liquidity.rs`,
+  feature `orderbook`): each snapshot seeds every leaf book with a multi-level
+  ladder — a touch level at the quoted bid/ask sized from the configured
+  `LiquidityProfile`, plus up to `L` deeper levels stepping one
+  `tick_size_cents` away from mid, with geometric size decay
+  `round(touch_size × rⁱ)` (computed in `Decimal`, half-to-even, terminating
+  when a level rounds to zero). Every price is tick-aligned by construction;
+  all seed `OrderId`s come from the disjoint seeded-maker range; orders submit
+  in a fixed order (ascending `contract_id`, bid before ask) so the seeded
+  book is byte-identical across runs. Seeding runs once before the strategy's
+  intents, so a strategy order queues behind the seeded depth (#23).
+- `BacktestConfig.liquidity_profile` (`LiquidityProfile` — touch-size function
+  `QuotedSize`/`Flat`, depth `L` default 5, decay `r` default 0.5, validated),
+  recorded in the run config so a seeded book is reproducible from the
+  manifest (#23).
+
 - The `option-chain-orderbook` adapter for realistic fills
   (`src/execution/realistic.rs`, `RealisticFill`, feature `orderbook`) — the
   foundation of realistic mode. It navigates to the leaf `OptionOrderBook`,

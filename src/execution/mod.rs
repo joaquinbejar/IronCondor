@@ -29,6 +29,8 @@
 //! `option-chain-orderbook`** — the whole seam is integer cents and `u128`
 //! ticks. Nothing of that mapping lives here.
 
+#[cfg(feature = "orderbook")]
+pub(crate) mod liquidity;
 pub mod naive;
 #[cfg(feature = "orderbook")]
 pub mod realistic;

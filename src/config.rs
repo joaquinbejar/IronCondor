@@ -63,6 +63,122 @@ pub enum SlippageModel {
     },
 }
 
+/// How the realistic-mode book seeder sizes a strike's **touch** level — the
+/// resting order placed at the quoted `bid` / `ask` before the geometric decay
+/// fills the deeper levels ([docs/04 §6](../docs/04-execution-models.md)).
+///
+/// Only realistic mode (feature `orderbook`) consumes this; naive mode has no
+/// book. The type is defined unconditionally so [`BacktestConfig`] carries the
+/// profile in every build and the manifest records it identically regardless of
+/// features (reproducibility).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TouchSize {
+    /// Touch size = the quote's own size for that side: `bid_size` for the bid
+    /// touch, `ask_size` for the ask touch. The default — it tracks the actual
+    /// quoted depth.
+    QuotedSize,
+    /// A flat touch size in contracts on both sides, independent of the quote
+    /// (`> 0`). Useful when the feed carries no reliable per-side sizes.
+    Flat {
+        /// The flat touch depth in contracts; must be `> 0`.
+        contracts: u32,
+    },
+}
+
+impl Default for TouchSize {
+    /// The default touch-size function tracks the quoted per-side size.
+    fn default() -> Self {
+        Self::QuotedSize
+    }
+}
+
+/// The default deeper-level count `L` ([docs/04 §6](../docs/04-execution-models.md), `5`).
+const fn default_depth_levels() -> u32 {
+    5
+}
+
+/// The default geometric decay factor `r` ([docs/04 §6](../docs/04-execution-models.md), `0.5`).
+fn default_decay() -> Decimal {
+    // `0.5` as mantissa `5` at scale `1`; no `f64`, no `dec!` (test-only macro).
+    Decimal::new(5, 1)
+}
+
+/// The per-strike liquidity profile that realistic mode seeds each book from
+/// ([docs/04 §6](../docs/04-execution-models.md)).
+///
+/// For every quoted contract the seeder rests a **touch** level at the quoted
+/// `bid` / `ask` (sized by [`TouchSize`]) plus `depth_levels` deeper levels
+/// stepping one `tick_size_cents` away from mid, with a **geometric size decay**
+/// `round(touch_size × decayⁱ)` that terminates the ladder at the first level
+/// rounding to zero. Recorded in the run config (and thus the manifest) so a
+/// seeded book is reproducible. Only realistic mode consumes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiquidityProfile {
+    /// How the touch level is sized (default [`TouchSize::QuotedSize`]).
+    #[serde(default)]
+    pub touch_size: TouchSize,
+    /// `L`: the number of deeper levels seeded on each side beyond the touch,
+    /// stepping one tick at a time away from mid (default `5`, capped at
+    /// [`Self::MAX_DEPTH_LEVELS`]). `0` seeds the touch only.
+    #[serde(default = "default_depth_levels")]
+    pub depth_levels: u32,
+    /// `r`: the geometric size-decay factor applied per level away from the
+    /// touch, in `(0, 1]` (default `0.5`). `1` gives a uniform ladder; smaller
+    /// values thin out the deeper levels faster.
+    #[serde(default = "default_decay")]
+    pub decay: Decimal,
+}
+
+impl Default for LiquidityProfile {
+    /// The documented defaults: quoted-size touch, `L = 5`, `r = 0.5`.
+    fn default() -> Self {
+        Self {
+            touch_size: TouchSize::default(),
+            depth_levels: default_depth_levels(),
+            decay: default_decay(),
+        }
+    }
+}
+
+impl LiquidityProfile {
+    /// Hard cap for [`Self::depth_levels`]: 64 deeper levels per side.
+    pub const MAX_DEPTH_LEVELS: u32 = 64;
+
+    /// Validate the profile: `depth_levels` within its cap, `decay ∈ (0, 1]`,
+    /// and a flat touch size `> 0`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BacktestError::Config`] naming the first rejected field and
+    /// its offending value.
+    #[must_use = "an unvalidated liquidity profile must not reach the seeder"]
+    pub fn validate(&self) -> Result<(), BacktestError> {
+        if self.depth_levels > Self::MAX_DEPTH_LEVELS {
+            return Err(BacktestError::Config(format!(
+                "liquidity_profile.depth_levels = {} exceeds hard cap {}",
+                self.depth_levels,
+                Self::MAX_DEPTH_LEVELS
+            )));
+        }
+        if self.decay <= Decimal::ZERO || self.decay > Decimal::ONE {
+            return Err(BacktestError::Config(format!(
+                "liquidity_profile.decay must be in (0, 1], got {}",
+                self.decay
+            )));
+        }
+        if let TouchSize::Flat { contracts } = self.touch_size
+            && contracts == 0
+        {
+            return Err(BacktestError::Config(
+                "liquidity_profile.touch_size flat contracts must be > 0, got 0".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Named resource ceilings governing every untrusted input surface.
 ///
 /// Each field has a unit, a generous default, and an absolute hard cap —
@@ -232,6 +348,14 @@ pub struct BacktestConfig {
     /// Ignored by naive mode. Defaults to `10`.
     #[serde(default = "default_marketable_cap_ticks")]
     pub marketable_cap_ticks: u32,
+    /// Realistic-mode per-strike book-seeding profile
+    /// ([docs/04 §6](../docs/04-execution-models.md)): the touch-size function,
+    /// the deeper-level count `L`, and the geometric decay `r`. Recorded here
+    /// so a seeded book is reproducible from the manifest. Ignored by naive
+    /// mode. Defaults to the documented profile (quoted-size touch, `L = 5`,
+    /// `r = 0.5`).
+    #[serde(default)]
+    pub liquidity_profile: LiquidityProfile,
     /// Resource ceilings for every untrusted input surface.
     #[serde(default)]
     pub limits: ResourceLimits,
@@ -270,6 +394,7 @@ impl BacktestConfig {
             ));
         }
         self.limits.validate()?;
+        self.liquidity_profile.validate()?;
         if let SlippageModel::SpreadFraction { fraction } = &self.slippage
             && fraction.is_sign_negative()
         {
@@ -300,7 +425,9 @@ impl BacktestConfig {
 mod tests {
     use rust_decimal_macros::dec;
 
-    use super::{BacktestConfig, FeeSchedule, ResourceLimits, SlippageModel};
+    use super::{
+        BacktestConfig, FeeSchedule, LiquidityProfile, ResourceLimits, SlippageModel, TouchSize,
+    };
     use crate::data::DataSourceSpec;
     use crate::domain::ExecutionMode;
     use crate::error::BacktestError;
@@ -322,6 +449,7 @@ mod tests {
                 fraction: dec!(0.5),
             },
             marketable_cap_ticks: 10,
+            liquidity_profile: LiquidityProfile::default(),
             limits: ResourceLimits::default(),
             output_dir: "runs/out".into(),
             overwrite: false,
@@ -422,6 +550,80 @@ mod tests {
         }"#;
         let parsed: Result<BacktestConfig, _> = serde_json::from_str(json);
         assert!(matches!(parsed, Ok(ref c) if c.marketable_cap_ticks == 10));
+    }
+
+    #[test]
+    fn test_liquidity_profile_defaults_match_documented_values() {
+        let profile = LiquidityProfile::default();
+        assert_eq!(profile.touch_size, TouchSize::QuotedSize);
+        assert_eq!(profile.depth_levels, 5);
+        assert_eq!(profile.decay, dec!(0.5));
+    }
+
+    #[test]
+    fn test_config_rejects_depth_levels_over_cap_config_error() {
+        let mut cfg = valid_config();
+        cfg.liquidity_profile.depth_levels = LiquidityProfile::MAX_DEPTH_LEVELS + 1;
+        assert_config_error(cfg.validate(), "depth_levels");
+    }
+
+    #[test]
+    fn test_config_rejects_decay_out_of_range_config_error() {
+        for bad in [dec!(0), dec!(-0.1), dec!(1.5)] {
+            let mut cfg = valid_config();
+            cfg.liquidity_profile.decay = bad;
+            assert_config_error(cfg.validate(), "decay");
+        }
+    }
+
+    #[test]
+    fn test_config_accepts_decay_of_one_uniform_ladder_ok() {
+        // `r = 1` is a valid (uniform-depth) profile: the boundary is inclusive.
+        let mut cfg = valid_config();
+        cfg.liquidity_profile.decay = dec!(1);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_rejects_zero_flat_touch_size_config_error() {
+        let mut cfg = valid_config();
+        cfg.liquidity_profile.touch_size = TouchSize::Flat { contracts: 0 };
+        assert_config_error(cfg.validate(), "flat contracts");
+    }
+
+    #[test]
+    fn test_config_liquidity_profile_defaults_when_absent() {
+        // A config JSON omitting the profile deserialises with the documented
+        // default (quoted-size touch, L = 5, r = 0.5), so old configs stay valid.
+        let json = r#"{
+            "data_source": {"kind": "parquet", "path": "p.parquet", "sha256": ""},
+            "mode": "realistic",
+            "seed": 1,
+            "initial_capital": 1000,
+            "fees": {"per_contract_cents": 0, "per_order_cents": 0},
+            "slippage": {"model": "none"},
+            "output_dir": "out"
+        }"#;
+        let parsed: Result<BacktestConfig, _> = serde_json::from_str(json);
+        assert!(matches!(
+            parsed,
+            Ok(ref c)
+                if c.liquidity_profile == LiquidityProfile::default()
+                && c.liquidity_profile.decay == dec!(0.5)
+        ));
+    }
+
+    #[test]
+    fn test_config_liquidity_profile_flat_touch_round_trips() {
+        let mut cfg = valid_config();
+        cfg.liquidity_profile = LiquidityProfile {
+            touch_size: TouchSize::Flat { contracts: 25 },
+            depth_levels: 3,
+            decay: dec!(0.7),
+        };
+        let json = serde_json::to_string(&cfg).unwrap_or_default();
+        let back: Result<BacktestConfig, _> = serde_json::from_str(&json);
+        assert!(matches!(back, Ok(ref c) if *c == cfg));
     }
 
     #[test]

@@ -17,6 +17,10 @@ use ironcondor::{DataFeed, DataSourceSpec, ParquetFeed, ResourceLimits};
 
 mod common;
 
+#[cfg(feature = "orderbook")]
+#[path = "fixtures/liquidity.rs"]
+mod liquidity_fixture;
+
 const TS0: i64 = 1_750_291_200_000_000_000;
 const NANOS_PER_DAY: i64 = 86_400_000_000_000;
 const EXPIRY: i64 = TS0 + 30 * NANOS_PER_DAY;
@@ -419,4 +423,119 @@ fn test_realistic_marketable_buy_round_trips_two_seeded_levels() {
     assert_eq!(second.quantity.value(), 2);
     assert_eq!(second.fees.value(), 2 * 65); // per-contract only (later fill)
     assert_eq!(first.contract, second.contract);
+}
+
+/// #023 ladder-walk: a marketable buy walks the **auto-seeded** ask ladder
+/// (touch + geometrically-decaying deeper levels) built from the chain snapshot,
+/// filling one `Fill` per level at progressively worse prices. Exercises #022's
+/// multi-level capture through #023's seeded depth via the public API only.
+#[cfg(feature = "orderbook")]
+#[test]
+fn test_realistic_ladder_walk_through_auto_seeded_depth_yields_per_level_fills() {
+    use ironcondor::{
+        ExecutionMode, ExecutionModel, FeeSchedule, Fill, OrderCommand, OrderIntent,
+        PositionAction, PriceCents, Quantity, RealisticFill, TimeInForce,
+    };
+    use optionstratlib::Side;
+
+    // ask_size 8, canonical profile (L=3, r=0.5) → ask ladder 8@500,4@505,2@510,1@515.
+    let snap = liquidity_fixture::snapshot(490, 500, 8, 8);
+    let contract = liquidity_fixture::contract();
+    let mut model = RealisticFill::with_liquidity_profile(
+        FeeSchedule {
+            per_contract_cents: 65,
+            per_order_cents: 100,
+        },
+        10,
+        7,
+        liquidity_fixture::canonical_profile(),
+    );
+
+    // marketable buy for 14 = 8 + 4 + 2 → walks the first three seeded levels.
+    let qty14 = match Quantity::new(14) {
+        Ok(q) => q,
+        Err(e) => panic!("14 is a valid quantity: {e}"),
+    };
+    let buy = OrderCommand::Submit(OrderIntent {
+        contract,
+        action: PositionAction::Open,
+        side: Side::Long,
+        quantity: qty14,
+        limit: None,
+        tif: TimeInForce::Ioc,
+        decision_mid: PriceCents::new(500),
+    });
+    let mut out: Vec<Fill> = Vec::new();
+    let result = model.fill(&[buy], &snap, &mut out);
+    assert!(matches!(result, Ok(())), "the marketable buy must route");
+    assert_eq!(out.len(), 3, "the buy walks three auto-seeded ask levels");
+
+    // per-level: (price, size) queue-behind the touch, then walk deeper.
+    let levels: Vec<(u64, u32)> = out
+        .iter()
+        .map(|f| (f.price.value(), f.quantity.value()))
+        .collect();
+    assert_eq!(levels, vec![(500, 8), (505, 4), (510, 2)]);
+
+    // the once-per-order fee sits on the first level only.
+    let (Some(first), Some(second), Some(third)) = (out.first(), out.get(1), out.get(2)) else {
+        panic!("three fills expected");
+    };
+    assert_eq!(first.fees.value(), 8 * 65 + 100);
+    assert_eq!(second.fees.value(), 4 * 65);
+    assert_eq!(third.fees.value(), 2 * 65);
+    assert!(out.iter().all(|f| f.mode == ExecutionMode::Realistic));
+}
+
+/// #023 determinism: two models seeded from the same snapshot with the same
+/// profile produce **byte-identical** depth — a marketable walk through each
+/// yields the identical per-level `Fill` sequence (price + size + order).
+#[cfg(feature = "orderbook")]
+#[test]
+fn test_realistic_seeding_is_byte_identical_across_two_models() {
+    use ironcondor::{
+        ExecutionModel, FeeSchedule, Fill, OrderCommand, OrderIntent, PositionAction, PriceCents,
+        Quantity, RealisticFill, TimeInForce,
+    };
+    use optionstratlib::Side;
+
+    let fees = FeeSchedule {
+        per_contract_cents: 65,
+        per_order_cents: 100,
+    };
+    let walk = |seed: u64| -> Vec<(u64, u32, i64)> {
+        let snap = liquidity_fixture::snapshot(490, 500, 8, 8);
+        let mut model = RealisticFill::with_liquidity_profile(
+            fees,
+            10,
+            seed,
+            liquidity_fixture::canonical_profile(),
+        );
+        let qty = match Quantity::new(15) {
+            Ok(q) => q,
+            Err(e) => panic!("15 is a valid quantity: {e}"),
+        };
+        let buy = OrderCommand::Submit(OrderIntent {
+            contract: liquidity_fixture::contract(),
+            action: PositionAction::Open,
+            side: Side::Long,
+            quantity: qty,
+            limit: None,
+            tif: TimeInForce::Ioc,
+            decision_mid: PriceCents::new(500),
+        });
+        let mut out: Vec<Fill> = Vec::new();
+        match model.fill(&[buy], &snap, &mut out) {
+            Ok(()) => {}
+            Err(e) => panic!("the marketable buy must route: {e}"),
+        }
+        out.iter()
+            .map(|f| (f.price.value(), f.quantity.value(), f.fees.value()))
+            .collect()
+    };
+
+    // Identical seed ⇒ identical seeded depth ⇒ identical walk.
+    assert_eq!(walk(7), walk(7));
+    // The seed does not perturb the (deterministic) ladder, either.
+    assert_eq!(walk(7), walk(99));
 }
