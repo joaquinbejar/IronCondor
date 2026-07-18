@@ -10,6 +10,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `SimClock` (`src/engine/clock.rs`): the deterministic, no-wall-clock time
+  source the replay loop advances — `advance_to` rejects a duplicate or
+  reversed timestamp as `DataOutOfOrder` (gaps preserved, never reordered);
+  and the conceptual `Event` model (`Snapshot`/`Decision`/`Fill`)
+  documenting the canonical per-step order with exits strictly before
+  entries; `clock_monotonic` property test (#5).
+
 - Market-data types: `InstrumentSpec` (validated `> 0` tick size and
   contract multiplier — the single authoritative cents↔ticks / scaling
   source), `QuoteView` (per-contract unit Greeks in native `optionstratlib`
