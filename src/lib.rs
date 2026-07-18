@@ -101,6 +101,7 @@ pub use domain::{
 pub use engine::{
     BacktestEngine, BacktestRun, ChainContext, ConfigOverride, Event, Ledger, OptStratAdapter,
     PositionMark, PositionableStrategy, ScenarioParams, ScenarioType, SimClock, Strategy,
+    UnitGreeks,
 };
 pub use error::BacktestError;
 #[cfg(feature = "orderbook")]
