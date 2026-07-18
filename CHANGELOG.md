@@ -10,6 +10,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `IronCondor` wired as the single v0.1 strategy: `StrategySpec` /
+  `IronCondorSpec` (the manifest's strategy kind + parameters, money in
+  integer cents, analytics `Decimal`) and `OptStratAdapter::from_spec`
+  constructing the upstream `IronCondor` via its 17-arg `new` and mapping
+  `StrategyError` to `BacktestError::Strategy` at the one construction seam.
+  The four-leg condor entry emits four `Open` intents in one step, sourcing
+  each `decision_mid` from the snapshot quote (never a repriced strategy), so
+  the dormant upstream wall-clock reprice stays dormant. `ShortStrangle` is
+  not wired (deferred to v0.2) (#11).
+
 - The engine-facing `Strategy` seam (`src/engine/strategy.rs`): the `Strategy`
   trait (`on_start` / `exits` / `on_snapshot` / `on_end`, each appending into a
   caller-owned `&mut Vec<OrderCommand>` so PB-1 is satisfiable by the
