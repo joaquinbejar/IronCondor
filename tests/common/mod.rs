@@ -13,9 +13,9 @@ use arrow::datatypes::{DataType, Field, Schema};
 use parquet::arrow::ArrowWriter;
 
 use ironcondor::{
-    BacktestConfig, BacktestEngine, BacktestRun, DataSourceSpec, ExecutionMode, FeeSchedule,
-    IronCondorSpec, NaiveFill, OptStratAdapter, ParquetFeed, PriceCents, Quantity, ResourceLimits,
-    SlippageModel, StrategySpec, Underlying,
+    BacktestConfig, BacktestEngine, BacktestRun, CsvFeed, DataSourceSpec, ExecutionMode,
+    FeeSchedule, IronCondorSpec, NaiveFill, OptStratAdapter, ParquetFeed, PriceCents, Quantity,
+    ResourceLimits, SlippageModel, StrategySpec, Underlying,
 };
 use optionstratlib::ExpirationDate;
 use optionstratlib::simulation::ExitPolicy;
@@ -140,6 +140,39 @@ pub fn write_parquet(path: &Path, rows: &[Row]) -> Result<(), String> {
     Ok(())
 }
 
+/// The canonical CSV header for the historical feed, matching [`schema`] and
+/// the integer-cents [`write_parquet`] values column-for-column.
+pub const CSV_HEADER: &str = "ts,underlying,underlying_price,tick_size,contract_multiplier,\
+    expiration,strike,style,bid,ask,bid_size,ask_size,implied_volatility,delta,gamma,theta,vega";
+
+/// Write a directory of per-step CSV chain files from canonical `rows`, one file
+/// per distinct step (`step_{step:05}.csv`, so the name sort matches the step
+/// order), with the SAME snapshot-level values [`write_parquet`] encodes (SPX /
+/// 500000 spot / 5c tick / 100x / [`EXPIRY`] / size 50 / iv 0.2 / greeks). This
+/// lets the same logical chain be built as both CSV and Parquet for a
+/// feed-parity assertion.
+pub fn write_csv_dir(dir: &Path, rows: &[Row]) -> Result<(), String> {
+    use std::collections::BTreeMap;
+
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let mut by_step: BTreeMap<i32, Vec<Row>> = BTreeMap::new();
+    for row in rows {
+        by_step.entry(row.0).or_default().push(*row);
+    }
+    for (step, step_rows) in by_step {
+        let mut out = String::from(CSV_HEADER);
+        for (_step, ts, strike, style, bid, ask) in step_rows {
+            out.push('\n');
+            out.push_str(&format!(
+                "{ts},SPX,500000,5,100,{EXPIRY},{strike},{style},{bid},{ask},50,50,0.2,0.3,0.01,-0.05,0.1"
+            ));
+        }
+        let name = format!("step_{step:05}.csv");
+        std::fs::write(dir.join(name), out).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 /// A `PriceCents` helper for the spec.
 fn cents(value: u64) -> PriceCents {
     PriceCents::new(value)
@@ -204,6 +237,23 @@ pub fn run_condor(path: &Path, seed: u64) -> Result<BacktestRun, String> {
     let feed = ParquetFeed::open(path, &ResourceLimits::default()).map_err(|e| e.to_string())?;
     // TimeSteps(1_000_000) never fires on a small tape, so exits stays empty and
     // on_end performs the single clean close of every leg at the terminal step.
+    let exit = ExitPolicy::TimeSteps(1_000_000);
+    let adapter = OptStratAdapter::<IronCondor>::from_spec(&iron_condor_spec(), exit)
+        .map_err(|e| e.to_string())?;
+    let execution = NaiveFill::new(config.slippage.clone(), config.fees);
+    BacktestEngine::run(&config, feed, execution, adapter, "iron_condor").map_err(|e| e.to_string())
+}
+
+/// Open `dir` as a [`CsvFeed`] (records a `DataSourceSpec::Csv` provenance),
+/// wrap the iron condor with a non-triggering exit policy, and run to
+/// completion — the CSV analogue of [`run_condor`].
+pub fn run_condor_csv(dir: &Path, seed: u64) -> Result<BacktestRun, String> {
+    let mut config = condor_config(dir, seed);
+    config.data_source = DataSourceSpec::Csv {
+        path: dir.display().to_string(),
+        sha256: String::new(),
+    };
+    let feed = CsvFeed::open(dir, &ResourceLimits::default()).map_err(|e| e.to_string())?;
     let exit = ExitPolicy::TimeSteps(1_000_000);
     let adapter = OptStratAdapter::<IronCondor>::from_spec(&iron_condor_spec(), exit)
         .map_err(|e| e.to_string())?;

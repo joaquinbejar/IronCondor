@@ -32,7 +32,7 @@ mod common;
 #[path = "fixtures/adversarial/mod.rs"]
 mod adversarial;
 
-use ironcondor::{BacktestError, ParquetFeed, ResourceLimits};
+use ironcondor::{BacktestError, CsvFeed, ParquetFeed, ResourceLimits};
 
 /// Crossed quote → the specific typed `CrossedQuote` variant the conversion
 /// core raises (§12.1 groups it under `Conversion`).
@@ -196,6 +196,132 @@ fn test_security_over_max_total_bytes_yields_tape_too_large() {
     };
     assert!(matches!(
         ParquetFeed::open(&path, &limits),
+        Err(BacktestError::TapeTooLarge {
+            limit: "max_total_bytes",
+            ..
+        })
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// CSV feed adversarial fixtures (issue #27) — each asserts a typed error and a
+// bounded ceiling through `CsvFeed::open`, never a panic / hang / OOM.
+// ---------------------------------------------------------------------------
+
+/// CSV crossed quote → the specific typed `CrossedQuote` variant.
+#[test]
+fn test_security_csv_crossed_quote_yields_crossed_quote() {
+    let Ok((_dir, path)) = adversarial::csv_crossed_quote() else {
+        panic!("csv crossed-quote fixture must build");
+    };
+    assert!(matches!(
+        CsvFeed::open(&path, &ResourceLimits::default()),
+        Err(BacktestError::CrossedQuote { .. })
+    ));
+}
+
+/// CSV negative strike → `Conversion` (unsigned integer-cents sign rejection).
+#[test]
+fn test_security_csv_negative_strike_yields_conversion() {
+    let Ok((_dir, path)) = adversarial::csv_negative_strike() else {
+        panic!("csv negative-strike fixture must build");
+    };
+    assert!(matches!(
+        CsvFeed::open(&path, &ResourceLimits::default()),
+        Err(BacktestError::Conversion(_))
+    ));
+}
+
+/// CSV zero strike → `Conversion` (non-positive strike rejected by the core).
+#[test]
+fn test_security_csv_zero_strike_yields_conversion() {
+    let Ok((_dir, path)) = adversarial::csv_zero_strike() else {
+        panic!("csv zero-strike fixture must build");
+    };
+    assert!(matches!(
+        CsvFeed::open(&path, &ResourceLimits::default()),
+        Err(BacktestError::Conversion(_))
+    ));
+}
+
+/// CSV NaN analytic → `Conversion` (non-finite analytic rejected by the core).
+#[test]
+fn test_security_csv_nan_analytic_yields_conversion() {
+    let Ok((_dir, path)) = adversarial::csv_nan_analytic() else {
+        panic!("csv nan-analytic fixture must build");
+    };
+    assert!(matches!(
+        CsvFeed::open(&path, &ResourceLimits::default()),
+        Err(BacktestError::Conversion(_))
+    ));
+}
+
+/// CSV dollar-float money → `Conversion` (money is integer cents on disk).
+#[test]
+fn test_security_csv_dollar_float_money_yields_conversion() {
+    let Ok((_dir, path)) = adversarial::csv_dollar_float_money() else {
+        panic!("csv dollar-float fixture must build");
+    };
+    assert!(matches!(
+        CsvFeed::open(&path, &ResourceLimits::default()),
+        Err(BacktestError::Conversion(_))
+    ));
+}
+
+/// Oversized CSV directory (3 files) + low `max_steps` →
+/// `TapeTooLarge { max_steps }`, cut off before the tape grows past the cap.
+#[test]
+fn test_security_csv_oversized_steps_yields_tape_too_large() {
+    let Ok((_dir, path)) = adversarial::csv_oversized_steps() else {
+        panic!("csv oversized-steps fixture must build");
+    };
+    let limits = ResourceLimits {
+        max_steps: 2,
+        ..ResourceLimits::default()
+    };
+    assert!(matches!(
+        CsvFeed::open(&path, &limits),
+        Err(BacktestError::TapeTooLarge {
+            limit: "max_steps",
+            ..
+        })
+    ));
+}
+
+/// Well-formed CSV directory + a 1-byte `max_file_bytes` →
+/// `TapeTooLarge { max_file_bytes }`, cut off from the filesystem metadata
+/// before any byte is read.
+#[test]
+fn test_security_csv_over_max_file_bytes_yields_tape_too_large() {
+    let Ok((_dir, path)) = adversarial::csv_well_formed() else {
+        panic!("csv well-formed fixture must build");
+    };
+    let limits = ResourceLimits {
+        max_file_bytes: 1,
+        ..ResourceLimits::default()
+    };
+    assert!(matches!(
+        CsvFeed::open(&path, &limits),
+        Err(BacktestError::TapeTooLarge {
+            limit: "max_file_bytes",
+            ..
+        })
+    ));
+}
+
+/// Well-formed CSV directory + a 1-byte `max_total_bytes` →
+/// `TapeTooLarge { max_total_bytes }`, cut off before the tape grows.
+#[test]
+fn test_security_csv_over_max_total_bytes_yields_tape_too_large() {
+    let Ok((_dir, path)) = adversarial::csv_well_formed() else {
+        panic!("csv well-formed fixture must build");
+    };
+    let limits = ResourceLimits {
+        max_total_bytes: 1,
+        ..ResourceLimits::default()
+    };
+    assert!(matches!(
+        CsvFeed::open(&path, &limits),
         Err(BacktestError::TapeTooLarge {
             limit: "max_total_bytes",
             ..

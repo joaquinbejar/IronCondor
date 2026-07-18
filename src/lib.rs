@@ -89,7 +89,7 @@ pub use config::{
     BacktestConfig, FeeSchedule, LiquidityProfile, ResourceLimits, SlippageModel, TouchSize,
 };
 pub use data::{
-    DataFeed, DataSourceSpec, FeedKind, ParquetFeed, RawQuote, SnapshotMeta, TapeMeta,
+    CsvFeed, DataFeed, DataSourceSpec, FeedKind, ParquetFeed, RawQuote, SnapshotMeta, TapeMeta,
     feed_catalogue, raw_quotes_to_snapshot, snapshot_to_option_chain,
 };
 pub use domain::{

@@ -13,7 +13,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use parquet::arrow::ArrowWriter;
 use sha2::{Digest, Sha256};
 
-use ironcondor::{DataFeed, DataSourceSpec, ParquetFeed, ResourceLimits};
+use ironcondor::{CsvFeed, DataFeed, DataSourceSpec, ParquetFeed, ResourceLimits};
 
 mod common;
 
@@ -174,6 +174,102 @@ fn test_parquet_feed_drives_ordered_tape_to_exhaustion_with_verified_identity() 
     assert_eq!(count, 3, "three steps materialise into three snapshots");
     // Exhaustion is sticky.
     assert!(matches!(feed.next(), Ok(None)));
+}
+
+#[test]
+fn test_csv_feed_matches_parquet_for_the_same_logical_data() {
+    // The same logical chain written as BOTH a Parquet file and a directory of
+    // per-step CSV files must yield byte-identical `ChainSnapshot`s — the CSV
+    // acceptance criterion (docs/03 §4, #27).
+    let Ok(dir) = tempfile::tempdir() else {
+        panic!("tempdir must create");
+    };
+    let rows = common::condor_rows(3, None);
+    let parquet_path = dir.path().join("chain.parquet");
+    if let Err(e) = common::write_parquet(&parquet_path, &rows) {
+        panic!("the parquet fixture must write: {e}");
+    }
+    let csv_dir = dir.path().join("csv");
+    if let Err(e) = common::write_csv_dir(&csv_dir, &rows) {
+        panic!("the csv fixture must write: {e}");
+    }
+
+    let (Ok(mut parquet), Ok(mut csv)) = (
+        ParquetFeed::open(&parquet_path, &ResourceLimits::default()),
+        CsvFeed::open(&csv_dir, &ResourceLimits::default()),
+    ) else {
+        panic!("both feeds over the same logical data must open");
+    };
+
+    let mut count = 0u32;
+    loop {
+        match (parquet.next(), csv.next()) {
+            (Ok(Some(p)), Ok(Some(c))) => {
+                assert_eq!(p, c, "the CSV snapshot must equal the Parquet snapshot");
+                count += 1;
+            }
+            (Ok(None), Ok(None)) => break,
+            other => panic!("the two feeds diverged in length or errored: {other:?}"),
+        }
+    }
+    assert_eq!(count, 3, "three steps in both feeds");
+}
+
+#[test]
+fn test_csv_feed_runs_end_to_end_to_equity_curve() {
+    // A CSV directory drives the full replay loop to a non-empty equity curve.
+    let Ok(dir) = tempfile::tempdir() else {
+        panic!("tempdir must create");
+    };
+    let csv_dir = dir.path().join("csv");
+    let rows = common::condor_rows(3, None);
+    if let Err(e) = common::write_csv_dir(&csv_dir, &rows) {
+        panic!("the csv fixture must write: {e}");
+    }
+    let Ok(run) = common::run_condor_csv(&csv_dir, 42) else {
+        panic!("the CSV-sourced iron-condor run must complete");
+    };
+    assert!(
+        !run.equity_curve.is_empty(),
+        "the CSV run must produce an equity curve"
+    );
+}
+
+#[test]
+fn test_csv_committed_fixtures_open_and_replay_in_order() {
+    // The committed CSV chain fixtures ship with the loader and must parse,
+    // ordering strictly by ts across their name-sorted files.
+    for (name, expected_steps) in [
+        ("normal", 3u32),
+        ("wide_spreads", 2),
+        ("missing_strikes", 2),
+        ("0dte", 2),
+    ] {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/csv")
+            .join(name);
+        let Ok(mut feed) = CsvFeed::open(&dir, &ResourceLimits::default()) else {
+            panic!("committed CSV fixture {name} must open");
+        };
+        assert_eq!(feed.tape_meta().data_identity.len(), 64);
+        let mut count = 0u32;
+        let mut prev_ts = i64::MIN;
+        loop {
+            match feed.next() {
+                Ok(Some(snap)) => {
+                    assert!(
+                        snap.ts.value() > prev_ts,
+                        "ts must strictly increase in fixture {name}"
+                    );
+                    prev_ts = snap.ts.value();
+                    count += 1;
+                }
+                Ok(None) => break,
+                Err(e) => panic!("committed fixture {name} must yield Ok until exhaustion: {e}"),
+            }
+        }
+        assert_eq!(count, expected_steps, "step count for fixture {name}");
+    }
 }
 
 #[test]
