@@ -10,6 +10,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The v0.1 end-to-end slice is complete: `run_backtest`
+  (`src/run.rs`) — a top-level composition root above both engine and
+  analytics — ties `ParquetFeed` + `IronCondor` + `NaiveFill` + the ledger +
+  metrics into "Parquet chain in, equity curve out", the v0.1 acceptance
+  headline (#16).
+- Minimal summary metrics (`src/analytics/metrics.rs`): per-step Sharpe,
+  volatility, and total return, plus max drawdown as a ratio and a
+  peak-to-trough cents magnitude — computed from the ledger's `EquityPoint`
+  series and populated into the upstream
+  `optionstratlib::backtesting::BacktestResult`
+  (`general_performance`, `drawdown_analysis`, and `custom_metrics` for the
+  cents magnitude), inventing no parallel result type. Per-Greek attribution,
+  `manifest.json`, the four-table bundle, and the full trade/risk statistics
+  remain v0.3 — their upstream structs are left defaulted with a doc note
+  (#16).
+
 - Mark-to-market ledger enrichment (`src/engine/ledger.rs`): `stale_mark`
   tracking via the engine-owned `PositionMark { position_id, mark, stale }`
   scratch (a held leg absent from a step carries its last-known mark and is

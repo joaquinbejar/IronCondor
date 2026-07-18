@@ -83,6 +83,7 @@ pub mod error;
 pub mod execution;
 #[cfg(feature = "python")]
 pub mod python;
+pub mod run;
 
 pub use config::{BacktestConfig, FeeSchedule, ResourceLimits, SlippageModel};
 pub use data::{
@@ -101,6 +102,7 @@ pub use engine::{
 };
 pub use error::BacktestError;
 pub use execution::{ExecutionModel, NaiveFill};
+pub use run::run_backtest;
 
 /// The migrated OptionChain-Simulator session surface (feature `simulator`):
 /// the async [`data::simulator::ApiClient`] and the bug-fixed
