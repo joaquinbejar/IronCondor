@@ -26,5 +26,5 @@ pub use execution::{
 pub use market::{ChainSnapshot, InstrumentSpec, QuoteView};
 pub use money::{Cents, PriceCents, Quantity, Ticks};
 pub use result::EquityPoint;
-pub use strategy_spec::{IronCondorSpec, StrategySpec};
+pub use strategy_spec::{IronCondorSpec, ShortStrangleSpec, StrategySpec};
 pub use time::{SimTime, StepIndex};

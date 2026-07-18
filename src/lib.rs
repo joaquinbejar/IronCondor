@@ -95,8 +95,8 @@ pub use data::{
 pub use domain::{
     Cents, ChainSnapshot, ContractKey, EquityPoint, ExecutionMode, Fill, InstrumentSpec,
     IronCondorSpec, OpenPosition, OrderCommand, OrderId, OrderIntent, PendingOrder, PositionAction,
-    PositionId, PriceCents, Quantity, QuoteView, SimTime, StepIndex, StrategySpec, Ticks,
-    TimeInForce, TradeId, Underlying,
+    PositionId, PriceCents, Quantity, QuoteView, ShortStrangleSpec, SimTime, StepIndex,
+    StrategySpec, Ticks, TimeInForce, TradeId, Underlying,
 };
 pub use engine::{
     BacktestEngine, BacktestRun, ChainContext, ConfigOverride, Event, Ledger, OptStratAdapter,

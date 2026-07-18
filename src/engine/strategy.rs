@@ -39,13 +39,13 @@ use optionstratlib::Side;
 use optionstratlib::prelude::Positive;
 use optionstratlib::simulation::{ExitPolicy, check_exit_policy};
 use optionstratlib::strategies::base::{Optimizable, Positionable};
-use optionstratlib::strategies::{IronCondor, Strategies};
+use optionstratlib::strategies::{IronCondor, ShortStrangle, Strategies};
 
 use crate::data::convert::{positive_from_price, snapshot_to_option_chain};
 use crate::domain::{
     ChainSnapshot, ContractKey, IronCondorSpec, OpenPosition, OrderCommand, OrderId, OrderIntent,
-    PendingOrder, PositionAction, PriceCents, Quantity, SimTime, StepIndex, StrategySpec,
-    TimeInForce,
+    PendingOrder, PositionAction, PriceCents, Quantity, ShortStrangleSpec, SimTime, StepIndex,
+    StrategySpec, TimeInForce,
 };
 use crate::error::BacktestError;
 
@@ -365,13 +365,17 @@ impl OptStratAdapter<IronCondor> {
     /// Build an iron-condor adapter from a [`StrategySpec`] and the
     /// [`ExitPolicy`] the adapter evaluates each step.
     ///
-    /// This is the **single** `StrategySpec → optionstratlib` construction
-    /// path for v0.1: it converts the spec's integer-cents money into
-    /// `Positive` dollars, calls the 17-argument `IronCondor::new`
+    /// This is the `StrategySpec → optionstratlib` construction path for the
+    /// iron condor: it converts the spec's integer-cents money into `Positive`
+    /// dollars, calls the 17-argument `IronCondor::new`
     /// ([specs/optionstratlib.md §3](../../../docs/specs/optionstratlib.md#3-strategy-types-and-traits)),
-    /// and wraps the result in [`OptStratAdapter::new`]. The v0.1 [`StrategySpec`]
-    /// has exactly one kind ([`StrategySpec::IronCondor`]), so the match is
-    /// currently total on that arm; a `ShortStrangle` arm is v0.2.
+    /// and wraps the result in [`OptStratAdapter::new`]. It is **kind-checked**:
+    /// this constructor builds an `OptStratAdapter<IronCondor>`, so a
+    /// [`StrategySpec::ShortStrangle`] is a caller error and returns
+    /// [`BacktestError::Strategy`] pointing at
+    /// [`OptStratAdapter::<ShortStrangle>::from_spec`] — never a silent wrong
+    /// build. The match stays exhaustive, so a future third strategy forces this
+    /// arm to be revisited.
     ///
     /// # Determinism
     ///
@@ -385,12 +389,58 @@ impl OptStratAdapter<IronCondor> {
     /// # Errors
     ///
     /// Returns [`BacktestError::Strategy`] when the upstream constructor
-    /// rejects the parameters or a volatility/yield is not a valid `Positive`,
-    /// and [`BacktestError::Conversion`] when a cents → `Positive` money
-    /// conversion fails.
+    /// rejects the parameters, a volatility/yield is not a valid `Positive`, or
+    /// the spec is not an [`StrategySpec::IronCondor`], and
+    /// [`BacktestError::Conversion`] when a cents → `Positive` money conversion
+    /// fails.
     pub fn from_spec(spec: &StrategySpec, exit: ExitPolicy) -> Result<Self, BacktestError> {
         match spec {
             StrategySpec::IronCondor(inner) => Ok(Self::new(build_iron_condor(inner)?, exit)),
+            StrategySpec::ShortStrangle(_) => Err(BacktestError::Strategy(format!(
+                "OptStratAdapter::<IronCondor>::from_spec received a {} spec; \
+                 build it with OptStratAdapter::<ShortStrangle>::from_spec",
+                spec.kind()
+            ))),
+        }
+    }
+}
+
+impl OptStratAdapter<ShortStrangle> {
+    /// Build a short-strangle adapter from a [`StrategySpec`] and the
+    /// [`ExitPolicy`] the adapter evaluates each step.
+    ///
+    /// The **v0.2 second strategy**, wired through the **unchanged** generic
+    /// [`OptStratAdapter`] and [`Strategy`] impl — the whole point of #28. It
+    /// mirrors [`OptStratAdapter::<IronCondor>::from_spec`]: convert the spec's
+    /// integer-cents money into `Positive` dollars, call the 16-argument
+    /// `ShortStrangle::new` (a two-leg short OTM call + short OTM put, with a
+    /// per-leg IV and per-leg open/close fees,
+    /// [specs/optionstratlib.md §3](../../../docs/specs/optionstratlib.md#3-strategy-types-and-traits)),
+    /// and wrap the result in [`OptStratAdapter::new`]. It is kind-checked: a
+    /// [`StrategySpec::IronCondor`] returns [`BacktestError::Strategy`] pointing
+    /// at [`OptStratAdapter::<IronCondor>::from_spec`].
+    ///
+    /// # Determinism
+    ///
+    /// A pure function of the spec — no wall-clock, no RNG. (`ShortStrangle::new`
+    /// timestamps its `Position`s with `Utc::now()`, but that date is never read
+    /// by [`Strategy::exits`] or the entry path, exactly as for the iron condor.)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BacktestError::Strategy`] when the upstream constructor
+    /// rejects the parameters, a volatility/yield is not a valid `Positive`, or
+    /// the spec is not an [`StrategySpec::ShortStrangle`], and
+    /// [`BacktestError::Conversion`] when a cents → `Positive` money conversion
+    /// fails.
+    pub fn from_spec(spec: &StrategySpec, exit: ExitPolicy) -> Result<Self, BacktestError> {
+        match spec {
+            StrategySpec::ShortStrangle(inner) => Ok(Self::new(build_short_strangle(inner)?, exit)),
+            StrategySpec::IronCondor(_) => Err(BacktestError::Strategy(format!(
+                "OptStratAdapter::<ShortStrangle>::from_spec received a {} spec; \
+                 build it with OptStratAdapter::<IronCondor>::from_spec",
+                spec.kind()
+            ))),
         }
     }
 }
@@ -413,18 +463,17 @@ fn positive_dollars(price: PriceCents) -> Result<Positive, BacktestError> {
 }
 
 /// Validate an analytic `Decimal` (volatility, dividend yield) into a
-/// `Positive` at the strategy-construction seam.
+/// `Positive` at the strategy-construction seam. `field` is the fully-qualified
+/// field name (e.g. `"iron condor implied volatility"`), so the message is
+/// strategy-agnostic and reusable across strategy constructors.
 ///
 /// # Errors
 ///
 /// Returns [`BacktestError::Strategy`] if `value` is negative (a `Positive`
 /// wraps a non-negative `Decimal`).
 fn positive_rate(value: Decimal, field: &str) -> Result<Positive, BacktestError> {
-    Positive::new_decimal(value).map_err(|e| {
-        BacktestError::Strategy(format!(
-            "iron condor {field} {value} must be non-negative: {e}"
-        ))
-    })
+    Positive::new_decimal(value)
+        .map_err(|e| BacktestError::Strategy(format!("{field} {value} must be non-negative: {e}")))
 }
 
 /// Build an `optionstratlib::strategies::IronCondor` from its
@@ -453,9 +502,9 @@ fn build_iron_condor(spec: &IronCondorSpec) -> Result<IronCondor, BacktestError>
         positive_dollars(spec.long_call_strike)?,
         positive_dollars(spec.long_put_strike)?,
         spec.expiration,
-        positive_rate(spec.implied_volatility, "implied volatility")?,
+        positive_rate(spec.implied_volatility, "iron condor implied volatility")?,
         spec.risk_free_rate,
-        positive_rate(spec.dividend_yield, "dividend yield")?,
+        positive_rate(spec.dividend_yield, "iron condor dividend yield")?,
         quantity,
         positive_dollars(spec.premium_short_call)?,
         positive_dollars(spec.premium_short_put)?,
@@ -465,6 +514,56 @@ fn build_iron_condor(spec: &IronCondorSpec) -> Result<IronCondor, BacktestError>
         positive_dollars(spec.close_fee)?,
     )
     .map_err(|e| BacktestError::Strategy(format!("iron condor construction rejected: {e}")))
+}
+
+/// Build an `optionstratlib::strategies::ShortStrangle` from its
+/// [`ShortStrangleSpec`], converting integer-cents money into `Positive`
+/// dollars and mapping the upstream `StrategyError` into
+/// [`BacktestError::Strategy`] — the short-strangle analogue of
+/// [`build_iron_condor`], and the one short-strangle construction conversion
+/// place.
+///
+/// The argument order and units follow `ShortStrangle::new` **exactly**: a
+/// short OTM call + short OTM put, with a per-leg implied volatility and per-leg
+/// open/close fees.
+///
+/// # Errors
+///
+/// Returns [`BacktestError::Strategy`] if `ShortStrangle::new` rejects the
+/// parameters or a volatility/yield/quantity is not a valid `Positive`, and
+/// [`BacktestError::Conversion`] if a cents → `Positive` money conversion fails.
+fn build_short_strangle(spec: &ShortStrangleSpec) -> Result<ShortStrangle, BacktestError> {
+    let quantity = Positive::new_decimal(Decimal::from(spec.quantity.value())).map_err(|e| {
+        BacktestError::Strategy(format!(
+            "short strangle quantity {} is invalid: {e}",
+            spec.quantity.value()
+        ))
+    })?;
+    ShortStrangle::new(
+        spec.underlying.as_str().to_string(),
+        positive_dollars(spec.underlying_price)?,
+        positive_dollars(spec.call_strike)?,
+        positive_dollars(spec.put_strike)?,
+        spec.expiration,
+        positive_rate(
+            spec.call_implied_volatility,
+            "short strangle call implied volatility",
+        )?,
+        positive_rate(
+            spec.put_implied_volatility,
+            "short strangle put implied volatility",
+        )?,
+        spec.risk_free_rate,
+        positive_rate(spec.dividend_yield, "short strangle dividend yield")?,
+        quantity,
+        positive_dollars(spec.premium_short_call)?,
+        positive_dollars(spec.premium_short_put)?,
+        positive_dollars(spec.open_fee_short_call)?,
+        positive_dollars(spec.close_fee_short_call)?,
+        positive_dollars(spec.open_fee_short_put)?,
+        positive_dollars(spec.close_fee_short_put)?,
+    )
+    .map_err(|e| BacktestError::Strategy(format!("short strangle construction rejected: {e}")))
 }
 
 impl<S: PositionableStrategy> Strategy for OptStratAdapter<S> {
@@ -730,7 +829,7 @@ mod tests {
     use crate::domain::{
         ChainSnapshot, ContractKey, InstrumentSpec, IronCondorSpec, OpenPosition, OrderCommand,
         OrderId, OrderIntent, PendingOrder, PositionAction, PositionId, PriceCents, Quantity,
-        QuoteView, SimTime, StepIndex, StrategySpec, Underlying,
+        QuoteView, ShortStrangleSpec, SimTime, StepIndex, StrategySpec, Underlying,
     };
     use crate::error::BacktestError;
 
@@ -930,6 +1029,90 @@ mod tests {
         ]
     }
 
+    // --- ShortStrangle fixtures (the v0.2 second strategy, #28) -------------
+
+    /// A real `ShortStrangle`: short call 5200, short put 4800, underlying 5000
+    /// — both OTM legs quoted in the shared [`snapshot`] fixture.
+    fn short_strangle() -> ShortStrangle {
+        let Ok(strangle) = ShortStrangle::new(
+            "SPX".to_string(),
+            pos(dec!(5000)),
+            pos(dec!(5200)), // short call strike (OTM, above spot)
+            pos(dec!(4800)), // short put strike (OTM, below spot)
+            ExpirationDate::DateTime(DateTime::from_timestamp_nanos(EXP_NS)),
+            pos(dec!(0.20)), // call implied volatility
+            pos(dec!(0.20)), // put implied volatility
+            dec!(0.05),
+            Positive::ZERO,
+            pos(dec!(1)),
+            pos(dec!(8)),    // premium short call
+            pos(dec!(7)),    // premium short put
+            pos(dec!(0.65)), // open fee short call
+            pos(dec!(0.65)), // close fee short call
+            pos(dec!(0.65)), // open fee short put
+            pos(dec!(0.65)), // close fee short put
+        ) else {
+            panic!("valid short strangle construction");
+        };
+        strangle
+    }
+
+    fn strangle_adapter(exit: ExitPolicy) -> OptStratAdapter<ShortStrangle> {
+        OptStratAdapter::new(short_strangle(), exit)
+    }
+
+    /// A [`StrategySpec`] whose ShortStrangle strikes match the [`snapshot`]
+    /// quotes (cents): short call 5200, short put 4800.
+    fn short_strangle_spec() -> StrategySpec {
+        StrategySpec::ShortStrangle(ShortStrangleSpec {
+            underlying: und(),
+            underlying_price: PriceCents::new(500_000),
+            call_strike: PriceCents::new(520_000),
+            put_strike: PriceCents::new(480_000),
+            expiration: ExpirationDate::DateTime(DateTime::from_timestamp_nanos(EXP_NS)),
+            call_implied_volatility: dec!(0.20),
+            put_implied_volatility: dec!(0.20),
+            risk_free_rate: dec!(0.05),
+            dividend_yield: Decimal::ZERO,
+            quantity: qty(1),
+            premium_short_call: PriceCents::new(800),
+            premium_short_put: PriceCents::new(700),
+            open_fee_short_call: PriceCents::new(65),
+            close_fee_short_call: PriceCents::new(65),
+            open_fee_short_put: PriceCents::new(65),
+            close_fee_short_put: PriceCents::new(65),
+        })
+    }
+
+    /// Build the short-strangle adapter through the `StrategySpec → ShortStrangle`
+    /// seam.
+    fn strangle_adapter_from_spec(
+        exit: ExitPolicy,
+    ) -> Result<OptStratAdapter<ShortStrangle>, BacktestError> {
+        OptStratAdapter::<ShortStrangle>::from_spec(&short_strangle_spec(), exit)
+    }
+
+    /// The two open legs the engine would hold after a short-strangle entry,
+    /// both short, with matching contracts and per-contract entry premia (cents).
+    fn strangle_open_legs() -> Vec<OpenPosition> {
+        vec![
+            OpenPosition {
+                position_id: PositionId::new(1),
+                contract: key(520_000, OptionStyle::Call),
+                side: Side::Short,
+                quantity: qty(1),
+                entry_premium: PriceCents::new(800),
+            },
+            OpenPosition {
+                position_id: PositionId::new(2),
+                contract: key(480_000, OptionStyle::Put),
+                side: Side::Short,
+                quantity: qty(1),
+                entry_premium: PriceCents::new(700),
+            },
+        ]
+    }
+
     fn is_open(cmd: &OrderCommand) -> bool {
         matches!(
             cmd,
@@ -988,6 +1171,169 @@ mod tests {
         out.clear();
         assert!(matches!(adapter.on_snapshot(&mut ctx, &mut out), Ok(())));
         assert!(out.is_empty(), "entered flag prevents a second entry");
+    }
+
+    // --- ShortStrangle through the SAME seam (issue #28) --------------------
+
+    #[test]
+    fn test_short_strangle_on_snapshot_opens_two_legs_through_same_seam() {
+        // A ShortStrangle wrapped in the SAME generic OptStratAdapter, driven
+        // through the SAME Strategy::on_snapshot seam as IronCondor — no
+        // strategy-specific branch. A two-leg strategy emits two opens.
+        let mut rng = ChaCha8Rng::seed_from_u64(30);
+        let snap = snapshot(0);
+        let mut ctx = ChainContext {
+            snapshot: &snap,
+            open: &[],
+            pending: &[],
+            rng: &mut rng,
+            step: StepIndex::new(0),
+        };
+        let mut adapter = strangle_adapter(ExitPolicy::Expiration);
+        let mut out = Vec::new();
+        assert!(matches!(adapter.on_snapshot(&mut ctx, &mut out), Ok(())));
+        assert_eq!(out.len(), 2, "one open per strangle leg (short call + put)");
+        assert!(out.iter().all(is_open), "on_snapshot appends opens only");
+        assert!(adapter.has_entered());
+    }
+
+    #[test]
+    fn test_short_strangle_second_on_snapshot_is_noop_via_entered_guard() {
+        // The one-shot entry guard is the generic adapter's, not IronCondor's —
+        // it holds identically for the strangle.
+        let mut rng = ChaCha8Rng::seed_from_u64(31);
+        let snap = snapshot(0);
+        let mut ctx = ChainContext {
+            snapshot: &snap,
+            open: &[],
+            pending: &[],
+            rng: &mut rng,
+            step: StepIndex::new(0),
+        };
+        let mut adapter = strangle_adapter(ExitPolicy::Expiration);
+        let mut out = Vec::new();
+        assert!(matches!(adapter.on_snapshot(&mut ctx, &mut out), Ok(())));
+        out.clear();
+        assert!(matches!(adapter.on_snapshot(&mut ctx, &mut out), Ok(())));
+        assert!(out.is_empty(), "entered flag prevents a second entry");
+    }
+
+    #[test]
+    fn test_short_strangle_exits_emits_two_closes_when_policy_triggers() {
+        // Exit-policy evaluation routes through the adapter's OWNED exits(),
+        // identically to IronCondor: one close per open leg when it fires.
+        let mut rng = ChaCha8Rng::seed_from_u64(32);
+        let snap = snapshot(7);
+        let legs = strangle_open_legs();
+        let ctx = ChainContext {
+            snapshot: &snap,
+            open: &legs,
+            pending: &[],
+            rng: &mut rng,
+            step: StepIndex::new(7),
+        };
+        let mut adapter = strangle_adapter(ExitPolicy::TimeSteps(0));
+        let mut out = Vec::new();
+        assert!(matches!(adapter.exits(&ctx, &mut out), Ok(())));
+        assert_eq!(out.len(), 2, "one close per open leg when the policy fires");
+        assert!(out.iter().all(is_close), "exits appends closes only");
+        // The closing side flattens each short leg: it is bought back.
+        assert!(out.iter().all(|c| matches!(
+            c,
+            OrderCommand::Submit(OrderIntent {
+                side: Side::Long,
+                action: PositionAction::Close(_),
+                ..
+            })
+        )));
+    }
+
+    #[test]
+    fn test_short_strangle_on_end_appends_only_closes() {
+        let mut rng = ChaCha8Rng::seed_from_u64(33);
+        let snap = snapshot(11);
+        let legs = strangle_open_legs();
+        let mut ctx = ChainContext {
+            snapshot: &snap,
+            open: &legs,
+            pending: &[],
+            rng: &mut rng,
+            step: StepIndex::new(11),
+        };
+        let mut adapter = strangle_adapter(ExitPolicy::Expiration);
+        let mut out = Vec::new();
+        assert!(matches!(adapter.on_end(&mut ctx, &mut out), Ok(())));
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(is_close), "on_end closes only");
+        assert!(!out.iter().any(is_open), "on_end never opens");
+    }
+
+    #[test]
+    fn test_short_strangle_satisfies_positionable_strategy_bound() {
+        // The full triple (Positionable + Strategies + Optimizable, no Default)
+        // holds for ShortStrangle upstream — the same bound IronCondor meets.
+        // Referencing the monomorphised guard fn proves the bound at compile
+        // time; building the adapter through from_spec proves the concrete
+        // construction path accepts it.
+        let _bound_holds: fn() = assert_positionable_strategy::<ShortStrangle>;
+        assert!(strangle_adapter_from_spec(ExitPolicy::Expiration).is_ok());
+    }
+
+    #[test]
+    fn test_short_strangle_from_spec_entry_emits_two_open_intents() {
+        let mut rng = ChaCha8Rng::seed_from_u64(34);
+        let snap = snapshot(0);
+        let mut ctx = ChainContext {
+            snapshot: &snap,
+            open: &[],
+            pending: &[],
+            rng: &mut rng,
+            step: StepIndex::new(0),
+        };
+        let Ok(mut adapter) = strangle_adapter_from_spec(ExitPolicy::Expiration) else {
+            panic!("the short strangle spec builds a valid adapter");
+        };
+        let mut out = Vec::new();
+        assert!(matches!(adapter.on_snapshot(&mut ctx, &mut out), Ok(())));
+        assert_eq!(out.len(), 2, "the two strangle legs emit two opens");
+        assert!(out.iter().all(is_open), "entry appends opens only");
+        assert!(adapter.has_entered());
+        // Dormancy guard: each Open's decision_mid is the SNAPSHOT quote mid,
+        // never a repriced inner premium — so no wall-clock reprice reaches it.
+        for cmd in &out {
+            let OrderCommand::Submit(intent) = cmd else {
+                panic!("entry emits Submit intents");
+            };
+            let Some(quote) = snap.quotes.get(&intent.contract) else {
+                panic!("each entry leg matches a snapshot quote");
+            };
+            assert_eq!(intent.decision_mid, quote.mid);
+            assert_eq!(intent.side, Side::Short, "both strangle legs are short");
+        }
+    }
+
+    #[test]
+    fn test_from_spec_rejects_mismatched_strategy_kind() {
+        // Each concrete from_spec is kind-checked: the ShortStrangle constructor
+        // refuses an IronCondor spec and vice versa — a typed BacktestError,
+        // never a silent wrong build. (No generic-adapter change: the rejection
+        // lives in the per-concrete-type from_spec.)
+        let strangle_from_condor = OptStratAdapter::<ShortStrangle>::from_spec(
+            &iron_condor_spec(),
+            ExitPolicy::Expiration,
+        );
+        assert!(matches!(
+            strangle_from_condor,
+            Err(BacktestError::Strategy(_))
+        ));
+        let condor_from_strangle = OptStratAdapter::<IronCondor>::from_spec(
+            &short_strangle_spec(),
+            ExitPolicy::Expiration,
+        );
+        assert!(matches!(
+            condor_from_strangle,
+            Err(BacktestError::Strategy(_))
+        ));
     }
 
     // --- StrategySpec -> IronCondor construction seam (issue #11) -----------
@@ -1069,7 +1415,9 @@ mod tests {
         // inputs, so the reliable upstream rejection is a parameter the
         // `Positive` domain refuses: a negative implied volatility. It surfaces
         // as BacktestError::Strategy at the construction seam, never a panic.
-        let StrategySpec::IronCondor(mut inner) = iron_condor_spec();
+        let StrategySpec::IronCondor(mut inner) = iron_condor_spec() else {
+            panic!("iron_condor_spec builds an IronCondor spec");
+        };
         inner.implied_volatility = dec!(-0.20);
         let spec = StrategySpec::IronCondor(inner);
         let result = OptStratAdapter::<IronCondor>::from_spec(&spec, ExitPolicy::Expiration);

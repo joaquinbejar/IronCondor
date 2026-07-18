@@ -57,9 +57,14 @@ use crate::execution::RealisticFill;
 /// The selected model fixes the concrete `X: ExecutionModel` of the
 /// monomorphised [`BacktestEngine::run`], so the loop has **no per-step `dyn`
 /// dispatch**; the strategy runs unchanged under either mode (the mode is
-/// configuration, not a code path the strategy sees). `strategy_spec` (the
-/// single [`StrategySpec::IronCondor`] kind) is wrapped with `exit` through the
-/// strategy adapter.
+/// configuration, not a code path the strategy sees). This composition root
+/// wires the [`StrategySpec::IronCondor`] kind, wrapping `strategy_spec` with
+/// `exit` through `OptStratAdapter::<IronCondor>::from_spec`; a
+/// [`StrategySpec::ShortStrangle`] (v0.2 breadth, #28) is a typed
+/// [`BacktestError::Strategy`] here rather than being wired into `run_backtest`
+/// (it is driven directly through the same generic adapter and engine — see
+/// `OptStratAdapter::<ShortStrangle>::from_spec` and the `short_strangle_naive`
+/// golden).
 ///
 /// The primary artifact is the ordered `run.equity_curve`
 /// (`Vec<EquityPoint>`, integer cents + the one drawdown float); the result

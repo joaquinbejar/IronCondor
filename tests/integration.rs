@@ -382,6 +382,53 @@ fn test_run_backtest_over_parquet_fixture_populates_minimal_metrics() {
 }
 
 #[test]
+fn test_short_strangle_run_over_parquet_fixture_produces_equity_curve() {
+    // The v0.2 second strategy runs end to end through the UNCHANGED engine and
+    // generic adapter (#28): a two-leg short strangle, opened at entry and closed
+    // by on_end at the terminal step, producing one equity point per snapshot.
+    let Ok(dir) = tempfile::tempdir() else {
+        panic!("tempdir must create");
+    };
+    let path = dir.path().join("strangle.parquet");
+    let rows = common::strangle_rows(4);
+    if let Err(e) = common::write_parquet(&path, &rows) {
+        panic!("the strangle fixture must write: {e}");
+    }
+
+    let Ok(run) = common::run_strangle(&path, 11) else {
+        panic!("the short strangle run over the fixture must succeed");
+    };
+
+    // One equity point per step (four snapshots), in step order.
+    assert_eq!(run.equity_curve.len(), 4);
+    let steps: Vec<u32> = run.equity_curve.iter().map(|p| p.step).collect();
+    assert_eq!(steps, vec![0, 1, 2, 3]);
+
+    // on_end closed both legs at the terminal step (no leg left open).
+    assert!(
+        run.open_at_end.is_empty(),
+        "on_end closes both strangle legs"
+    );
+
+    // The upstream result carries the second strategy's name.
+    assert_eq!(run.result.strategy_name, "short_strangle");
+    assert_eq!(
+        run.result.initial_capital,
+        rust_decimal::Decimal::new(10_000_000, 2)
+    );
+    // The test period spans the tape's first and last snapshot timestamps (UTC),
+    // derived from SimTime ns — never Utc::now.
+    assert_eq!(
+        run.result.test_period_start.timestamp_nanos_opt(),
+        Some(common::TS0)
+    );
+    assert_eq!(
+        run.result.test_period_end.timestamp_nanos_opt(),
+        Some(common::TS0 + 3 * common::NANOS_PER_DAY)
+    );
+}
+
+#[test]
 fn test_iron_condor_run_is_byte_identical_across_two_runs() {
     let Ok(dir) = tempfile::tempdir() else {
         panic!("tempdir must create");
