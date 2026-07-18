@@ -424,3 +424,143 @@ fn test_security_bundle_over_max_rows_per_table_yields_tape_too_large() {
         })
     ));
 }
+
+/// Missing required manifest field (`seed`) → `Bundle`, rejected before any
+/// table is parsed (the #52 hostile-bundle "missing required field" case).
+#[test]
+fn test_security_bundle_missing_required_field_yields_bundle_error() {
+    let Ok((_dir, bundle)) = adversarial::bundle_missing_required_field() else {
+        panic!("missing-required-field bundle fixture must build");
+    };
+    match read_bundle(&bundle, &ResourceLimits::default()) {
+        Err(BacktestError::Bundle(msg)) => {
+            assert!(
+                msg.contains("missing required field"),
+                "missing-field: {msg}"
+            );
+        }
+        other => panic!("expected a Bundle missing-field error, got {other:?}"),
+    }
+}
+
+/// Bad referenced-input hash → `Bundle` (`sha256 mismatch`); the read-back
+/// re-hashes the reachable input and refuses a silent divergence (the #52
+/// hostile-bundle "bad input hash" case).
+#[test]
+fn test_security_bundle_bad_input_hash_yields_bundle_error() {
+    let Ok((_dir, bundle)) = adversarial::bundle_bad_input_hash() else {
+        panic!("bad-input-hash bundle fixture must build");
+    };
+    match read_bundle(&bundle, &ResourceLimits::default()) {
+        Err(BacktestError::Bundle(msg)) => {
+            assert!(msg.contains("sha256 mismatch"), "bad-input-hash: {msg}");
+        }
+        other => panic!("expected a Bundle sha256-mismatch error, got {other:?}"),
+    }
+}
+
+/// Well-formed bundle + a 1-byte `max_string_len` →
+/// `TapeTooLarge { max_string_len }`, cut off on the manifest `schema` string
+/// (`"ironcondor.bundle.v1"`, 20 bytes) before any oversized string is
+/// materialised (the #52 hostile-bundle "oversized string" ceiling).
+#[test]
+fn test_security_bundle_over_max_string_len_yields_tape_too_large() {
+    let Ok((_dir, bundle)) = adversarial::bundle_well_formed() else {
+        panic!("well-formed bundle fixture must build");
+    };
+    let limits = ResourceLimits {
+        max_string_len: 1,
+        ..ResourceLimits::default()
+    };
+    assert!(matches!(
+        read_bundle(&bundle, &limits),
+        Err(BacktestError::TapeTooLarge {
+            limit: "max_string_len",
+            ..
+        })
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// Fuzzer-found regression (#52): a Parquet file with a malformed embedded
+// `ARROW:schema` IPC flatbuffer. Before the hardening
+// (`ArrowReaderOptions::with_skip_arrow_metadata(true)` at both Parquet read
+// sites) this PANICKED inside arrow-ipc (`unimplemented!` in `get_data_type`);
+// both the feed and the bundle path must now yield a typed error, never a panic.
+// ---------------------------------------------------------------------------
+
+/// Malformed embedded `ARROW:schema` via the FEED → a typed `BacktestError`,
+/// never a panic. Post-skip the file's Parquet schema fails column validation,
+/// so the documented variant is `Conversion` (a `Data` corrupt-bytes rejection
+/// is also acceptable — both are typed, both prove "no panic").
+#[test]
+fn test_security_malformed_arrow_schema_feed_yields_typed_error_not_panic() {
+    let Ok((_dir, path)) = adversarial::parquet_malformed_arrow_schema() else {
+        panic!("malformed-arrow-schema parquet fixture must build");
+    };
+    // Reaching this assertion at all proves `open` returned rather than
+    // unwinding (it did not panic); the variant is the documented typed error.
+    assert!(matches!(
+        ParquetFeed::open(&path, &ResourceLimits::default()),
+        Err(BacktestError::Conversion(_) | BacktestError::Data(_))
+    ));
+}
+
+/// Malformed embedded `ARROW:schema` via the BUNDLE read-back (as `fills.parquet`)
+/// → `BacktestError::Bundle` (the table fails schema validation once the embedded
+/// schema is skipped), never a panic.
+#[test]
+fn test_security_malformed_arrow_schema_bundle_yields_bundle_error_not_panic() {
+    let Ok((_dir, bundle)) = adversarial::bundle_malformed_arrow_schema_table() else {
+        panic!("malformed-arrow-schema bundle fixture must build");
+    };
+    assert!(matches!(
+        read_bundle(&bundle, &ResourceLimits::default()),
+        Err(BacktestError::Bundle(_))
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// Fuzzer-found regression (#52): a Parquet file with a negative column-chunk
+// `byte_range`. Before the #52 hardening this PANICKED inside parquet's
+// row-group decode (`byte_range` assert, mod.rs:1063). It is now closed by BOTH
+// a pre-decode column-chunk offset guard that PREVENTS the panic (so the
+// `panic=abort` fuzz build stays green) and the `catch_unwind` backstop that
+// contains the residual class in the production unwind build. Both the feed and
+// the bundle path must now yield a typed error, never a panic.
+// ---------------------------------------------------------------------------
+
+/// Negative `byte_range` via the FEED → `BacktestError::Data`, never a panic.
+/// The pre-decode column-chunk guard PREVENTS the parquet `byte_range` assert
+/// (rejecting the negative offset before the decode loop) — this is what keeps
+/// the `panic=abort` fuzz build green (a caught panic would still abort there);
+/// the `catch_unwind` backstop remains for the residual, still-unhardened class.
+/// This asserts the prevention path fires.
+#[test]
+fn test_security_malformed_byte_range_feed_yields_typed_error_not_panic() {
+    let Ok((_dir, path)) = adversarial::parquet_malformed_byte_range() else {
+        panic!("malformed-byte-range parquet fixture must build");
+    };
+    match ParquetFeed::open(&path, &ResourceLimits::default()) {
+        Err(BacktestError::Data(msg)) => {
+            assert!(
+                msg.contains("byte_range"),
+                "prevention-guard message: {msg}"
+            );
+        }
+        other => panic!("expected a byte_range prevention Data error, got {other:?}"),
+    }
+}
+
+/// Negative `byte_range` via the BUNDLE read-back (as `fills.parquet`) →
+/// `BacktestError::Bundle`, never a panic.
+#[test]
+fn test_security_malformed_byte_range_bundle_yields_bundle_error_not_panic() {
+    let Ok((_dir, bundle)) = adversarial::bundle_malformed_byte_range_table() else {
+        panic!("malformed-byte-range bundle fixture must build");
+    };
+    assert!(matches!(
+        read_bundle(&bundle, &ResourceLimits::default()),
+        Err(BacktestError::Bundle(_))
+    ));
+}

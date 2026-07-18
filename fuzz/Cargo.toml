@@ -1,0 +1,71 @@
+# IronCondor parser fuzz targets (#52).
+#
+# A SEPARATE, NON-workspace crate (the cargo-fuzz default): the empty
+# `[workspace]` table below detaches it from the parent so it keeps its OWN
+# `Cargo.lock` and never enters the main crate's dependency graph. The main
+# `cargo deny --all-features check` and the main `Cargo.lock` therefore stay
+# byte-identical — this harness adds nothing to the shipped supply chain.
+#
+# Audit note — dev-only fuzz harness, never shipped, outside the `ironcondor`
+# crate (its `#![forbid(unsafe_code)]` is unaffected):
+#   * libfuzzer-sys 0.4 — the libFuzzer `fuzz_target!` runtime binding. Licence:
+#     MIT OR Apache-2.0 OR NCSA. The macro-generated `#[no_mangle]` entrypoint is
+#     the ONLY tolerated `unsafe` (same exemption as the PyO3 macro glue); no
+#     hand-written unsafe appears in this crate. It pulls `arbitrary`
+#     transitively, unused directly here — the targets take raw `&[u8]`.
+#   * tempfile 3 — the per-iteration scratch dir/file the PATH-based parsers
+#     (`CsvFeed`/`ParquetFeed`/`read_bundle`) require. Licence: MIT OR Apache-2.0.
+#     Already a main-crate dev-dependency.
+#   * ironcondor { path = ".." } — the crate under test, at its DEFAULT features
+#     (CSV + Parquet + bundle read-back are all default-feature surfaces).
+
+[package]
+name = "ironcondor-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# Own workspace root — detaches this crate from the parent package.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+tempfile = "3"
+
+[dependencies.ironcondor]
+path = ".."
+
+# A tiny shared lib so the tight `ResourceLimits` and the bundle byte-framing
+# live in ONE place, keeping the three `fuzz_targets/*` bins thin.
+[lib]
+name = "ironcondor_fuzz"
+path = "src/lib.rs"
+
+[[bin]]
+name = "fuzz_csv_feed"
+path = "fuzz_targets/fuzz_csv_feed.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_parquet_feed"
+path = "fuzz_targets/fuzz_parquet_feed.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_bundle_readback"
+path = "fuzz_targets/fuzz_bundle_readback.rs"
+test = false
+doc = false
+bench = false
+
+# Keep a light debug level for readable crash backtraces without bloating the
+# instrumented build.
+[profile.release]
+debug = 1

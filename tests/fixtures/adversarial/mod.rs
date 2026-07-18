@@ -23,11 +23,17 @@
 
 #![allow(dead_code)]
 
+mod malformed_arrow_schema;
+mod malformed_parquet_byte_range;
+
 use std::path::{Path, PathBuf};
 
 use tempfile::TempDir;
 
 use crate::common;
+
+use malformed_arrow_schema::MALFORMED_ARROW_SCHEMA_PARQUET;
+use malformed_parquet_byte_range::MALFORMED_BYTE_RANGE_PARQUET;
 
 /// Write `rows` (the shared canonical schema, valid analytics) into a fresh
 /// tempdir under `name` and return the directory + path.
@@ -468,6 +474,111 @@ pub fn bundle_non_round_trippable_contract_id() -> Result<(TempDir, PathBuf), St
             counts.insert("fills".to_string(), serde_json::Value::from(1_u64));
         }
     })?;
+    Ok((dir, bundle))
+}
+
+/// A bundle whose `manifest.json` is missing a required field (`seed`, one of
+/// the eleven `REQUIRED_MANIFEST_FIELDS`). Expected: `BacktestError::Bundle`
+/// (`"missing required field seed"`), rejected **before** any table is parsed —
+/// the `#52` "hostile bundle: missing required field" case.
+pub fn bundle_missing_required_field() -> Result<(TempDir, PathBuf), String> {
+    let (dir, bundle) = build_valid_bundle()?;
+    patch_bundle_manifest(&bundle, |obj| {
+        obj.remove("seed");
+    })?;
+    Ok((dir, bundle))
+}
+
+/// A bundle whose `manifest.data_source` records a **wrong** `sha256` for its
+/// referenced (and reachable) single-file Parquet input — the chain the bundle
+/// was produced from still sits next to it. Expected: `BacktestError::Bundle`
+/// (`"sha256 mismatch"`) — the read-back re-hashes the reachable input and
+/// refuses a silent divergence; the `#52` "hostile bundle: bad input hash" case.
+///
+/// The `data_source` is rewritten explicitly (a reachable path + an all-zeros
+/// hash) rather than only tampering the hash, so the case does not depend on
+/// whatever path the writer recorded — the referenced file is guaranteed
+/// reachable at read-back and the hash is guaranteed to differ.
+pub fn bundle_bad_input_hash() -> Result<(TempDir, PathBuf), String> {
+    let (dir, bundle) = build_valid_bundle()?;
+    // `build_valid_bundle` writes the chain next to the bundle dir.
+    let chain = dir.path().join("chain.parquet");
+    let chain_str = chain.display().to_string();
+    patch_bundle_manifest(&bundle, |obj| {
+        obj.insert(
+            "data_source".to_string(),
+            serde_json::json!({
+                "kind": "parquet",
+                "path": chain_str,
+                "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+            }),
+        );
+    })?;
+    Ok((dir, bundle))
+}
+
+// ---------------------------------------------------------------------------
+// Fuzzer-found regression (#52): a Parquet file whose embedded `ARROW:schema`
+// IPC flatbuffer is malformed. Before the #52 hardening
+// (`ArrowReaderOptions::with_skip_arrow_metadata(true)` at both Parquet read
+// sites) this PANICKED inside arrow-ipc; now it yields a typed `BacktestError`.
+// The minimised reproducer is committed as source in
+// `malformed_arrow_schema.rs` (a `const &[u8]`, no opaque blob).
+// ---------------------------------------------------------------------------
+
+/// The minimised malformed-`ARROW:schema` Parquet file on disk. Expected (after
+/// the #52 fix): `ParquetFeed::open` returns a typed `BacktestError`
+/// (`Conversion` — once the embedded schema is skipped, the file's Parquet
+/// schema fails column validation), **never a panic**.
+pub fn parquet_malformed_arrow_schema() -> Result<(TempDir, PathBuf), String> {
+    let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let path = dir.path().join("malformed_arrow_schema.parquet");
+    std::fs::write(&path, MALFORMED_ARROW_SCHEMA_PARQUET).map_err(|e| e.to_string())?;
+    Ok((dir, path))
+}
+
+/// A valid bundle whose `fills.parquet` is replaced by the malformed-
+/// `ARROW:schema` reproducer. Expected (after the #52 fix): `read_bundle`
+/// returns a typed `BacktestError::Bundle` (the table fails schema validation
+/// once the embedded schema is skipped), **never a panic**.
+pub fn bundle_malformed_arrow_schema_table() -> Result<(TempDir, PathBuf), String> {
+    let (dir, bundle) = build_valid_bundle()?;
+    std::fs::write(bundle.join("fills.parquet"), MALFORMED_ARROW_SCHEMA_PARQUET)
+        .map_err(|e| e.to_string())?;
+    Ok((dir, bundle))
+}
+
+// ---------------------------------------------------------------------------
+// Fuzzer-found regression (#52): a Parquet file whose column-chunk metadata
+// carries a negative `byte_range`. Before the #52 catch_unwind backstop this
+// PANICKED inside parquet's row-group decode (`byte_range` assert); now it
+// yields a typed `BacktestError`. Reproducer committed as source in
+// `malformed_parquet_byte_range.rs`.
+// ---------------------------------------------------------------------------
+
+/// The minimised negative-`byte_range` Parquet file on disk. Expected (after the
+/// #52 backstop): `ParquetFeed::open` returns a typed `BacktestError::Data` (the
+/// contained-panic message), **never a panic** — the file passes schema
+/// validation and trips the assert during row-group decode, which the backstop
+/// catches.
+pub fn parquet_malformed_byte_range() -> Result<(TempDir, PathBuf), String> {
+    let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let path = dir.path().join("malformed_byte_range.parquet");
+    std::fs::write(&path, MALFORMED_BYTE_RANGE_PARQUET).map_err(|e| e.to_string())?;
+    Ok((dir, path))
+}
+
+/// A valid bundle whose `fills.parquet` is replaced by the negative-`byte_range`
+/// reproducer. Expected (after the #52 backstop): `read_bundle` returns a typed
+/// `BacktestError::Bundle`, **never a panic**. (This feed-shaped reproducer trips
+/// the bundle's stricter per-table schema check before the decode loop; the
+/// decode-loop backstop itself is exercised by the feed test above and the fuzz
+/// smoke — a bundle-shaped negative-`byte_range` file is not readily
+/// synthesizable in Rust, so this asserts the end-to-end no-panic invariant.)
+pub fn bundle_malformed_byte_range_table() -> Result<(TempDir, PathBuf), String> {
+    let (dir, bundle) = build_valid_bundle()?;
+    std::fs::write(bundle.join("fills.parquet"), MALFORMED_BYTE_RANGE_PARQUET)
+        .map_err(|e| e.to_string())?;
     Ok((dir, bundle))
 }
 

@@ -8,6 +8,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **Fuzz targets landed for the three untrusted-byte parser surfaces — CSV
+  feed, Parquet feed, and bundle read-back (#52).** A `fuzz/` `cargo-fuzz`
+  subcrate (its own workspace, so the main `Cargo.lock` and `cargo deny` graph
+  are untouched) with three libFuzzer targets driving the real public parsers
+  (`CsvFeed::open`, `ParquetFeed::open`, `read_bundle`) under tight
+  `ResourceLimits`, asserting the v1.0 invariant: **for any input bytes, the
+  only outcomes are a typed `BacktestError` or a valid parse — never a panic,
+  hang, or OOM**. The seed corpus is materialised at fuzz-time from the
+  committed adversarial generators (source-form, never a committed binary), and
+  a `fuzz-smoke` CI job runs a short smoke over each target (nightly toolchain
+  installed in-job only; the repo stays pinned to stable 1.97.0).
+- **Two real parser panics found by the fuzzer and closed (#52).** Both were
+  reachable through the Parquet read path (`ParquetFeed::open` and
+  `read_bundle`) on crafted input, and both are now committed as minimised,
+  source-form regression fixtures with `tests/security.rs` assertions:
+  1. **arrow-ipc embedded-schema panic** — a Parquet footer may embed an
+     `ARROW:schema` IPC flatbuffer whose parse panics inside `arrow-ipc`
+     (`unimplemented!("Type NONE not supported")` in `get_data_type`). Fixed by
+     opening the reader with
+     `ArrowReaderOptions::new().with_skip_arrow_metadata(true)` at both call
+     sites, so the schema is derived from the Parquet schema itself — which the
+     feed/bundle column validation already checks — and the embedded flatbuffer
+     is never parsed.
+  2. **parquet metadata `byte_range` assert** — a crafted negative column-chunk
+     offset trips `assert!(col_start >= 0 && col_len >= 0)` in
+     `ColumnChunkMetaData::byte_range()` during row-group decode.
+- **Untrusted-Parquet hardening: a prevention guard + a `catch_unwind`
+  backstop (#52).** The `byte_range` assert is one of a *class* of Parquet
+  metadata panics arrow-rs is still hardening upstream (arrow-rs
+  [#9840](http://www.mail-archive.com/commits@arrow.apache.org/msg61636.html),
+  [#9868](http://www.mail-archive.com/commits@arrow.apache.org/msg61779.html),
+  [#5382](https://www.mail-archive.com/commits@arrow.apache.org/msg38005.html)),
+  several still present in parquet 59.1.0 (the latest published, so no dep bump
+  is available yet). Two complementary layers close it at the two Parquet read
+  sites (`src/data/historical.rs`, `src/bundle/reader.rs`):
+  - a **pre-decode prevention guard** that rejects a negative column-chunk
+    `compressed_size` / `data_page_offset` / `dictionary_page_offset` before the
+    decode loop, so the `byte_range` panic never fires. This is what keeps the
+    **fuzz** targets green: `cargo-fuzz` builds `panic=abort`, where a *caught*
+    panic still aborts — a fuzz target only stays green if the panic is
+    *prevented*, not merely caught.
+  - a narrowly-scoped `std::panic::catch_unwind` **backstop** wrapping **only**
+    the upstream builder-construction and row-group-decode calls (our own
+    validation stays outside the wrap, so a bug in this crate still panics
+    loudly); a contained panic is logged (`tracing::warn!`) and mapped to a
+    typed `BacktestError` (`Data` for the feed, `Bundle` for read-back). In the
+    production unwind build this contains the *residual*, still-unhardened
+    members of the class that no prevention guard exists for yet.
+
+  The `fuzz-smoke` job is a **deterministic green-on-known gate**: it runs each
+  target at `-runs=0`, replaying the materialised corpus (every seed + committed
+  regression) with **zero mutation/exploration**, so the pass/fail is provably
+  flake-free (an exploring run is not bit-deterministic under AddressSanitizer
+  and could nondeterministically red a stacked-PR chain). Discovery of new class
+  members is a deliberate **local** campaign that becomes a new prevention guard
+  + regression. The future dep-bump path (drop both layers once a hardened
+  arrow-rs release ships and a long local campaign stays clean) is documented in
+  `fuzz/README.md`.
+
 ### Added
 
 - **Hot-path percentile/linearity regression gates for every tracked path

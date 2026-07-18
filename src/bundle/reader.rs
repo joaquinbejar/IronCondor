@@ -86,7 +86,7 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Schema};
 use optionstratlib::OptionStyle;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::arrow_reader::{ArrowReaderOptions, ParquetRecordBatchReaderBuilder};
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -466,7 +466,24 @@ fn decode_table<T>(
         )));
     }
     let file = File::open(path).map_err(|e| bundle_err(&format!("open {table}.parquet"), &e))?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| {
+    // `with_skip_arrow_metadata(true)` is REQUIRED for no-panic on untrusted
+    // input: a bundle table's Parquet footer may embed an `ARROW:schema` IPC
+    // flatbuffer whose parse panics inside arrow-ipc (`unimplemented!` in
+    // `get_data_type`), which unwinds instead of returning `Err`. Skipping it
+    // derives the schema from the Parquet schema itself — which `validate_schema`
+    // below already checks column-for-column, so the accepted set is unchanged.
+    // The call is ALSO run under the #52 catch_unwind backstop
+    // (`guard_bundle_parquet`): parquet 59.1.0 (the latest published) still has a
+    // known metadata-panic class on malformed input (arrow-rs #9840, #9868,
+    // #5382) that unwinds instead of returning `Err`, so any such panic is
+    // contained and mapped to a typed `BacktestError::Bundle`.
+    let builder = guard_bundle_parquet(table, "metadata read", || {
+        ParquetRecordBatchReaderBuilder::try_new_with_options(
+            file,
+            ArrowReaderOptions::new().with_skip_arrow_metadata(true),
+        )
+    })?
+    .map_err(|e| {
         bundle_err(
             &format!("read {table}.parquet metadata (truncated or corrupt footer)"),
             &e,
@@ -490,6 +507,28 @@ fn decode_table<T>(
     // row group is decoded.
     let mut declared_bytes: u64 = 0;
     for group in builder.metadata().row_groups() {
+        // (#52) Reject a negative column-chunk offset/size BEFORE the decode
+        // loop. This exists to PREVENT (not merely catch) the known
+        // `ColumnChunkMetaData::byte_range()` assert (parquet mod.rs:1063), which
+        // PANICS during decode on a crafted negative offset: the
+        // `guard_bundle_parquet` catch_unwind backstop contains that in
+        // production (unwind), but cargo-fuzz builds `panic=abort` where a caught
+        // panic still aborts — so the fuzz targets only stay green if the panic
+        // never fires. catch_unwind remains the backstop for the residual,
+        // still-unhardened parquet metadata-panic class (arrow-rs #9840, #9868,
+        // #5382). A well-formed table has non-negative offsets, so this never
+        // rejects a valid bundle (the goldens are unaffected).
+        for col in group.columns() {
+            if col.compressed_size() < 0
+                || col.data_page_offset() < 0
+                || col.dictionary_page_offset().is_some_and(|off| off < 0)
+            {
+                return Err(BacktestError::Bundle(format!(
+                    "{table}.parquet column chunk declares a negative offset or size \
+                     (would trip byte_range)"
+                )));
+            }
+        }
         let size = u64::try_from(group.total_byte_size()).map_err(|_| {
             BacktestError::Bundle(format!(
                 "{table}.parquet row group reports a negative byte size"
@@ -510,15 +549,22 @@ fn decode_table<T>(
     // Exact schema (columns / types / nullability).
     validate_schema(table, builder.schema(), expected)?;
 
-    let reader = builder
-        .with_batch_size(READ_BATCH_ROWS)
-        .build()
-        .map_err(|e| bundle_err(&format!("build {table}.parquet reader"), &e))?;
+    let mut reader = guard_bundle_parquet(table, "reader build", || {
+        builder.with_batch_size(READ_BATCH_ROWS).build()
+    })?
+    .map_err(|e| bundle_err(&format!("build {table}.parquet reader"), &e))?;
 
     let mut out: Vec<T> = Vec::new();
     let mut decoded_rows: u64 = 0;
     let mut decoded_bytes: u64 = 0;
-    for batch in reader {
+    loop {
+        // Upstream row-group decode under the #52 backstop (see the feed's
+        // `guard_parquet` doc): a parquet metadata assert (e.g. a negative
+        // column-chunk offset in `byte_range`) is contained as a typed error,
+        // not an unwind. Our own validation below stays OUTSIDE the wrap.
+        let Some(batch) = guard_bundle_parquet(table, "row-group decode", || reader.next())? else {
+            break;
+        };
         let batch =
             batch.map_err(|e| bundle_err(&format!("decode {table}.parquet row group"), &e))?;
         let n = batch.num_rows();
@@ -1056,6 +1102,41 @@ fn check_string_len(len: usize, limits: &ResourceLimits) -> Result<(), BacktestE
 /// Wrap a failed I/O / Arrow / Parquet operation as a [`BacktestError::Bundle`].
 fn bundle_err(context: &str, error: &dyn std::fmt::Display) -> BacktestError {
     BacktestError::Bundle(format!("{context}: {error}"))
+}
+
+/// Run one untrusted-Parquet upstream call under the #52 catch_unwind backstop:
+/// a panic inside arrow/parquet's metadata parse or row-group decode is
+/// **contained** and mapped to a typed [`BacktestError::Bundle`], never an
+/// unwind across the read-back boundary
+/// ([docs/07 §8](../../../docs/07-performance-and-security.md#8-untrusted-input-hardening)).
+/// It wraps ONLY the upstream call — the reader's own validation stays outside —
+/// so a bug in THIS crate still panics loudly in tests. The feed side
+/// (`crate::data::historical::guard_parquet`) is the twin for the CSV/Parquet
+/// feeds; parquet 59.1.0 (the latest published) still carries a known
+/// metadata-panic class on malformed input (arrow-rs #9840, #9868, #5382).
+///
+/// `AssertUnwindSafe` is justified: every value the closure touches (the `File`,
+/// the builder, the reader) is local to the call and is dropped on the unwind
+/// path; nothing shared or observable survives a caught panic, and the caller
+/// returns immediately without reusing the poisoned value.
+fn guard_bundle_parquet<T>(
+    table: &str,
+    op: &str,
+    f: impl FnOnce() -> T,
+) -> Result<T, BacktestError> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(|payload| {
+        let msg = crate::error::panic_payload_message(&*payload);
+        tracing::warn!(
+            target: "ironcondor::bundle",
+            table,
+            op,
+            panic = %msg,
+            "contained an upstream parquet panic (#52 backstop)"
+        );
+        BacktestError::Bundle(format!(
+            "{table}.parquet {op} panicked inside arrow/parquet and was contained by the #52 backstop: {msg}"
+        ))
+    })
 }
 
 /// Lower-hex encode a byte slice.

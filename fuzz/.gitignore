@@ -1,0 +1,14 @@
+# cargo-fuzz build output + libFuzzer working dirs.
+/target
+/artifacts
+/coverage
+
+# The seed corpus is DERIVED from the committed adversarial generators
+# (tests/fixtures/adversarial/mod.rs) at fuzz-time via seed_corpus.sh — the
+# generators are the permanent regressions, the materialised bytes are not
+# committed (the repo "no committed binary blob" convention; see README.md).
+/corpus
+
+# This crate is its own workspace; its lock is regenerated on demand and is NOT
+# the main-crate Cargo.lock (which stays committed + untouched).
+/Cargo.lock

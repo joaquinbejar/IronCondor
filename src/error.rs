@@ -116,6 +116,24 @@ impl From<option_chain_orderbook::Error> for BacktestError {
     }
 }
 
+/// Extract a human-readable message from a caught panic payload (the
+/// `Box<dyn Any>` returned by [`std::panic::catch_unwind`]).
+///
+/// The untrusted-Parquet decode backstop (#52) uses this at the two Parquet read
+/// boundaries to turn a contained upstream panic into a typed [`BacktestError`]
+/// message. A Rust panic payload is a `&str` or a `String`; anything else is
+/// summarised rather than dropped.
+#[must_use]
+pub(crate) fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::BacktestError;
