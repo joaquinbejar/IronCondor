@@ -7,8 +7,13 @@
 //! the migrated session `simulator` client (issue #6) exist so far; the feed
 //! seam and loaders land with the remaining issues.
 
+pub mod convert;
 #[cfg(feature = "simulator")]
 pub mod simulator;
+
+#[cfg(feature = "simulator")]
+pub use convert::chain_response_to_snapshot;
+pub use convert::{RawQuote, SnapshotMeta, raw_quotes_to_snapshot, snapshot_to_option_chain};
 
 use serde::{Deserialize, Serialize};
 
