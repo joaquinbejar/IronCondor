@@ -972,4 +972,70 @@ proptest! {
         prop_assert!(rejected);
         prop_assert!(out.is_empty());
     }
+
+    /// Realistic per-level slippage obeys the §7.1 sign truth table (feeding
+    /// `fill_and_step_sign_reconciliation`): a marketable buy that walks a
+    /// three-level ask ladder against a **fixed** decision-time mid (the touch)
+    /// records, on every level, `slippage = (price − decision_mid) × qty`
+    /// (side_sign +1 for a long) — **positive exactly when the fill is worse
+    /// than the mid** and zero at the touch. The prices are non-decreasing along
+    /// the walk (progressively deeper), so the impact is emergent, not
+    /// configured, and never sign-flips twice.
+    #[test]
+    fn realistic_per_level_slippage_positive_when_adverse(
+        tick_idx in 0usize..5,
+        base in 1u64..500,
+        s0 in 1u32..20,
+        s1 in 1u32..20,
+        s2 in 1u32..20,
+    ) {
+        let tick = [1u64, 5, 10, 25, 100][tick_idx];
+        let touch = base * tick; // tick-aligned by construction
+        let fees = FeeSchedule { per_contract_cents: 0, per_order_cents: 0 };
+        let mut model = ironcondor::RealisticFill::new(fees, 10, 7);
+        // Seed three ask levels one tick apart: touch, touch+tick, touch+2·tick.
+        for (i, size) in [s0, s1, s2].into_iter().enumerate() {
+            let level = u64::try_from(i).unwrap_or(0);
+            let price = touch + level * tick;
+            let q = match Quantity::new(size) { Ok(q) => q, Err(_) => return Ok(()) };
+            let seeded = model.seed_maker_limit(
+                &ob_contract(), true, PriceCents::new(price), q, PriceCents::new(tick),
+            );
+            prop_assert!(seeded.is_ok());
+        }
+        let total = s0 + s1 + s2;
+        let qty = match Quantity::new(total) { Ok(q) => q, Err(_) => return Ok(()) };
+        // decision_mid fixed at the touch (never re-read post-impact).
+        let Some(snap) = ob_snapshot(tick, touch, touch) else { return Ok(()); };
+        let buy = OrderCommand::Submit(OrderIntent {
+            contract: ob_contract(),
+            action: PositionAction::Open,
+            side: Side::Long,
+            quantity: qty,
+            limit: None,
+            tif: TimeInForce::Ioc,
+            decision_mid: PriceCents::new(touch),
+        });
+        let mut out: Vec<Fill> = Vec::new();
+        prop_assert!(model.fill(&[buy], &snap, &mut out).is_ok());
+        prop_assert_eq!(out.len(), 3); // the buy walks all three seeded levels
+
+        let mut prev_price = 0u64;
+        for fill in &out {
+            // prices are non-decreasing along the walk (deeper = worse).
+            prop_assert!(fill.price.value() >= prev_price);
+            prev_price = fill.price.value();
+            // §7.1: slippage = (price − mid) × qty × (+1) for a long buy.
+            let expected = i64::from(fill.quantity.value())
+                * (i64::try_from(fill.price.value()).unwrap_or(i64::MAX)
+                    - i64::try_from(touch).unwrap_or(i64::MAX));
+            prop_assert_eq!(fill.slippage.value(), expected);
+            // positive exactly when adverse (fill above the decision mid).
+            if fill.price.value() > touch {
+                prop_assert!(fill.slippage.value() > 0);
+            } else {
+                prop_assert_eq!(fill.slippage.value(), 0);
+            }
+        }
+    }
 }
