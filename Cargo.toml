@@ -57,6 +57,16 @@ csv = "1"
 # Streaming file sha256 = the tape data-identity for file feeds. Licence:
 # MIT OR Apache-2.0.
 sha2 = "0.10"
+# Structured logging — the repo-mandated logging crate (`rules/global_rules.md`
+# "Logging & Observability"; docs/05 §13 "tracing on write milestones"). Used by
+# the P&L attribution (#31) to emit the advisory `WARN` when a step's residual
+# exceeds the documented model-quality threshold — never a run failure, never a
+# change to the bundle bytes. Audit note: what — the `tracing` facade behind the
+# advisory attribution warning; why — the mandated logger, required by the
+# milestone acceptance criteria; licence — MIT. Already present transitively (via
+# optionstratlib, reqwest, …) at the same 0.1.x, so this direct dependency adds
+# nothing new to the lockfile; `cargo audit` / `cargo deny` stay green.
+tracing = "0.1"
 # Seeded ChaCha8Rng — the run's SOLE randomness source (docs/02 §7); seeded
 # from config.seed so `(seed, config, data)` is byte-reproducible. Never
 # `thread_rng`. `ChaCha8Rng` + its re-exported `rand_core::SeedableRng` are the

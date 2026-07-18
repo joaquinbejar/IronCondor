@@ -11,12 +11,15 @@
 //! `analytics` **consumes** engine output; the engine must therefore **not**
 //! import `analytics` (that would invert the `analytics → engine output`
 //! dependency, [CLAUDE.md](../../CLAUDE.md) Module Boundaries). So the "run,
-//! then compute metrics" orchestration cannot live inside
+//! then compute analytics" orchestration cannot live inside
 //! [`crate::engine::BacktestEngine::run`]. It lives **here**, at the crate top
 //! level — a composition root that sits *above* both layers, calls
 //! [`crate::engine::BacktestEngine::run`] first, then
-//! [`crate::analytics::metrics::populate`] on its output. The engine stays
-//! analytics-free; analytics stays engine-free; this module depends on both.
+//! [`crate::analytics::metrics::populate`] and
+//! [`crate::analytics::attribution::attribute`] on its output (the P&L
+//! attribution by Greek, #31, reads the engine's owned attribution substrate
+//! and fills `run.greeks_attribution`). The engine stays analytics-free;
+//! analytics stays engine-loop-free; this module depends on both.
 //!
 //! # Determinism
 //!
@@ -28,7 +31,7 @@
 use optionstratlib::simulation::ExitPolicy;
 use optionstratlib::strategies::IronCondor;
 
-use crate::analytics::metrics;
+use crate::analytics::{attribution, metrics};
 use crate::config::BacktestConfig;
 use crate::data::{DataSourceSpec, ParquetFeed};
 use crate::domain::{ExecutionMode, StrategySpec};
@@ -148,6 +151,13 @@ pub fn run_backtest(
         BacktestError::Config("initial capital exceeds the i64 cents range".to_string())
     })?;
     metrics::populate(&mut run.result, &run.equity_curve, initial_capital_cents)?;
+
+    // …and the per-step P&L attribution by Greek, decomposed from the engine's
+    // owned attribution substrate ([`crate::engine::substrate`]) into one
+    // `GreeksAttributionRow` per step, with an exact integer-cents residual
+    // (#31). The engine leaves `run.greeks_attribution` empty; analytics fills
+    // it here — the same layering as `metrics::populate` above.
+    run.greeks_attribution = attribution::attribute(&run.attribution_substrate)?;
 
     Ok(run)
 }

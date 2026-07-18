@@ -382,6 +382,68 @@ fn test_run_backtest_over_parquet_fixture_populates_minimal_metrics() {
 }
 
 #[test]
+fn test_run_backtest_populates_greeks_attribution_end_to_end() {
+    // The #31 end-to-end wiring: `run_backtest` runs the engine (which collects
+    // the attribution substrate) THEN the analytics attribution pass, landing
+    // one `GreeksAttributionRow` per step in `run.greeks_attribution`. This
+    // proves the composition-root wiring, not just the analytics pass in
+    // isolation (which `tests/property.rs` covers).
+    use optionstratlib::simulation::ExitPolicy;
+
+    let Ok(dir) = tempfile::tempdir() else {
+        panic!("tempdir must create");
+    };
+    let path = dir.path().join("condor.parquet");
+    let rows = common::condor_rows(6, None);
+    if let Err(e) = common::write_parquet(&path, &rows) {
+        panic!("the condor fixture must write: {e}");
+    }
+
+    let config = common::condor_config(&path, 7);
+    let spec = common::iron_condor_spec();
+    let Ok(run) = ironcondor::run_backtest(&config, &spec, ExitPolicy::TimeSteps(1_000_000)) else {
+        panic!("the run_backtest slice must succeed");
+    };
+
+    // One attribution row per step, in step order — filled by run.rs post-run.
+    assert_eq!(
+        run.greeks_attribution.len(),
+        run.equity_curve.len(),
+        "one attribution row per equity point"
+    );
+    let attr_steps: Vec<u32> = run.greeks_attribution.iter().map(|r| r.step).collect();
+    assert_eq!(attr_steps, vec![0, 1, 2, 3, 4, 5], "rows are in step order");
+
+    // The golden reconciliation invariant holds EXACTLY in integer cents at
+    // every step, checked against the independent equity curve.
+    let mut prev_equity: i64 = 10_000_000; // condor_config initial capital
+    for (row, point) in run.greeks_attribution.iter().zip(run.equity_curve.iter()) {
+        let expected = i128::from(point.equity_cents) - i128::from(prev_equity);
+        prev_equity = point.equity_cents;
+        let lhs = i128::from(row.theta_pnl_cents)
+            + i128::from(row.delta_pnl_cents)
+            + i128::from(row.vega_pnl_cents)
+            + i128::from(row.spread_capture_cents)
+            - i128::from(row.fees_cents)
+            + i128::from(row.residual_cents);
+        assert_eq!(
+            lhs, expected,
+            "attribution reconciles to step_pnl at step {}",
+            row.step
+        );
+    }
+
+    // Step 0's Greek terms are all zero (no S_-1), and the residual closes the
+    // initial-capital baseline.
+    let Some(row0) = run.greeks_attribution.first() else {
+        panic!("a step-0 row exists");
+    };
+    assert_eq!(row0.theta_pnl_cents, 0);
+    assert_eq!(row0.delta_pnl_cents, 0);
+    assert_eq!(row0.vega_pnl_cents, 0);
+}
+
+#[test]
 fn test_short_strangle_run_over_parquet_fixture_produces_equity_curve() {
     // The v0.2 second strategy runs end to end through the UNCHANGED engine and
     // generic adapter (#28): a two-leg short strangle, opened at entry and closed

@@ -58,12 +58,13 @@ use optionstratlib::backtesting::BacktestResult;
 use crate::config::BacktestConfig;
 use crate::data::DataFeed;
 use crate::domain::{
-    Cents, ChainSnapshot, EquityPoint, Fill, OpenPosition, OrderCommand, OrderId, OrderIntent,
-    PositionAction, PositionId, Quantity, TradeId,
+    Cents, ChainSnapshot, EquityPoint, Fill, GreeksAttributionRow, OpenPosition, OrderCommand,
+    OrderId, OrderIntent, PositionAction, PositionId, Quantity, TradeId,
 };
 use crate::engine::clock::SimClock;
 use crate::engine::ledger::Ledger;
 use crate::engine::strategy::{ChainContext, Strategy};
+use crate::engine::substrate::{AttributionCollector, AttributionSubstrate};
 use crate::error::BacktestError;
 use crate::execution::ExecutionModel;
 
@@ -134,6 +135,18 @@ impl IdCounters {
 /// `strategy_name`, the initial/final capital, and the test period — and left
 /// otherwise `Default`; the rich metrics (Sharpe, drawdown analysis, trade
 /// statistics) are analytics' responsibility (#16/#32), not fabricated here.
+///
+/// # The attribution hand-off (analytics reads engine output)
+///
+/// The engine cannot import `analytics` (layering,
+/// [CLAUDE.md](../../../CLAUDE.md)), so the Greek decomposition runs **post-run**.
+/// The loop collects the per-step, per-leg decomposition inputs into
+/// [`Self::attribution_substrate`] (owned, PB-1-safe,
+/// [`crate::engine::substrate`]); a caller above both layers (the `run.rs`
+/// composition root) then runs the analytics pass and fills
+/// [`Self::greeks_attribution`]. The engine leaves that field **empty** — it is
+/// analytics' output, not the engine's — exactly as it leaves the rich
+/// [`BacktestResult`] metrics to `metrics::populate`.
 #[derive(Debug)]
 #[must_use = "a BacktestRun carries the run's results and should be consumed"]
 pub struct BacktestRun {
@@ -144,6 +157,16 @@ pub struct BacktestRun {
     /// The legs still open when the feed exhausted (`open_at_end = true`),
     /// marked-to-last at `S_last` mid — never force-closed.
     pub open_at_end: Vec<OpenPosition>,
+    /// The per-step, per-leg **attribution substrate** the loop collected — the
+    /// owned inputs the post-run P&L-attribution pass consumes
+    /// ([`crate::engine::substrate`], #31).
+    pub attribution_substrate: AttributionSubstrate,
+    /// The per-step P&L attribution rows, one per step
+    /// ([`GreeksAttributionRow`]). **Empty** as returned by
+    /// [`BacktestEngine::run`] — analytics fills it post-run from
+    /// [`Self::attribution_substrate`] (the composition root does this via
+    /// [`crate::analytics::attribution::attribute`]).
+    pub greeks_attribution: Vec<GreeksAttributionRow>,
 }
 
 /// The deterministic replay engine — the facade over [`BacktestEngine::run`].
@@ -220,6 +243,7 @@ impl BacktestEngine {
             cmds: Vec::with_capacity(16),
             fills: Vec::with_capacity(16),
             equity_curve: Vec::with_capacity(capacity),
+            attribution: AttributionCollector::with_capacity(capacity),
         };
 
         // Peek S0: the feed has no `peek`, so pull it and hold it as the
@@ -234,6 +258,14 @@ impl BacktestEngine {
         // §3.1 steps 6–7: run on_start and execute its opening intents against
         // S0 BEFORE step 0's on_snapshot — no equity point is emitted here.
         state.on_start(&current)?;
+
+        // Now the opening inventory (hence the steady-state leg count) is known,
+        // pre-size the attribution leg buffer so warm steps push without
+        // reallocating (PB-1). Reserving here, before the measured (b)–(g) tail,
+        // keeps the per-step body allocation-free for a constant-leg run.
+        state
+            .attribution
+            .reserve_legs(capacity, state.inventory.len());
 
         // --- Per-step loop (§3.2) + termination (§3.3) ----------------------
         // `last_ts` is assigned exactly once, at the terminal-step break — the
@@ -271,12 +303,16 @@ impl BacktestEngine {
         let RunState {
             equity_curve,
             inventory,
+            attribution,
             ..
         } = state;
         Ok(BacktestRun {
             result,
             equity_curve,
             open_at_end: inventory,
+            attribution_substrate: attribution.into_substrate(),
+            // Empty by design — analytics fills it post-run (see the type docs).
+            greeks_attribution: Vec::new(),
         })
     }
 }
@@ -296,6 +332,10 @@ struct RunState<S: Strategy, X: ExecutionModel> {
     cmds: Vec<OrderCommand>,
     fills: Vec<Fill>,
     equity_curve: Vec<EquityPoint>,
+    /// Collects the per-step, per-leg attribution substrate the post-run
+    /// analytics pass consumes (#31). Sized at `on_start`, pushed amortised each
+    /// step — PB-1-safe, never a per-step allocation on a constant-leg run.
+    attribution: AttributionCollector,
 }
 
 impl<S: Strategy, X: ExecutionModel> RunState<S, X> {
@@ -352,6 +392,7 @@ impl<S: Strategy, X: ExecutionModel> RunState<S, X> {
             cmds,
             fills,
             equity_curve,
+            attribution,
         } = self;
 
         // a. advance the clock (rejects a non-increasing ts as DataOutOfOrder).
@@ -413,8 +454,18 @@ impl<S: Strategy, X: ExecutionModel> RunState<S, X> {
 
         // f. the ONE ledger mutation for the step ⇒ the step's single point.
         let point = ledger.settle(snapshot.step, snapshot.ts, inventory.as_slice(), snapshot)?;
-        // g. record (attribution is v0.3; #14 collects the ordered curve).
+        // g. record: the ordered equity curve (#14) AND the per-step attribution
+        // substrate (#31). Both are amortised pushes into buffers sized at
+        // startup — no per-step allocation on a constant-leg run (PB-1). The
+        // ledger's per-leg hand-off (`position_marks`) plus its `spread_capture`
+        // / `fees` / `step_pnl` are live right here, before the next `settle`
+        // overwrites them; the collector copies out what the post-run pass needs.
         equity_curve.push(point);
+        let marks = ledger.position_marks();
+        let spread_capture = ledger.spread_capture();
+        let fees = ledger.fees();
+        let step_pnl = ledger.step_pnl();
+        attribution.collect(snapshot, marks, spread_capture, fees, step_pnl);
         Ok(())
     }
 }
