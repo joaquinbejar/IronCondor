@@ -10,6 +10,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The determinism golden suite is hardened to the full bundle for every named
+  scenario (#50).** The frozen four-table + `manifest.json` bundle golden (#36)
+  covered only `iron_condor_naive`; it now covers **every** named golden scenario
+  under the single comparison oracle (`tests/oracle/mod.rs`) plus a
+  same-environment run-twice byte-identical assertion:
+  - `tests/bundle_golden.rs` gains full-bundle goldens for `short_strangle_naive`
+    (naive `ShortStrangle`) and `iron_condor_realistic` (realistic fills, feature
+    `orderbook`), each with committed `expected/` trees (manifest + four Parquet
+    tables, regenerate with `BLESS=1 cargo test --test bundle_golden`), plus a
+    mode-pair test proving the naive/realistic bundles share a manifest key shape
+    while their table values diverge;
+  - the `golden` CI job now runs the extended suite (`--test golden` and
+    `--test bundle_golden`, each with and without `--features orderbook`);
+  - the v1.0 acceptance line "caught at least one real regression" is now
+    evidence, not prose: `tests/golden/REGRESSION-EVIDENCE.md` records a real
+    wall-clock determinism leak introduced on scratch and caught by the
+    run-twice **byte layer** (the logical golden missed it because the affected
+    field lives in the opaque `metrics` object the cross-environment oracle
+    strips), then reverted. The frozen `iron_condor_naive` bundle and the
+    conformance fixture are untouched.
 - **The four public surfaces are frozen for SemVer 1.0 (#49).** Each surface —
   the result bundle, the `src/lib.rs` Rust re-exports, the PyO3 module surface,
   and the `BacktestConfig` + env-var configuration surface — now has a named
