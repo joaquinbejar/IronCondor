@@ -10,6 +10,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `BacktestEngine::run<F: DataFeed, X: ExecutionModel, S: Strategy>`
+  (`src/engine/backtest.rs`) — the synchronous, single-threaded, monomorphised
+  replay loop implementing the normative state machine: startup (materialise
+  the tape, execute `on_start` intents against `S0` before step 0), per-step
+  (snapshot → mark → exits strictly before entries → naive fills → ledger
+  → one `EquityPoint`), and termination (`on_end` inside the final step, legs
+  left open flagged `open_at_end`, never a synthetic terminal fill). Lifecycle
+  ids are minted from seeded monotonic counters; the only randomness is the
+  seeded `ChaCha8Rng`; no wall-clock, no `thread_rng`, no look-ahead. Returns a
+  `BacktestRun` carrying the populated `optionstratlib::backtesting::BacktestResult`,
+  the `EquityPoint` curve, and the open-at-end legs (#14).
+- The minimal mark-to-market `Ledger` (`src/engine/ledger.rs`) — cash moves
+  only by fills and fees, positions marked at the snapshot mid with last-known
+  carry-forward, `EquityPoint` and unclamped drawdown emitted once per step
+  (enriched with the rigorous invariants at #15) — and the `EquityPoint`
+  domain record (#14).
+- Property tests `no_look_ahead` (perturbing a future snapshot leaves the
+  prefix byte-identical) and `same_seed_same_result` (an RNG-consuming strategy
+  reproduces exactly), plus an end-to-end `ParquetFeed → run → BacktestResult`
+  integration test over the canonical fixture (#14).
+
+### Changed
+
+- `Underlying` is interned as `Arc<str>` instead of `String`, so cloning a
+  `ContractKey` (and every `Fill` / `OpenPosition` / `QuoteView` that owns one)
+  is a refcount bump rather than a heap allocation — the warm replay-step body
+  no longer allocates, the prerequisite for the PB-1 zero-allocation gate. The
+  exact `Eq` / `Hash` / `Ord` semantics and the grammar validation are
+  unchanged (#14).
+
 - The naive fill model (`src/execution/naive.rs`, `NaiveFill`) — the fast v0.1
   execution mode and criterion throughput baseline. A pure function of the
   snapshot and config with no book, state, or randomness: it fills every
