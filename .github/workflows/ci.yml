@@ -64,6 +64,31 @@ jobs:
       # Distinct from the throughput bench (#18) and the golden job (#17).
       - run: cargo test --test zero_alloc
 
+  bench-gate:
+    name: bench-gate
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: Swatinem/rust-cache@v2
+      # PB-3 regression gate (#29, docs/07 §6, docs/TESTING.md §11.1). Runs the
+      # realistic-vs-naive A/B bench (`benches/realistic_overhead.rs`) with
+      # REDUCED criterion samples (short job — full-fidelity numbers are the
+      # local BENCH.md measurement) and fails the build if the DIMENSIONLESS
+      # realistic/naive overhead RATIO leaves its committed band.
+      #
+      # Why the ratio, not an absolute number: the BENCH.md baseline is Apple
+      # M4 Max but this runner is Linux — an absolute-ns compare would false-
+      # positive every run. The ratio is HARDWARE-PORTABLE: both modes run the
+      # same `run_backtest` over the same tape in the same process, so a uniform
+      # clock-speed factor cancels and the ratio only moves on a real
+      # algorithmic regression in one mode (a naive regression drops it toward 1
+      # → trips the floor; a realistic blow-up raises it → trips the ceiling).
+      # A coarse absolute naive ceiling is a documented backstop for the one
+      # case the ratio is blind to (a regression that slows BOTH modes equally).
+      # Distinct from the zero-alloc gate (PB-1) and the throughput bench (PB-2).
+      - run: ./scripts/bench_gate.sh
+
   security:
     name: security
     runs-on: ubuntu-24.04
