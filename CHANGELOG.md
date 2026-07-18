@@ -10,6 +10,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Crate skeleton: the layered `src/` module tree (`domain`, `engine`,
+  `execution`, `data`, `analytics`, `bundle`, `python`, `error`, `config`) as
+  compiling placeholders, `#![forbid(unsafe_code)]` + `#![warn(missing_docs)]`
+  at the crate root, the four feature flags (`default`, `orderbook`,
+  `simulator`, `python`), and the unconditional `rlib` + `cdylib` crate types
+  (#1).
+- Toolchain and lint policy: `rust-toolchain.toml` pinned to stable 1.97.0,
+  `rustfmt.toml`, `clippy.toml`, and a root `Makefile` with the `pre-push`
+  gate (#1).
+- CI skeleton (`.github/workflows/ci.yml`): `fmt`, `clippy`, `test`, and
+  `build-release` jobs on pinned runner and toolchain images with
+  cancel-in-progress concurrency (#1).
 - Design documentation for the planned backtester (`docs/`): PRD, roadmap,
   competitive analysis, domain model, engine architecture, data layer,
   execution models, analytics/reporting, Python bindings, and ADRs 0001–0006.
