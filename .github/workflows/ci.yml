@@ -31,6 +31,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.97.0
         with:
           components: clippy
+      # `--all-features` compiles the `python` feature (#38): pyo3-build-config
+      # needs an interpreter >= the abi3-py310 floor. setup-python pins it
+      # instead of trusting the runner image's system python.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets --all-features --workspace -- -D warnings
 
@@ -40,6 +46,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.97.0
+      # `--all-features` builds pyo3 WITHOUT extension-module (that flag is
+      # maturin-injected, #38), so the test binaries link libpython in
+      # embedding mode — setup-python provides a shared libpython >= 3.10.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --all-features
 
@@ -145,4 +157,51 @@ jobs:
       # (its sha256 becomes `lockfile_sha256` build provenance in the v0.3
       # bundle manifest, docs/07 §10).
       - run: cargo install --locked --version 0.19.2 cargo-deny
-      - run: cargo deny check
+      # `--all-features` resolves the FULL feature graph (python/orderbook/
+      # simulator) so feature-gated dependencies are licence/advisory-gated
+      # too — the default-features graph silently skipped them until #38
+      # exposed it (target-lexicon's `Apache-2.0 WITH LLVM-exception` and the
+      # simulator's rustls stack were never checked).
+      - run: cargo deny --all-features check
+
+  python-wheels:
+    name: python-wheels
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: Swatinem/rust-cache@v2
+      # Python 3.10 == the abi3 floor, so maturin builds a `cp310-abi3` wheel
+      # with no forward-compatibility shim. One wheel per platform serves 3.10+.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install maturin + pytest
+        run: python -m pip install --upgrade "maturin>=1.7,<2.0" pytest
+      # Builds the scaffold wheel from `python/pyproject.toml` (manifest-path
+      # points at the root crate). `--features python` mirrors the pyproject
+      # `[tool.maturin] features`; `pyo3/extension-module` is injected there for
+      # the wheel link. --out keeps the wheel next to the project for install.
+      - name: Build the cp310-abi3 wheel
+        working-directory: python
+        run: maturin build --release --features python --out dist
+      - name: Install the built wheel
+        working-directory: python
+        run: python -m pip install --no-index --find-links dist ironcondor
+      # Acceptance criterion (#38): the wheel imports and reports the crate
+      # version. Compares the module's `__version__` against the crate version
+      # parsed from Cargo.toml — a byte match, no hand-copied string.
+      - name: Smoke-import and assert __version__ == crate version
+        run: |
+          set -euo pipefail
+          MODULE_VERSION="$(python -c 'import ironcondor; print(ironcondor.__version__)')"
+          CRATE_VERSION="$(grep -m1 '^version' Cargo.toml | sed -E 's/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')"
+          echo "ironcondor.__version__ = ${MODULE_VERSION}"
+          echo "crate version         = ${CRATE_VERSION}"
+          test "${MODULE_VERSION}" = "${CRATE_VERSION}"
+      - name: Run the pytest smoke suite
+        run: python -m pytest python/tests -q

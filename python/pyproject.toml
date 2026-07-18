@@ -1,0 +1,56 @@
+# maturin packaging for the `ironcondor` Python extension (#38, ADR-0005,
+# docs/06 §7). Builds a single `cp310-abi3` wheel per platform from the root
+# crate's `python` feature. The distribution name `ironcondor` is UNREGISTERED
+# on PyPI; wheels are a v0.4 deliverable and publishing needs explicit owner
+# approval (CLAUDE.md, docs/06 §8). The `Private :: Do Not Upload` classifier
+# below is a hard guard against an accidental upload until that approval lands
+# (#41).
+
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "ironcondor"
+description = "High-performance options-strategy backtester with order-book-level fill simulation (Python bindings)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Joaquin Bejar", email = "jb@taunais.com" }]
+keywords = ["finance", "options", "trading", "backtesting", "quant"]
+# maturin fills the version from the crate (Cargo.toml `version`), so the
+# wheel version and the crate version are always one string.
+dynamic = ["version"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Financial and Insurance Industry",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Office/Business :: Financial :: Investment",
+    # Hard guard: PyPI rejects any upload carrying this classifier. Remove only
+    # when publication is owner-approved (#41).
+    "Private :: Do Not Upload",
+]
+
+[project.urls]
+Homepage = "https://github.com/joaquinbejar/IronCondor"
+Repository = "https://github.com/joaquinbejar/IronCondor"
+
+[tool.maturin]
+# The crate manifest lives at the repository root, one level up.
+manifest-path = "../Cargo.toml"
+# Enable the binding code (`python`) plus `pyo3/extension-module` for the wheel
+# build ONLY. extension-module suppresses the libpython link (correct for the
+# importable cdylib); keeping it out of the `python` cargo feature is what lets
+# `cargo test --all-features` still link and run (see Cargo.toml). abi3 is
+# inferred from the crate's `pyo3` `abi3-py310` feature → a `cp310-abi3` wheel.
+features = ["python", "pyo3/extension-module"]
+# The importable module name; matches the crate `[lib] name` and the
+# `#[pymodule] fn ironcondor` entry point.
+module-name = "ironcondor"
+# Ship the type stub and PEP 561 marker from this directory.
+include = ["ironcondor.pyi", "py.typed"]
+strip = true

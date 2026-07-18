@@ -38,6 +38,22 @@ ignore = ["RUSTSEC-2024-0436"]
 allow = [
     "MIT",
     "Apache-2.0",
+    # `target-lexicon` (build-dep of pyo3-build-config, the `python` feature,
+    # #38) is licensed `Apache-2.0 WITH LLVM-exception` with NO OR-fallback —
+    # the plain `Apache-2.0` allow does not satisfy a WITH expression. The LLVM
+    # exception only RELAXES Apache-2.0 (drops the §4 binary-redistribution
+    # attribution requirement), so it is strictly more permissive.
+    "Apache-2.0 WITH LLVM-exception",
+    # The rustls TLS stack behind the `simulator` feature's reqwest client —
+    # `ring` (`Apache-2.0 AND ISC`), `untrusted`, `rustls-webpki` — carries ISC,
+    # an OSI-approved permissive licence functionally equivalent to MIT. These
+    # were previously unchecked because the deny gate resolved default features
+    # only (fixed at #38: CI now runs `cargo deny --all-features check`).
+    "ISC",
+    # `webpki-roots` (the Mozilla CA-root bundle the simulator's rustls client
+    # trusts) ships as data under CDLA-Permissive-2.0 — a permissive data
+    # licence (attribution-only, no copyleft).
+    "CDLA-Permissive-2.0",
     "BSD-2-Clause",
     "BSD-3-Clause",
     "BSL-1.0",
