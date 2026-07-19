@@ -178,6 +178,35 @@ impl TradeLogCollector {
         );
     }
 
+    /// Extend an already-recorded open leg with a carried fill run (#110):
+    /// the remaining size grows and the entry premium is replaced with the
+    /// caller's re-averaged VWAP, so the eventual close realises against the
+    /// leg's true blended entry.
+    ///
+    /// # Errors
+    ///
+    /// - [`BacktestError::Execution`] if `position_id` names no open leg.
+    /// - [`BacktestError::ArithmeticOverflow`] if the size grows past `u32`.
+    pub fn record_open_extend(
+        &mut self,
+        position_id: PositionId,
+        added: Quantity,
+        new_entry_premium: PriceCents,
+    ) -> Result<(), BacktestError> {
+        let Some(leg) = self.open.get_mut(&position_id) else {
+            return Err(BacktestError::Execution(format!(
+                "open-extend targets position {} which is not tracked",
+                position_id.value()
+            )));
+        };
+        leg.remaining = leg
+            .remaining
+            .checked_add(added.value())
+            .ok_or(BacktestError::ArithmeticOverflow)?;
+        leg.entry_premium = new_entry_premium;
+        Ok(())
+    }
+
     /// Record a leg close, computing its realised P&L and pushing a
     /// [`ClosedTrade`]. A partial close (`quantity` below the leg's remaining
     /// size) keeps the leg open with the residual; a full close removes it.

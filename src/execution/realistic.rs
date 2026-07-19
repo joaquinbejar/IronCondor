@@ -167,6 +167,12 @@ pub struct RealisticFill {
     /// emission order (the contiguous e1 prefix of `out_fills`). **Reusable
     /// scratch:** cleared in place each `fill` (capacity retained).
     carry_groups: Vec<CarryGroup>,
+    /// Count of live resting strategy orders per contract — the incremental
+    /// membership index the eviction predicate consults in O(log L) instead of
+    /// scanning `resting_strategy` per book (#110 review: keeps a rolling
+    /// universe linear in the live set). Maintained at mirror insert/remove;
+    /// an entry is dropped at count 0.
+    live_orders: BTreeMap<ContractKey, u32>,
     /// Reusable scratch for the per-step reseed plan — sized once, cleared in
     /// place by [`liquidity::plan_seed_into`] each refresh, so the refresh's own
     /// plan buffer never reallocates ([docs/07 §4](../../../docs/07-performance-and-security.md)).
@@ -260,6 +266,7 @@ impl RealisticFill {
             resting_strategy: BTreeMap::new(),
             order_index: BTreeMap::new(),
             carry_groups: Vec::new(),
+            live_orders: BTreeMap::new(),
             seed_plan: Vec::new(),
             fill_groups: Vec::new(),
             books: BTreeMap::new(),
@@ -297,6 +304,7 @@ impl RealisticFill {
             resting_strategy: BTreeMap::new(),
             order_index: BTreeMap::new(),
             carry_groups: Vec::new(),
+            live_orders: BTreeMap::new(),
             seed_plan: Vec::new(),
             fill_groups: Vec::new(),
             books: BTreeMap::new(),
@@ -459,16 +467,14 @@ impl RealisticFill {
             let Self {
                 books,
                 resting_seed_ids,
-                resting_strategy,
+                live_orders,
                 ..
             } = self;
             books.retain(|contract, _| {
-                snap.quotes.contains_key(contract)
-                    || resting_strategy.values().any(|m| &m.contract == contract)
+                snap.quotes.contains_key(contract) || live_orders.contains_key(contract)
             });
             resting_seed_ids.retain(|contract, _| {
-                snap.quotes.contains_key(contract)
-                    || resting_strategy.values().any(|m| &m.contract == contract)
+                snap.quotes.contains_key(contract) || live_orders.contains_key(contract)
             });
         }
         // 2. Reseed fresh depth in the fixed plan order, capturing any
@@ -678,7 +684,9 @@ impl RealisticFill {
             });
         }
         if exhausted {
-            self.resting_strategy.remove(&maker_seq);
+            if let Some(meta) = self.resting_strategy.remove(&maker_seq) {
+                Self::release_live_order(&mut self.live_orders, &meta.contract)?;
+            }
             self.order_index.remove(&engine_order_id);
         }
         Ok(())
@@ -828,6 +836,10 @@ impl RealisticFill {
                 },
             );
             self.order_index.insert(engine_order_id, seq);
+            let count = self.live_orders.entry(intent.contract.clone()).or_insert(0);
+            *count = count
+                .checked_add(1)
+                .ok_or(BacktestError::ArithmeticOverflow)?;
         }
         Ok(())
     }
@@ -855,8 +867,33 @@ impl RealisticFill {
             // propagates as a typed book rejection.
             let _cancelled = book.cancel_order(ObOrderId::Sequential(seq))?;
         }
-        self.resting_strategy.remove(&seq);
+        if let Some(meta) = self.resting_strategy.remove(&seq) {
+            Self::release_live_order(&mut self.live_orders, &meta.contract)?;
+        }
         self.order_index.remove(&order_id);
+        Ok(())
+    }
+
+    /// Decrement (and drop at zero) the live-order count for `contract` — the
+    /// eviction index's remove half. An absent entry is a mirror/index desync
+    /// and surfaces as a typed error, never a silent wrong count.
+    fn release_live_order(
+        live_orders: &mut BTreeMap<ContractKey, u32>,
+        contract: &ContractKey,
+    ) -> Result<(), BacktestError> {
+        let Some(count) = live_orders.get_mut(contract) else {
+            return Err(BacktestError::Execution(
+                "live-order index missing an entry for a tracked resting order".to_string(),
+            ));
+        };
+        *count = count.checked_sub(1).ok_or_else(|| {
+            BacktestError::Execution(
+                "live-order index underflow for a tracked resting order".to_string(),
+            )
+        })?;
+        if *count == 0 {
+            live_orders.remove(contract);
+        }
         Ok(())
     }
 }
@@ -916,9 +953,34 @@ impl ExecutionModel for RealisticFill {
         // `fill_count = n`). `submit_ids` carries one pre-minted engine id per
         // `Submit`/`Replace` in command order — the identity the resting mirror
         // records (#110).
+        // Phase 1 — lifecycle first (the trait's ordered-command contract):
+        // every Cancel, and every Replace's cancel half, is applied BEFORE any
+        // Submit reaches the book, so a cancel frees queue space and removes
+        // liquidity a same-step Submit must not consume. Order within the
+        // class follows the queue.
+        for command in commands {
+            match command {
+                OrderCommand::Cancel(order_id) | OrderCommand::Replace { order_id, .. } => {
+                    self.cancel_resting(*order_id)?;
+                }
+                OrderCommand::Submit(_) => {}
+            }
+        }
+        // Phase 2 — submits (and Replace replacements) in command order. The
+        // pre-minted id ordinal counts one id per Submit/Replace in COMMAND
+        // order — the same stream the engine minted — so phase splitting does
+        // not perturb which order gets which id, and fill groups are pushed in
+        // ascending command_index (the order the engine's group walk expects).
         let mut next_submit_id: usize = 0;
-        let mut take_submit_id = |ids: &[OrderId]| -> Result<OrderId, BacktestError> {
-            let id = ids.get(next_submit_id).copied().ok_or_else(|| {
+        for (command_index, command) in commands.iter().enumerate() {
+            let intent = match command {
+                OrderCommand::Submit(intent) => intent,
+                // Cancel half already applied in phase 1; a Replace still
+                // consumes its id slot below via the shared ordinal.
+                OrderCommand::Replace { replacement, .. } => replacement,
+                OrderCommand::Cancel(_) => continue,
+            };
+            let engine_order_id = submit_ids.get(next_submit_id).copied().ok_or_else(|| {
                 BacktestError::Execution(
                     "submit_ids under-covers the step's Submit/Replace commands".to_string(),
                 )
@@ -926,61 +988,22 @@ impl ExecutionModel for RealisticFill {
             next_submit_id = next_submit_id
                 .checked_add(1)
                 .ok_or(BacktestError::ArithmeticOverflow)?;
-            Ok(id)
-        };
-        for (command_index, command) in commands.iter().enumerate() {
-            match command {
-                OrderCommand::Submit(intent) => {
-                    let engine_order_id = take_submit_id(submit_ids)?;
-                    let before = out_fills.len();
-                    self.fill_submit(intent, engine_order_id, snap, out_fills)?;
-                    // `fill_submit` only appends, so `len >= before` always holds;
-                    // `checked_sub` (never `saturating_sub` on a counter, per the
-                    // repo's Category-E rule) surfaces any future refactor that
-                    // shrank the buffer as a typed error rather than a silent 0.
-                    let produced = out_fills.len().checked_sub(before).ok_or_else(|| {
-                        BacktestError::Execution(
-                            "fill buffer shrank during fill_submit".to_string(),
-                        )
-                    })?;
-                    if produced > 0 {
-                        let fill_count = u32::try_from(produced)
-                            .map_err(|_| BacktestError::ArithmeticOverflow)?;
-                        self.fill_groups.push(FillGroup {
-                            command_index,
-                            fill_count,
-                        });
-                    }
-                }
-                OrderCommand::Cancel(order_id) => {
-                    self.cancel_resting(*order_id)?;
-                }
-                OrderCommand::Replace {
-                    order_id,
-                    replacement,
-                } => {
-                    // Cancel-then-submit: the old order dies (benign no-op if the
-                    // refresh already consumed it), the replacement routes as a
-                    // fresh submit under its own pre-minted id — a new order, a
-                    // new queue position, never an in-place amend.
-                    self.cancel_resting(*order_id)?;
-                    let replacement_id = take_submit_id(submit_ids)?;
-                    let before = out_fills.len();
-                    self.fill_submit(replacement, replacement_id, snap, out_fills)?;
-                    let produced = out_fills.len().checked_sub(before).ok_or_else(|| {
-                        BacktestError::Execution(
-                            "fill buffer shrank during fill_submit".to_string(),
-                        )
-                    })?;
-                    if produced > 0 {
-                        let fill_count = u32::try_from(produced)
-                            .map_err(|_| BacktestError::ArithmeticOverflow)?;
-                        self.fill_groups.push(FillGroup {
-                            command_index,
-                            fill_count,
-                        });
-                    }
-                }
+            let before = out_fills.len();
+            self.fill_submit(intent, engine_order_id, snap, out_fills)?;
+            // `fill_submit` only appends, so `len >= before` always holds;
+            // `checked_sub` (never `saturating_sub` on a counter, per the
+            // repo's Category-E rule) surfaces any future refactor that
+            // shrank the buffer as a typed error rather than a silent 0.
+            let produced = out_fills.len().checked_sub(before).ok_or_else(|| {
+                BacktestError::Execution("fill buffer shrank during fill_submit".to_string())
+            })?;
+            if produced > 0 {
+                let fill_count =
+                    u32::try_from(produced).map_err(|_| BacktestError::ArithmeticOverflow)?;
+                self.fill_groups.push(FillGroup {
+                    command_index,
+                    fill_count,
+                });
             }
         }
         Ok(())
@@ -2412,6 +2435,51 @@ mod tests {
         };
         assert_eq!(carry.order_id, TEST_SUBMIT_IDS[0]);
         assert_eq!(carry.fill_count, 2);
+    }
+
+    /// Review F3: lifecycle commands apply BEFORE submits — a queue carrying
+    /// `[Submit marketable buy, Cancel(resting sell)]` cancels the sell first,
+    /// so the buy crosses only seeded depth instead of self-crossing the
+    /// strategy's own resting order.
+    #[test]
+    fn test_mixed_queue_cancel_applies_before_submit() {
+        let mut model = RealisticFill::with_liquidity_profile(fees(), 30, 5, touch_only_profile());
+        let mut out: Vec<Fill> = Vec::new();
+        // Step 0: GTC sell 2 @ 500 rests on the ask (bid 480, quoted ask 600).
+        let OrderCommand::Submit(mut sell) = gtc_buy(500, 2, 550) else {
+            panic!("gtc_buy builds a Submit");
+        };
+        sell.side = Side::Short;
+        let r0 = model.fill(
+            &[OrderCommand::Submit(sell)],
+            TEST_SUBMIT_IDS,
+            &snapshot_full(0, 480, 600, 5, 5),
+            &mut out,
+        );
+        assert!(matches!(r0, Ok(())));
+        assert!(out.is_empty(), "the sell rests");
+        // Step 1: RAW order is [marketable buy, Cancel(sell)] — without
+        // lifecycle-first the buy would cross the resting sell at 500 and fail
+        // closed as a self-cross. With phase 1 the cancel lands first and the
+        // buy walks the reseeded 600 ask instead.
+        let cmds = [
+            marketable(Side::Long, PositionAction::Open, 2, 550),
+            OrderCommand::Cancel(TEST_SUBMIT_IDS[0]),
+        ];
+        let step1_ids = [TEST_SUBMIT_IDS[1]];
+        let r1 = model.fill(
+            &cmds,
+            &step1_ids,
+            &snapshot_full(1, 480, 600, 5, 5),
+            &mut out,
+        );
+        assert!(matches!(r1, Ok(())), "no self-cross: {r1:?}");
+        assert_eq!(out.len(), 1, "the buy fills against seeded depth");
+        let Some(fill) = out.first() else {
+            panic!("one fill");
+        };
+        assert_eq!(fill.price.value(), 600, "filled at the seeded ask, not 500");
+        assert!(model.resting_strategy.is_empty(), "the sell was cancelled");
     }
 
     /// The full lifecycle sequence is deterministic: two identically-driven
