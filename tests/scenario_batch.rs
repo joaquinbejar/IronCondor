@@ -447,6 +447,71 @@ fn test_batch_tampered_sha256_is_recorded_typed_error() {
             }
         }
     }
+    // #110: the materialise failure is cached per path as an error DESCRIPTOR,
+    // so every run sharing the path records the IDENTICAL rendered error (one
+    // parse of the bad file, not one per worker).
+    let descriptors: Vec<&String> = index
+        .runs
+        .iter()
+        .map(|entry| match &entry.outcome {
+            BatchRunOutcome::Error { error } => error,
+            BatchRunOutcome::Ok { .. } => panic!("all outcomes are errors here"),
+        })
+        .collect();
+    let (Some(first), Some(second)) = (descriptors.first(), descriptors.get(1)) else {
+        panic!("two run outcomes");
+    };
+    assert_eq!(
+        first, second,
+        "both runs record the identical cached descriptor"
+    );
+}
+
+/// #110: the recorded outcome error is the MATERIALISE-TIME descriptor — the
+/// sha256-mismatch message cached when the batch pre-materialised the path —
+/// not a per-run re-read artifact, and it survives the `Data` re-wrap intact.
+/// (True no-reopen is enforced by `open_and_run`'s cache-hit arm, which
+/// returns the descriptor before any filesystem call; the delete-between-
+/// materialise-and-fan-out control is not injectable through the public batch
+/// API, so this pins the observable half.)
+#[test]
+fn test_batch_cached_descriptor_replays_without_reopening() {
+    let Ok(dir) = tempfile::tempdir() else {
+        panic!("tempdir");
+    };
+    let parquet = dir.path().join("condor.parquet");
+    if let Err(e) = write_parquet(&parquet, &condor_rows(4, None)) {
+        panic!("write parquet fixture: {e}");
+    }
+    let out = dir.path().join("out");
+    let mut base = batch_base(&parquet, &out);
+    base.data_source = DataSourceSpec::Parquet {
+        path: parquet.display().to_string(),
+        sha256: "0".repeat(64),
+    };
+    let params = ScenarioParams {
+        kind: ScenarioType::MonteCarlo,
+        base_seed: 1,
+        count: 2,
+        sweep: Vec::new(),
+    };
+    let index = match run_scenario_batch(&params, &base, &iron_condor_spec(), &exit(), None) {
+        Ok(index) => index,
+        Err(e) => panic!("a batch with a bad sha must still return an index: {e}"),
+    };
+    for entry in &index.runs {
+        let BatchRunOutcome::Error { error } = &entry.outcome else {
+            panic!("a tampered sha must be a recorded error");
+        };
+        assert!(
+            error.contains("sha256"),
+            "the cached descriptor carries the original sha256-mismatch message: {error}"
+        );
+        assert!(
+            !error.contains("No such file"),
+            "the error is the materialise-time descriptor, not a re-read artifact"
+        );
+    }
 }
 
 /// A run whose recorded file is missing fails the re-read with a typed error

@@ -42,8 +42,8 @@ pub use realistic::RealisticFill;
 use crate::config::FeeSchedule;
 use crate::domain::execution::sign_convention;
 use crate::domain::{
-    Cents, ChainSnapshot, ContractKey, ExecutionMode, Fill, OrderCommand, PriceCents, Quantity,
-    SimTime, StepIndex,
+    Cents, ChainSnapshot, ContractKey, ExecutionMode, Fill, OrderCommand, OrderId, PriceCents,
+    Quantity, SimTime, StepIndex,
 };
 use crate::error::BacktestError;
 use optionstratlib::Side;
@@ -73,17 +73,46 @@ use optionstratlib::Side;
 ///   `0` consuming `fill_count` fills per group.
 /// - A `Cancel` / `Replace`, and a `Submit` that produced no fill, contribute
 ///   **no** group.
-/// - The groups account for **exactly** the command fills; refresh-generated
+/// - The groups account for the step's **command** fills; refresh-generated
 ///   fills (e1, [docs/04 §6.1](../../../docs/04-execution-models.md)) carry no
-///   group (they belong to a prior-step resting order, not a current command),
-///   so the engine requires `Σ fill_count == out_fills.len()` and rejects any
-///   surplus as an uncorrelated fill (resting-order fill routing is deferred).
+///   `FillGroup` — they belong to a prior-step resting order, not a current
+///   command, and are correlated through the parallel [`CarryGroup`] channel
+///   instead. The engine requires `Σ carry.fill_count + Σ group.fill_count ==
+///   out_fills.len()` and rejects any uncorrelated surplus as a typed error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FillGroup {
-    /// 0-based index into the step's `commands` of the `Submit` that produced
-    /// this contiguous run of fills.
+    /// 0-based index into the step's `commands` of the `Submit` (or `Replace`
+    /// replacement) that produced this contiguous run of fills.
     pub command_index: usize,
     /// The count of contiguous fills (`≥ 1`) this command produced.
+    pub fill_count: u32,
+}
+
+/// The refresh-fill → resting-order correlation channel — how a fill model tells
+/// the engine which of the **refresh-generated** fills (e1) at the FRONT of a
+/// step's `out_fills` belong to which prior-step resting [`OrderId`], so the
+/// engine can apply them to the leg the resting order opens or closes (the GTC
+/// resting-order lifecycle, issue #110).
+///
+/// A refresh fill belongs to a GTC order submitted in an **earlier** step, not to
+/// any command in the current step, so it carries no [`FillGroup`]. This parallel
+/// channel names its owning [`OrderId`] instead — the engine looks it up in its
+/// pending-order registry to find the leg to open (a new inventory leg) or close
+/// (`reduce_leg`). Refresh fills are always appended **before** the command fills
+/// ([docs/04 §6.1](../../../docs/04-execution-models.md)), so the carry groups
+/// describe a contiguous **prefix** of `out_fills` and the command [`FillGroup`]s
+/// describe the suffix.
+///
+/// Each `CarryGroup` is one contiguous run of refresh fills produced by one
+/// resting order, in the order they appear in the prefix; the engine consumes the
+/// prefix group-by-group. The default [`ExecutionModel::carry_fills`] is **empty**
+/// (naive mode, and any model without a resting book).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CarryGroup {
+    /// The prior-step resting order these refresh fills belong to — the identity
+    /// the engine pre-minted and the model recorded when the order rested.
+    pub order_id: OrderId,
+    /// The count of contiguous refresh fills (`≥ 1`) this resting order produced.
     pub fill_count: u32,
 }
 
@@ -106,6 +135,13 @@ pub trait ExecutionModel {
     ///   `out_fills` in place before the call so its capacity is reused — no
     ///   per-step `Vec<Fill>` allocation (PB-1,
     ///   [docs/07 §4](../../../docs/07-performance-and-security.md)).
+    /// - **Pre-minted order ids (the identity bridge).** `submit_ids` carries
+    ///   one engine-minted [`OrderId`] per `Submit` **and** per `Replace` (for
+    ///   its replacement), in **command order** — the identity a resting GTC
+    ///   order records so a later refresh fill (e1, [`CarryGroup`]) and a
+    ///   `Cancel` / `Replace` can name it (#110). A model with no resting book
+    ///   (naive) ignores it. The engine mints them monotonically, so an IOC-only
+    ///   run's ids are byte-identical to the earlier in-loop minting.
     /// - **Ordered command processing.** `Cancel` and `Replace` are applied
     ///   **before** `Submit`, in a fixed order, so cancels free queue space
     ///   before new submits contend for it.
@@ -132,9 +168,26 @@ pub trait ExecutionModel {
     fn fill(
         &mut self,
         commands: &[OrderCommand],
+        submit_ids: &[OrderId],
         snap: &ChainSnapshot,
         out_fills: &mut Vec<Fill>,
     ) -> Result<(), BacktestError>;
+
+    /// The refresh-fill → resting-order correlation for the **most recent**
+    /// [`Self::fill`] call (see [`CarryGroup`]) — the contiguous prefix of
+    /// refresh-generated fills (e1) and the prior-step [`OrderId`] each belongs
+    /// to. The engine consumes this prefix first, applying each group to the leg
+    /// its resting order opens or closes, before correlating the command fills
+    /// via [`Self::fill_groups`].
+    ///
+    /// The default is **empty**: naive mode has no resting book, and any model
+    /// that never rests a GTC order produces no refresh fills. Returning a borrow
+    /// of reusable model scratch keeps this allocation-free on the per-step path
+    /// (PB-1); the slice is valid until the next `fill`.
+    #[must_use]
+    fn carry_fills(&self) -> &[CarryGroup] {
+        &[]
+    }
 
     /// The fill→order correlation for the **most recent** [`Self::fill`] call —
     /// how the appended fills map back to the `Submit` commands (see
@@ -301,8 +354,9 @@ mod tests {
     use super::{ExecutionModel, FeeCharge, FillDraft, assemble_fill, fee_for_fill};
     use crate::config::FeeSchedule;
     use crate::domain::{
-        ChainSnapshot, ContractKey, ExecutionMode, Fill, InstrumentSpec, OrderCommand, OrderIntent,
-        PositionAction, PriceCents, Quantity, SimTime, StepIndex, TimeInForce, Underlying,
+        ChainSnapshot, ContractKey, ExecutionMode, Fill, InstrumentSpec, OrderCommand, OrderId,
+        OrderIntent, PositionAction, PriceCents, Quantity, SimTime, StepIndex, TimeInForce,
+        Underlying,
     };
     use crate::error::BacktestError;
 
@@ -377,6 +431,7 @@ mod tests {
         fn fill(
             &mut self,
             commands: &[OrderCommand],
+            _submit_ids: &[crate::domain::OrderId],
             snap: &ChainSnapshot,
             out_fills: &mut Vec<Fill>,
         ) -> Result<(), BacktestError> {
@@ -536,7 +591,8 @@ mod tests {
         };
         out.push(seed);
         let commands = [submit(152, 150), submit(151, 150)];
-        let result = model.fill(&commands, &snap, &mut out);
+        let ids = [OrderId::new(1), OrderId::new(2)];
+        let result = model.fill(&commands, &ids, &snap, &mut out);
         assert!(matches!(result, Ok(())));
         // one pre-existing + two appended, in submission order.
         assert_eq!(out.len(), 3);

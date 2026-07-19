@@ -15,6 +15,19 @@ use sha2::{Digest, Sha256};
 
 use ironcondor::{CsvFeed, DataFeed, DataSourceSpec, ParquetFeed, ResourceLimits};
 
+/// Pre-minted engine order ids for driving an execution model directly in
+/// tests: ample for any test's Submit/Replace count; arbitrary identities.
+const TEST_SUBMIT_IDS: &[ironcondor::OrderId] = &[
+    ironcondor::OrderId::new(9001),
+    ironcondor::OrderId::new(9002),
+    ironcondor::OrderId::new(9003),
+    ironcondor::OrderId::new(9004),
+    ironcondor::OrderId::new(9005),
+    ironcondor::OrderId::new(9006),
+    ironcondor::OrderId::new(9007),
+    ironcondor::OrderId::new(9008),
+];
+
 mod common;
 
 #[cfg(feature = "orderbook")]
@@ -954,7 +967,7 @@ fn test_realistic_marketable_buy_round_trips_two_seeded_levels() {
         decision_mid: PriceCents::new(500),
     });
     let mut out: Vec<Fill> = Vec::new();
-    let result = model.fill(&[buy], &snap, &mut out);
+    let result = model.fill(&[buy], TEST_SUBMIT_IDS, &snap, &mut out);
     assert!(matches!(result, Ok(())), "the marketable buy must route");
     assert_eq!(out.len(), 2, "the order walks two seeded levels");
 
@@ -1012,7 +1025,7 @@ fn test_realistic_ladder_walk_through_auto_seeded_depth_yields_per_level_fills()
         decision_mid: PriceCents::new(500),
     });
     let mut out: Vec<Fill> = Vec::new();
-    let result = model.fill(&[buy], &snap, &mut out);
+    let result = model.fill(&[buy], TEST_SUBMIT_IDS, &snap, &mut out);
     assert!(matches!(result, Ok(())), "the marketable buy must route");
     assert_eq!(out.len(), 3, "the buy walks three auto-seeded ask levels");
 
@@ -1071,7 +1084,7 @@ fn test_realistic_seeding_is_byte_identical_across_two_models() {
             decision_mid: PriceCents::new(500),
         });
         let mut out: Vec<Fill> = Vec::new();
-        match model.fill(&[buy], &snap, &mut out) {
+        match model.fill(&[buy], TEST_SUBMIT_IDS, &snap, &mut out) {
             Ok(()) => {}
             Err(e) => panic!("the marketable buy must route: {e}"),
         }
@@ -1129,7 +1142,7 @@ fn test_realistic_thin_vs_deep_strike_fill_quality_differs_with_depth() {
             decision_mid: PriceCents::new(500),
         });
         let mut out: Vec<Fill> = Vec::new();
-        match model.fill(&[buy], &snap, &mut out) {
+        match model.fill(&[buy], TEST_SUBMIT_IDS, &snap, &mut out) {
             Ok(()) => {}
             Err(e) => panic!("the marketable buy must route: {e}"),
         }
@@ -1332,7 +1345,12 @@ fn test_realistic_resting_limit_fills_when_consecutive_snapshot_crosses() {
 
     // snap0: wide ask 600, DEEP size 100. The buy rests below the ask — no fill.
     // This deep seed must NOT leak into later steps.
-    match model.fill(&[buy], &snap(0, 490, 600, 100, 100), &mut out) {
+    match model.fill(
+        &[buy],
+        TEST_SUBMIT_IDS,
+        &snap(0, 490, 600, 100, 100),
+        &mut out,
+    ) {
         Ok(()) => {}
         Err(e) => panic!("snap0 must route: {e}"),
     }
@@ -1345,7 +1363,7 @@ fn test_realistic_resting_limit_fills_when_consecutive_snapshot_crosses() {
     // deep snap0 seed and reseeds thin depth; the strategy order survives,
     // unfilled, its aged priority intact (never cancelled or reinserted).
     out.clear();
-    match model.fill(&[], &snap(1, 490, 540, 4, 4), &mut out) {
+    match model.fill(&[], TEST_SUBMIT_IDS, &snap(1, 490, 540, 4, 4), &mut out) {
         Ok(()) => {}
         Err(e) => panic!("snap1 must refresh: {e}"),
     }
@@ -1357,7 +1375,7 @@ fn test_realistic_resting_limit_fills_when_consecutive_snapshot_crosses() {
     // snap2: ask crosses at 500 — the resting buy fills via a refresh-generated
     // fill, at its own limit price (aged priority), tagged to the crossing step.
     out.clear();
-    match model.fill(&[], &snap(2, 490, 500, 4, 4), &mut out) {
+    match model.fill(&[], TEST_SUBMIT_IDS, &snap(2, 490, 500, 4, 4), &mut out) {
         Ok(()) => {}
         Err(e) => panic!("snap2 must refresh: {e}"),
     }
@@ -1404,6 +1422,7 @@ fn test_realistic_resting_limit_fills_when_consecutive_snapshot_crosses() {
             tif: TimeInForce::Ioc,
             decision_mid: PriceCents::new(500),
         })],
+        TEST_SUBMIT_IDS,
         &snap(3, 490, 500, 4, 4),
         &mut out,
     ) {
@@ -1524,8 +1543,18 @@ fn test_cross_mode_parity_same_strategy_shape_identical_pnl_differs() {
     let mut naive_out: Vec<Fill> = Vec::new();
     let mut realistic_out: Vec<Fill> = Vec::new();
     let (Ok(()), Ok(())) = (
-        naive_model.fill(std::slice::from_ref(&buy), &snap, &mut naive_out),
-        realistic_model.fill(std::slice::from_ref(&buy), &snap, &mut realistic_out),
+        naive_model.fill(
+            std::slice::from_ref(&buy),
+            TEST_SUBMIT_IDS,
+            &snap,
+            &mut naive_out,
+        ),
+        realistic_model.fill(
+            std::slice::from_ref(&buy),
+            TEST_SUBMIT_IDS,
+            &snap,
+            &mut realistic_out,
+        ),
     ) else {
         panic!("both models must fill the marketable buy");
     };

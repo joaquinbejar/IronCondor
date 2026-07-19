@@ -369,12 +369,26 @@ impl<S: PositionableStrategy> OptStratAdapter<S> {
     /// (the remainder is guarded strictly positive before it becomes a `Quantity`).
     fn close_all(
         open: &[OpenPosition],
+        pending: &[PendingOrder],
         snapshot: &ChainSnapshot,
         out: &mut Vec<OrderCommand>,
     ) -> Result<(), BacktestError> {
         for leg in open {
             let open_qty = leg.quantity.value();
-            let scheduled = scheduled_close_qty(out, leg.position_id)?;
+            let mut scheduled = scheduled_close_qty(out, leg.position_id)?;
+            // A resting (GTC) close is also scheduled coverage (#110): if it
+            // fills in this final step's refresh it closes the leg itself, and
+            // double-closing here would overshoot in reduce_leg. A pending
+            // remainder that never fills leaves the leg honestly open_at_end.
+            for pend in pending {
+                if let PositionAction::Close(pid) = pend.intent.action
+                    && pid == leg.position_id
+                {
+                    scheduled = scheduled
+                        .checked_add(pend.intent.quantity.value())
+                        .ok_or(BacktestError::ArithmeticOverflow)?;
+                }
+            }
             if scheduled >= open_qty {
                 // Already fully closed this step — appending another close would
                 // duplicate it and abort the run in reduce_leg.
@@ -706,8 +720,9 @@ impl<S: PositionableStrategy> Strategy for OptStratAdapter<S> {
         out: &mut Vec<OrderCommand>,
     ) -> Result<(), BacktestError> {
         // Closing commands only — the loop rejects a Submit(Open) from on_end.
-        // close_all skips legs the exit phase already closed this step (F11).
-        Self::close_all(ctx.open, ctx.snapshot, out)
+        // close_all skips legs the exit phase already closed this step (F11)
+        // and quantity covered by resting (GTC) closes still working (#110).
+        Self::close_all(ctx.open, ctx.pending, ctx.snapshot, out)
     }
 
     fn exit_reason(&self) -> ExitReason {
@@ -2257,5 +2272,45 @@ mod tests {
             adapter(composite).exit_reason(),
             ExitReason::Other(_)
         ));
+    }
+
+    /// #110: `close_all` reconciles against PENDING (resting GTC) closes — a
+    /// leg fully covered by a resting close is skipped, a partially covered leg
+    /// is flattened only for its uncovered remainder.
+    #[test]
+    fn test_close_all_skips_quantity_covered_by_pending_closes() {
+        let legs = open_legs();
+        let Some(first) = legs.first() else {
+            panic!("fixture has legs");
+        };
+        // A resting GTC close fully covering leg 1 (qty 1).
+        let pending = [crate::domain::PendingOrder {
+            order_id: OrderId::new(77),
+            intent: OrderIntent {
+                contract: first.contract.clone(),
+                action: PositionAction::Close(first.position_id),
+                side: Side::Long, // flattens the short leg
+                quantity: first.quantity,
+                limit: Some(PriceCents::new(1)),
+                tif: crate::domain::TimeInForce::Gtc,
+                decision_mid: PriceCents::new(2_000),
+            },
+        }];
+        let mut out: Vec<OrderCommand> = Vec::new();
+        let result =
+            OptStratAdapter::<IronCondor>::close_all(&legs, &pending, &snapshot(9), &mut out);
+        assert!(matches!(result, Ok(())));
+        // Leg 1 is fully covered by the pending close ⇒ skipped; the other
+        // three legs are flattened.
+        assert_eq!(out.len(), 3, "the pending-covered leg is not re-closed");
+        for cmd in &out {
+            let OrderCommand::Submit(intent) = cmd else {
+                panic!("close_all emits submits only");
+            };
+            let PositionAction::Close(pid) = intent.action else {
+                panic!("close_all emits closes only");
+            };
+            assert_ne!(pid, first.position_id, "leg 1 must not be re-closed");
+        }
     }
 }

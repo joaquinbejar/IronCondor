@@ -59,7 +59,8 @@ use crate::config::BacktestConfig;
 use crate::data::{DataFeed, DataSourceSpec};
 use crate::domain::{
     Cents, ChainSnapshot, EquityPoint, Fill, GreeksAttributionRow, OpenPosition, OrderCommand,
-    OrderId, OrderIntent, PositionAction, PositionId, PriceCents, Quantity, TradeId,
+    OrderId, OrderIntent, PendingOrder, PositionAction, PositionId, PriceCents, Quantity,
+    TimeInForce, TradeId,
 };
 use crate::engine::bundle_collector::{BundleCollector, FillRecord, PositionSnapshot};
 use crate::engine::clock::SimClock;
@@ -68,7 +69,8 @@ use crate::engine::strategy::{ChainContext, Strategy};
 use crate::engine::substrate::{AttributionCollector, AttributionSubstrate};
 use crate::engine::tradelog::{ClosedTrade, TradeLogCollector};
 use crate::error::BacktestError;
-use crate::execution::{ExecutionModel, FillGroup};
+use crate::execution::{CarryGroup, ExecutionModel, FillGroup};
+use std::collections::BTreeMap;
 
 /// Seeded, deterministic monotonic id counters.
 ///
@@ -274,6 +276,9 @@ impl BacktestEngine {
             attribution: AttributionCollector::with_capacity(capacity),
             trade_log: TradeLogCollector::with_capacity(16),
             bundle: BundleCollector::with_capacity(16),
+            pending_orders: BTreeMap::new(),
+            pending_scratch: Vec::new(),
+            submit_ids_scratch: Vec::with_capacity(16),
         };
 
         // Peek S0: the feed has no `peek`, so pull it and hold it as the
@@ -405,6 +410,22 @@ struct RunState<S: Strategy, X: ExecutionModel> {
     /// `on_start`; a fill is a sparse push and each open leg contributes one
     /// alloc-free snapshot per step against the reserved buffer — PB-1-safe.
     bundle: BundleCollector,
+    /// Live resting (GTC) orders by their stable [`OrderId`] (#110) — the
+    /// registry the carry-fill prefix is applied against, `Cancel`/`Replace` are
+    /// validated against, and [`ChainContext::pending`] is rebuilt from.
+    /// `BTreeMap` for deterministic iteration; empty on every IOC-only run.
+    pending_orders: BTreeMap<OrderId, PendingEntry>,
+    /// Reusable buffer for the strategy-facing pending view, rebuilt from the
+    /// registry each step (cleared in place; a [`PendingOrder`] clone is `Copy`
+    /// fields plus an `Arc<str>` refcount bump — PB-1-safe, and empty on every
+    /// IOC-only run).
+    pending_scratch: Vec<PendingOrder>,
+    /// Reusable buffer of pre-minted order ids — one per `Submit`/`Replace` in
+    /// command order, minted BEFORE the execution model runs so a resting order
+    /// can record its engine identity (#110). The minting order replicates the
+    /// former in-`apply_step_fills` sequence exactly, so IOC-only runs derive
+    /// byte-identical ids.
+    submit_ids_scratch: Vec<OrderId>,
 }
 
 impl<S: Strategy, X: ExecutionModel> RunState<S, X> {
@@ -423,6 +444,8 @@ impl<S: Strategy, X: ExecutionModel> RunState<S, X> {
             fills,
             trade_log,
             bundle,
+            pending_orders,
+            submit_ids_scratch,
             ..
         } = self;
         cmds.clear();
@@ -438,8 +461,15 @@ impl<S: Strategy, X: ExecutionModel> RunState<S, X> {
             strategy.on_start(&mut ctx, cmds)?;
         }
         fills.clear();
-        execution.fill(cmds.as_slice(), snapshot, fills)?;
+        mint_submit_ids(cmds.as_slice(), ids, submit_ids_scratch)?;
+        execution.fill(
+            cmds.as_slice(),
+            submit_ids_scratch.as_slice(),
+            snapshot,
+            fills,
+        )?;
         let groups = execution.fill_groups();
+        let carry = execution.carry_fills();
         // Startup emits opening intents only, so no close reason is consulted;
         // the ranges make every `Close` (were one ever emitted) a ManualClose.
         let reasons = CloseReasons {
@@ -451,12 +481,15 @@ impl<S: Strategy, X: ExecutionModel> RunState<S, X> {
             cmds.as_slice(),
             fills.as_slice(),
             groups,
+            carry,
+            submit_ids_scratch.as_slice(),
             snapshot,
             inventory,
             ids,
             ledger,
             trade_log,
             bundle,
+            pending_orders,
             &reasons,
         )?;
         Ok(())
@@ -480,10 +513,18 @@ impl<S: Strategy, X: ExecutionModel> RunState<S, X> {
             attribution,
             trade_log,
             bundle,
+            pending_orders,
+            pending_scratch,
+            submit_ids_scratch,
         } = self;
 
         // a. advance the clock (rejects a non-increasing ts as DataOutOfOrder).
         clock.advance_to(snapshot.ts, snapshot.step)?;
+
+        // b. rebuild the strategy-facing pending view from the registry (#110):
+        //    each entry's intent shows its REMAINING resting size. Cleared and
+        //    refilled in place — empty (and allocation-free) on IOC-only runs.
+        rebuild_pending_view(pending_orders, pending_scratch);
 
         // c. exits (closes) into the shared queue — strictly before entries.
         cmds.clear();
@@ -491,7 +532,7 @@ impl<S: Strategy, X: ExecutionModel> RunState<S, X> {
             let ctx = ChainContext {
                 snapshot,
                 open: inventory.as_slice(),
-                pending: &[],
+                pending: pending_scratch.as_slice(),
                 marks: ledger.marks(),
                 rng: &mut *rng,
                 step: snapshot.step,
@@ -507,7 +548,7 @@ impl<S: Strategy, X: ExecutionModel> RunState<S, X> {
             let mut ctx = ChainContext {
                 snapshot,
                 open: inventory.as_slice(),
-                pending: &[],
+                pending: pending_scratch.as_slice(),
                 marks: ledger.marks(),
                 rng: &mut *rng,
                 step: snapshot.step,
@@ -522,7 +563,7 @@ impl<S: Strategy, X: ExecutionModel> RunState<S, X> {
                 let mut ctx = ChainContext {
                     snapshot,
                     open: inventory.as_slice(),
-                    pending: &[],
+                    pending: pending_scratch.as_slice(),
                     marks: ledger.marks(),
                     rng: &mut *rng,
                     step: snapshot.step,
@@ -546,14 +587,23 @@ impl<S: Strategy, X: ExecutionModel> RunState<S, X> {
             policy_reason,
         };
 
-        // e. the single execution phase (naive = e2 only; realistic e1 is v0.2).
+        // e. the single execution phase (naive = e2 only; realistic = e1
+        //    refresh + e2 commands, with e1 carry fills routed via #110).
         fills.clear();
-        execution.fill(cmds.as_slice(), snapshot, fills)?;
+        mint_submit_ids(cmds.as_slice(), ids, submit_ids_scratch)?;
+        execution.fill(
+            cmds.as_slice(),
+            submit_ids_scratch.as_slice(),
+            snapshot,
+            fills,
+        )?;
         // The fill→order correlation for this call (`None` ⇒ one-per-`Submit`
-        // 1:1, naive; `Some` ⇒ one group per filling `Submit`, realistic).
-        // Borrows `execution` immutably, disjoint from the inventory/ledger/bundle
-        // borrows `apply_step_fills` takes.
+        // 1:1, naive; `Some` ⇒ one group per filling `Submit`, realistic), plus
+        // the carry channel naming which refresh fills belong to which resting
+        // order (#110). Borrows `execution` immutably, disjoint from the
+        // inventory/ledger/bundle borrows `apply_step_fills` takes.
         let groups = execution.fill_groups();
+        let carry = execution.carry_fills();
 
         // Capture the beginning-of-step holdings (as of S_{n-1}) BEFORE
         // apply_step_fills mutates the inventory, so a leg that closes this step
@@ -569,12 +619,15 @@ impl<S: Strategy, X: ExecutionModel> RunState<S, X> {
             cmds.as_slice(),
             fills.as_slice(),
             groups,
+            carry,
+            submit_ids_scratch.as_slice(),
             snapshot,
             inventory,
             ids,
             ledger,
             trade_log,
             bundle,
+            pending_orders,
             &reasons,
         )?;
 
@@ -644,6 +697,299 @@ fn reject_non_close(on_end_cmds: &[OrderCommand]) -> Result<(), BacktestError> {
 /// attribute each `Close`'s [`ExitReason`] to the phase that emitted it: the
 /// exit-policy phase (`cmds[0..exits_end)`), the terminal end-of-data phase
 /// (`cmds[on_end_start..)`), or an in-step strategy adjustment (in between).
+/// Mint one [`OrderId`] per `Submit`/`Replace` in command order into the reused
+/// scratch, BEFORE the execution model runs — the identity bridge (#110). The
+/// minting sequence replicates the former in-`apply_step_fills` per-`Submit`
+/// minting exactly, so an IOC-only run derives byte-identical ids.
+fn mint_submit_ids(
+    cmds: &[OrderCommand],
+    ids: &mut IdCounters,
+    scratch: &mut Vec<OrderId>,
+) -> Result<(), BacktestError> {
+    scratch.clear();
+    for cmd in cmds {
+        if matches!(cmd, OrderCommand::Submit(_) | OrderCommand::Replace { .. }) {
+            scratch.push(ids.mint_order()?);
+        }
+    }
+    Ok(())
+}
+
+/// Rebuild the strategy-facing pending view from the registry (#110): one
+/// [`PendingOrder`] per live resting order, in `OrderId` order, each intent
+/// showing its REMAINING resting size. Cleared and refilled in place.
+fn rebuild_pending_view(
+    pending: &BTreeMap<OrderId, PendingEntry>,
+    scratch: &mut Vec<PendingOrder>,
+) {
+    scratch.clear();
+    scratch.extend(pending.values().map(|entry| entry.pending.clone()));
+}
+
+/// Register a GTC remainder as a live working order (#110). `fills_so_far` is
+/// the count of fills the order already produced at its submit step (its
+/// `fill_seq` 0..n), so a later carried fill continues the sequence at `n`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one argument per registration-time signal; the registry insert centralises the shape"
+)]
+fn register_pending(
+    pending: &mut BTreeMap<OrderId, PendingEntry>,
+    order_id: OrderId,
+    intent: &OrderIntent,
+    remaining: Quantity,
+    fills_so_far: u32,
+    trade_id: Option<TradeId>,
+    position_id: Option<PositionId>,
+    reason: Option<ExitReason>,
+) {
+    let mut resting = intent.clone();
+    resting.quantity = remaining;
+    pending.insert(
+        order_id,
+        PendingEntry {
+            pending: PendingOrder {
+                order_id,
+                intent: resting,
+            },
+            trade_id,
+            position_id,
+            fills_so_far,
+            reason,
+        },
+    );
+}
+
+/// Extend an existing open leg with a carried fill run (#110): quantity grows
+/// by the run's total and the entry premium re-averages as the quantity-weighted
+/// VWAP of the old leg and the new fills — the same half-to-even policy as
+/// [`vwap_cents`]. The old leg's contribution uses its stored (already-rounded)
+/// VWAP — the only value the leg retains — so the combined figure is exact given
+/// that stored entry; the ledger's cash stays exact regardless (it applies every
+/// fill individually).
+fn extend_open_leg(
+    inventory: &mut [OpenPosition],
+    position_id: PositionId,
+    order_fills: &[Fill],
+    agg: &FillAggregate,
+) -> Result<(), BacktestError> {
+    let Some(leg) = inventory.iter_mut().find(|l| l.position_id == position_id) else {
+        return Err(BacktestError::Execution(format!(
+            "carry extension targets position {} which is not open",
+            position_id.value()
+        )));
+    };
+    let old_qty = u64::from(leg.quantity.value());
+    let old_notional = u128::from(leg.entry_premium.value())
+        .checked_mul(u128::from(old_qty))
+        .ok_or(BacktestError::ArithmeticOverflow)?;
+    let mut carry_notional: u128 = 0;
+    for fill in order_fills {
+        let leg_notional = u128::from(fill.price.value())
+            .checked_mul(u128::from(u64::from(fill.quantity.value())))
+            .ok_or(BacktestError::ArithmeticOverflow)?;
+        carry_notional = carry_notional
+            .checked_add(leg_notional)
+            .ok_or(BacktestError::ArithmeticOverflow)?;
+    }
+    let total_qty = old_qty
+        .checked_add(u64::from(agg.quantity.value()))
+        .ok_or(BacktestError::ArithmeticOverflow)?;
+    let total_notional = old_notional
+        .checked_add(carry_notional)
+        .ok_or(BacktestError::ArithmeticOverflow)?;
+    leg.quantity =
+        Quantity::new(u32::try_from(total_qty).map_err(|_| BacktestError::ArithmeticOverflow)?)?;
+    leg.entry_premium = vwap_cents(total_notional, total_qty)?;
+    Ok(())
+}
+
+/// Apply one carry group — a contiguous run of refresh fills belonging to one
+/// prior-step resting order — against the pending registry (#110): an `Open`
+/// entry pushes a NEW inventory leg under the order's original trade, a `Close`
+/// entry reduces its target leg; `fill_seq` continues from the order's prior
+/// fill count; the entry's remaining size shrinks and the entry drops at zero.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the carry application threads the same per-step state as apply_step_fills"
+)]
+fn apply_carry_group(
+    order_id: OrderId,
+    order_fills: &[Fill],
+    snapshot: &ChainSnapshot,
+    inventory: &mut Vec<OpenPosition>,
+    ids: &mut IdCounters,
+    ledger: &mut Ledger,
+    trade_log: &mut TradeLogCollector,
+    bundle: &mut BundleCollector,
+    pending: &mut BTreeMap<OrderId, PendingEntry>,
+    multiplier: u32,
+    ts_ns: i64,
+) -> Result<(), BacktestError> {
+    let Some(entry) = pending.get_mut(&order_id) else {
+        return Err(BacktestError::Execution(format!(
+            "carry group names order {} which is not pending",
+            order_id.value()
+        )));
+    };
+    let agg = aggregate_fills(order_fills)?;
+    let first = order_fills
+        .first()
+        .ok_or_else(|| BacktestError::Execution("a carry group's fill run is empty".to_string()))?;
+    let count = u32::try_from(order_fills.len()).map_err(|_| BacktestError::ArithmeticOverflow)?;
+    match entry.pending.intent.action {
+        PositionAction::Open => {
+            let trade_id = match entry.trade_id {
+                Some(existing) => existing,
+                None => {
+                    let minted = ids.mint_trade()?;
+                    entry.trade_id = Some(minted);
+                    minted
+                }
+            };
+            // ONE leg per resting order: the first fill (at submit or here)
+            // creates the position; every later carried fill EXTENDS it —
+            // quantity grows and the entry premium re-averages — so an
+            // `order_id` maps to exactly one `PositionId` in the bundle's
+            // trade → position → order → fill tree.
+            let position_id = match entry.position_id {
+                Some(existing) => {
+                    extend_open_leg(inventory, existing, order_fills, &agg)?;
+                    let Some(leg) = inventory.iter().find(|l| l.position_id == existing) else {
+                        return Err(BacktestError::Execution(format!(
+                            "carry extension lost leg {}",
+                            existing.value()
+                        )));
+                    };
+                    trade_log.record_open_extend(existing, agg.quantity, leg.entry_premium)?;
+                    bundle.register_open_leg(existing, trade_id, leg.entry_premium, first.side);
+                    existing
+                }
+                None => {
+                    let minted = ids.mint_position()?;
+                    entry.position_id = Some(minted);
+                    inventory.push(OpenPosition {
+                        position_id: minted,
+                        contract: first.contract.clone(),
+                        side: first.side,
+                        quantity: agg.quantity,
+                        entry_premium: agg.vwap,
+                    });
+                    trade_log.record_open(
+                        minted,
+                        trade_id,
+                        first.contract.clone(),
+                        first.side,
+                        agg.quantity,
+                        agg.vwap,
+                        ts_ns,
+                    );
+                    bundle.register_open_leg(minted, trade_id, agg.vwap, first.side);
+                    minted
+                }
+            };
+            for (level, fill) in order_fills.iter().enumerate() {
+                let level = u32::try_from(level).map_err(|_| BacktestError::ArithmeticOverflow)?;
+                let fill_seq = entry
+                    .fills_so_far
+                    .checked_add(level)
+                    .ok_or(BacktestError::ArithmeticOverflow)?;
+                bundle.record_open_fill(fill, order_id.value(), trade_id, position_id, fill_seq);
+                ledger.apply_fill(fill, multiplier)?;
+            }
+        }
+        PositionAction::Close(position_id) => {
+            let full_close = reduce_leg(inventory, position_id, agg.quantity)?;
+            let reason = entry.reason.clone().unwrap_or(ExitReason::ManualClose);
+            trade_log.record_close(
+                position_id,
+                agg.vwap,
+                agg.fees,
+                agg.slippage,
+                ts_ns,
+                agg.quantity,
+                multiplier,
+                reason.clone(),
+            )?;
+            let snapshot_mark = snapshot.quotes.get(&first.contract).map(|quote| quote.mid);
+            for (level, fill) in order_fills.iter().enumerate() {
+                let level = u32::try_from(level).map_err(|_| BacktestError::ArithmeticOverflow)?;
+                let fill_seq = entry
+                    .fills_so_far
+                    .checked_add(level)
+                    .ok_or(BacktestError::ArithmeticOverflow)?;
+                bundle.record_close_fill(fill, order_id.value(), position_id, fill_seq)?;
+                ledger.apply_fill(fill, multiplier)?;
+            }
+            if full_close {
+                bundle.record_close_terminal(
+                    &first.contract,
+                    first.step.value(),
+                    first.ts.value(),
+                    position_id,
+                    agg.quantity.value(),
+                    snapshot_mark,
+                    multiplier,
+                    reason,
+                )?;
+            }
+        }
+    }
+    entry.fills_so_far = entry
+        .fills_so_far
+        .checked_add(count)
+        .ok_or(BacktestError::ArithmeticOverflow)?;
+    let remaining = entry
+        .pending
+        .intent
+        .quantity
+        .value()
+        .checked_sub(agg.quantity.value())
+        .ok_or_else(|| {
+            BacktestError::Execution(format!(
+                "carry fills exceed order {}'s resting size",
+                order_id.value()
+            ))
+        })?;
+    if remaining == 0 {
+        pending.remove(&order_id);
+    } else {
+        entry.pending.intent.quantity = Quantity::new(remaining)?;
+    }
+    Ok(())
+}
+
+/// One live resting (GTC) order the engine is tracking across steps (#110):
+/// the strategy-facing [`PendingOrder`] view plus the correlation state the
+/// carry-fill application needs — the order's minted trade (opens), how many
+/// fills it has produced so far (the `fill_seq` continuation), and the close
+/// reason captured at registration (closes).
+#[derive(Debug, Clone)]
+struct PendingEntry {
+    /// The strategy-facing view: the stable [`OrderId`] handle plus the resting
+    /// intent with `quantity` = the REMAINING resting size.
+    pending: PendingOrder,
+    /// The trade this order's fills belong to. Every pending OPEN carries a
+    /// trade: the step trade is reserved at registration even when the order
+    /// filled nothing, so a multi-leg entry whose orders all rest still shares
+    /// ONE step-wide trade when the legs later fill (the public same-step
+    /// `trade_id` rule). `None` for closes (a close joins its position's trade).
+    trade_id: Option<TradeId>,
+    /// The single leg this open order builds. A partial submit creates it; a
+    /// zero-fill open creates it on the FIRST carried fill; every later carried
+    /// fill EXTENDS it (quantity + weighted entry) — one `order_id` maps to one
+    /// `PositionId` in the bundle's trade → position → order → fill tree.
+    /// `None` for closes and for opens that have not filled yet.
+    position_id: Option<PositionId>,
+    /// Fills this order has produced so far — the next carried fill's
+    /// `fill_seq`.
+    fills_so_far: u32,
+    /// The close reason captured when a `Close` rested (registration step), so a
+    /// later carried close records the reason the strategy scheduled it with.
+    /// `None` for opens.
+    reason: Option<ExitReason>,
+}
+
 struct CloseReasons {
     /// One past the last exit-policy close index — closes below it are the
     /// applied [`ExitPolicy`]'s.
@@ -815,17 +1161,36 @@ fn vwap_cents(notional: u128, total_qty: u64) -> Result<PriceCents, BacktestErro
 /// key ([docs/05 §7](../../../docs/05-analytics-and-reporting.md#7-fillsparquet)).
 /// A full close pushes one terminal `positions.parquet` row for the whole close.
 ///
-/// The `groups` must account for **exactly** the produced fills: any surplus is
-/// an uncorrelated fill (a refresh-generated fill of a prior-step resting order —
-/// routing those through the engine's inventory is deferred with the resting-order
-/// lifecycle), and any shortfall is a `Submit` that produced no fill; both are a
-/// typed [`BacktestError::Execution`].
+/// # The carry channel and the pending registry (#110)
+///
+/// `carry` (the [`ExecutionModel::carry_fills`] channel, [`CarryGroup`]) names
+/// which of the refresh-generated fills at the **front** of `fills` belong to
+/// which prior-step resting order. The prefix is applied FIRST, group by group,
+/// against `pending`: an `Open` entry pushes a NEW inventory leg (its own
+/// [`PositionId`], entry = the carried fill's price, the order's original
+/// [`TradeId`] — minted on the first carried fill if the submit step filled
+/// nothing) and a `Close` entry reduces its target leg; `fill_seq` continues
+/// from the order's prior fill count. A carry group naming an unknown order is a
+/// typed error. `carry` with `groups == None` (the naive contract) is also a
+/// typed error — carrying requires the grouped mode.
+///
+/// A `Submit`/`Replace` replacement with `tif == Gtc` that fills partially or
+/// not at all REGISTERS its remainder in `pending` (a working order) instead of
+/// failing; an IOC that produced no fill remains a typed error. `Cancel` and the
+/// replaced side of `Replace` drop their registry entry (validated against the
+/// step-start registry first — an id never registered is a typed error; an id
+/// consumed by THIS step's refresh is a benign no-op).
+///
+/// `carry` plus `groups` must account for **exactly** the produced fills; any
+/// mismatch is a typed [`BacktestError::Execution`].
 ///
 /// # Errors
 ///
 /// - [`BacktestError::Execution`] if a `Close` names an unknown leg or an
-///   oversized quantity, if a `Submit` produced no fill, or if the fills are not
-///   fully correlated to the submitted orders.
+///   oversized quantity, if an IOC `Submit` produced no fill, if a
+///   `Cancel`/`Replace` names an order that was never pending, if a carry group
+///   names an unknown resting order, or if the fills are not fully correlated to
+///   the submitted orders.
 /// - [`BacktestError::ArithmeticOverflow`] from id minting, the aggregation, the
 ///   ledger, the trade log's realised-P&L arithmetic, or the bundle collector's
 ///   unrealised arithmetic.
@@ -837,16 +1202,46 @@ fn apply_step_fills(
     cmds: &[OrderCommand],
     fills: &[Fill],
     groups: Option<&[FillGroup]>,
+    carry: &[CarryGroup],
+    submit_ids: &[OrderId],
     snapshot: &ChainSnapshot,
     inventory: &mut Vec<OpenPosition>,
     ids: &mut IdCounters,
     ledger: &mut Ledger,
     trade_log: &mut TradeLogCollector,
     bundle: &mut BundleCollector,
+    pending: &mut BTreeMap<OrderId, PendingEntry>,
     reasons: &CloseReasons,
 ) -> Result<(), BacktestError> {
     let multiplier = snapshot.spec.contract_multiplier;
     let ts_ns = snapshot.ts.value();
+
+    // Pre-validate lifecycle commands against the STEP-START registry (#110):
+    // a Cancel/Replace naming an order that is not pending now was never owned
+    // by the strategy (assert_owned guards the seam, but a hand-rolled Strategy
+    // could bypass it) — fail closed. During the command walk below an absent
+    // entry is instead benign: this step's own refresh (e1) may have consumed
+    // the order before its cancel applied.
+    for cmd in cmds {
+        let (OrderCommand::Cancel(order_id) | OrderCommand::Replace { order_id, .. }) = cmd else {
+            continue;
+        };
+        if !pending.contains_key(order_id) {
+            return Err(BacktestError::Execution(format!(
+                "cancel/replace targets order {} which is not pending",
+                order_id.value()
+            )));
+        }
+    }
+
+    // The carry channel requires the grouped correlation mode: under the naive
+    // 1:1 contract there is no resting book, so a non-empty carry is a seam
+    // violation, not data.
+    if groups.is_none() && !carry.is_empty() {
+        return Err(BacktestError::Execution(
+            "carry fills require the grouped correlation mode".to_string(),
+        ));
+    }
 
     // Coverage precheck: the correlation mode must account for EXACTLY the
     // produced fills, so the per-command consumption below never mis-attributes a
@@ -854,7 +1249,15 @@ fn apply_step_fills(
     // realistic) is the sum of the groups' fill counts — `Some(&[])` therefore
     // expects zero fills, so a surplus refresh fill is rejected here rather than
     // silently consumed one-per-`Submit` (F31).
-    let expected_fills = match groups {
+    let mut carry_total: usize = 0;
+    for group in carry {
+        let count =
+            usize::try_from(group.fill_count).map_err(|_| BacktestError::ArithmeticOverflow)?;
+        carry_total = carry_total
+            .checked_add(count)
+            .ok_or(BacktestError::ArithmeticOverflow)?;
+    }
+    let command_fills = match groups {
         None => cmds
             .iter()
             .filter(|cmd| matches!(cmd, OrderCommand::Submit(_)))
@@ -871,6 +1274,9 @@ fn apply_step_fills(
             total
         }
     };
+    let expected_fills = carry_total
+        .checked_add(command_fills)
+        .ok_or(BacktestError::ArithmeticOverflow)?;
     if expected_fills != fills.len() {
         return Err(BacktestError::Execution(format!(
             "execution fills are not fully correlated to submitted orders \
@@ -881,15 +1287,69 @@ fn apply_step_fills(
     }
 
     let mut cursor: usize = 0;
+
+    // --- The carry prefix (#110): refresh fills of prior-step resting orders,
+    // applied FIRST against the pending registry, before any command fill.
+    for group in carry {
+        let count =
+            usize::try_from(group.fill_count).map_err(|_| BacktestError::ArithmeticOverflow)?;
+        let end = cursor
+            .checked_add(count)
+            .ok_or(BacktestError::ArithmeticOverflow)?;
+        let order_fills = fills.get(cursor..end).ok_or_else(|| {
+            BacktestError::Execution("carry correlation ran past the produced fills".to_string())
+        })?;
+        cursor = end;
+        apply_carry_group(
+            group.order_id,
+            order_fills,
+            snapshot,
+            inventory,
+            ids,
+            ledger,
+            trade_log,
+            bundle,
+            pending,
+            multiplier,
+            ts_ns,
+        )?;
+    }
+
     // `None` (naive) has no group iterator; `Some` (grouped) walks the groups in
     // command order, matching each filling `Submit` by its `command_index`.
     let mut groups_iter = groups.map(|g| g.iter().peekable());
     // One trade_id per step's group of Open intents.
     let mut step_trade: Option<TradeId> = None;
+    // The pre-minted id ordinal: one id per `Submit`/`Replace`, in command order.
+    let mut submit_ordinal: usize = 0;
     for (idx, cmd) in cmds.iter().enumerate() {
-        match cmd {
-            OrderCommand::Submit(intent) => {
-                let order_id = ids.mint_order()?;
+        // Cancel drops its registry entry (benign when this step's refresh
+        // already consumed the order); Replace additionally routes its
+        // replacement below exactly like a `Submit`.
+        let intent = match cmd {
+            OrderCommand::Submit(intent) => intent,
+            OrderCommand::Cancel(order_id) => {
+                pending.remove(order_id);
+                continue;
+            }
+            OrderCommand::Replace {
+                order_id,
+                replacement,
+            } => {
+                pending.remove(order_id);
+                replacement
+            }
+        };
+        {
+            {
+                let order_id = submit_ids.get(submit_ordinal).copied().ok_or_else(|| {
+                    BacktestError::Execution(
+                        "pre-minted submit_ids under-cover the step's commands".to_string(),
+                    )
+                })?;
+                submit_ordinal = submit_ordinal
+                    .checked_add(1)
+                    .ok_or(BacktestError::ArithmeticOverflow)?;
                 // How many fills this `Submit` produced: exactly one under the
                 // naive one-per-`Submit` contract (`None`), else this command's
                 // group (`Some`), or zero when no group targets this index.
@@ -907,6 +1367,38 @@ fn apply_step_fills(
                     },
                 };
                 if count == 0 {
+                    if matches!(intent.tif, TimeInForce::Gtc) {
+                        // A GTC that crossed nothing rests whole — a working
+                        // order the carry channel can fill later (#110). An
+                        // OPEN reserves the step-wide trade NOW: opens emitted
+                        // together in one step share one trade_id even when
+                        // every one of them rests before filling.
+                        let (trade, reason) = match intent.action {
+                            PositionAction::Open => {
+                                let trade = match step_trade {
+                                    Some(existing) => existing,
+                                    None => {
+                                        let minted = ids.mint_trade()?;
+                                        step_trade = Some(minted);
+                                        minted
+                                    }
+                                };
+                                (Some(trade), None)
+                            }
+                            PositionAction::Close(_) => (None, Some(reasons.reason_for(idx))),
+                        };
+                        register_pending(
+                            pending,
+                            order_id,
+                            intent,
+                            intent.quantity,
+                            0,
+                            trade,
+                            None,
+                            reason,
+                        );
+                        continue;
+                    }
                     return Err(BacktestError::Execution(format!(
                         "submitted order at command index {idx} produced no fill \
                          (a zero-fill order cannot open or close a leg)"
@@ -929,6 +1421,10 @@ fn apply_step_fills(
                     "a fill must echo its submitted contract"
                 );
                 let agg = aggregate_fills(order_fills)?;
+                // The position this Submit opened (None for closes) — threaded
+                // into a GTC remainder's registry entry so later carried fills
+                // EXTEND this leg instead of minting a new one per carry.
+                let mut opened_position: Option<PositionId> = None;
                 match intent.action {
                     PositionAction::Open => {
                         let trade_id = match step_trade {
@@ -940,6 +1436,7 @@ fn apply_step_fills(
                             }
                         };
                         let position_id = ids.mint_position()?;
+                        opened_position = Some(position_id);
                         inventory.push(OpenPosition {
                             position_id,
                             contract: first.contract.clone(),
@@ -1013,11 +1510,39 @@ fn apply_step_fills(
                         }
                     }
                 }
+                // A GTC that filled only part of its size rests the remainder —
+                // register it as a working order the carry channel can fill
+                // later (#110). IOC remainders were discarded by the model.
+                if matches!(intent.tif, TimeInForce::Gtc) {
+                    let filled = u64::from(agg.quantity.value());
+                    let total = u64::from(intent.quantity.value());
+                    if filled < total {
+                        let remainder = total
+                            .checked_sub(filled)
+                            .ok_or(BacktestError::ArithmeticOverflow)?;
+                        let remainder = Quantity::new(
+                            u32::try_from(remainder)
+                                .map_err(|_| BacktestError::ArithmeticOverflow)?,
+                        )?;
+                        let (trade, reason) = match intent.action {
+                            PositionAction::Open => (step_trade, None),
+                            PositionAction::Close(_) => (None, Some(reasons.reason_for(idx))),
+                        };
+                        let produced = u32::try_from(order_fills.len())
+                            .map_err(|_| BacktestError::ArithmeticOverflow)?;
+                        register_pending(
+                            pending,
+                            order_id,
+                            intent,
+                            remainder,
+                            produced,
+                            trade,
+                            opened_position,
+                            reason,
+                        );
+                    }
+                }
             }
-            // Cancel/replace produce no fill and no inventory/cash effect here;
-            // resting-order lifecycle (and its order-id minting) lands with the
-            // realistic book (v0.2).
-            OrderCommand::Cancel(_) | OrderCommand::Replace { .. } => {}
         }
     }
     // The precheck guarantees full coverage; assert the walk consumed every fill
@@ -1107,7 +1632,7 @@ mod tests {
     use crate::data::feed::InMemoryFeed;
     use crate::domain::{
         Cents, ChainSnapshot, ContractKey, ExecutionMode, Fill, InstrumentSpec, OrderCommand,
-        OrderIntent, PositionAction, PositionId, PriceCents, Quantity, QuoteView, SimTime,
+        OrderId, OrderIntent, PositionAction, PositionId, PriceCents, Quantity, QuoteView, SimTime,
         StepIndex, Underlying,
     };
     use crate::engine::strategy::{ChainContext, Strategy};
@@ -1481,6 +2006,7 @@ mod tests {
         fn fill(
             &mut self,
             _commands: &[OrderCommand],
+            _submit_ids: &[OrderId],
             snap: &ChainSnapshot,
             out_fills: &mut Vec<Fill>,
         ) -> Result<(), BacktestError> {
@@ -2043,5 +2569,457 @@ mod tests {
         };
         assert_eq!(last.position_value_cents, 0);
         assert_eq!(last.equity_cents, 10_000_000 - 106_425 + 93_575);
+    }
+
+    // --- #110 resting-order lifecycle through the full engine loop ----------
+
+    /// A strategy that submits ONE resting GTC buy at `on_start` and otherwise
+    /// holds; optionally cancels it at a given step (via the pending view).
+    #[cfg(feature = "orderbook")]
+    struct GtcRest {
+        limit: u64,
+        quantity: u32,
+        cancel_at_step: Option<u32>,
+    }
+
+    #[cfg(feature = "orderbook")]
+    impl Strategy for GtcRest {
+        fn on_start(
+            &mut self,
+            ctx: &mut ChainContext,
+            out: &mut Vec<OrderCommand>,
+        ) -> Result<(), BacktestError> {
+            out.push(OrderCommand::Submit(OrderIntent {
+                contract: call_key(),
+                action: PositionAction::Open,
+                side: Side::Long,
+                quantity: Quantity::new(self.quantity)?,
+                limit: Some(PriceCents::new(self.limit)),
+                tif: crate::domain::TimeInForce::Gtc,
+                decision_mid: ctx
+                    .snapshot
+                    .quotes
+                    .get(&call_key())
+                    .map_or(PriceCents::new(self.limit), |q| q.mid),
+            }));
+            Ok(())
+        }
+
+        fn exits(
+            &mut self,
+            _ctx: &ChainContext,
+            _out: &mut Vec<OrderCommand>,
+        ) -> Result<(), BacktestError> {
+            Ok(())
+        }
+
+        fn on_snapshot(
+            &mut self,
+            ctx: &mut ChainContext,
+            out: &mut Vec<OrderCommand>,
+        ) -> Result<(), BacktestError> {
+            if let Some(step) = self.cancel_at_step
+                && ctx.step.value() == step
+                && let Some(pending) = ctx.pending.first()
+            {
+                out.push(OrderCommand::Cancel(pending.order_id));
+            }
+            Ok(())
+        }
+
+        fn on_end(
+            &mut self,
+            _ctx: &mut ChainContext,
+            _out: &mut Vec<OrderCommand>,
+        ) -> Result<(), BacktestError> {
+            Ok(())
+        }
+
+        fn exit_reason(&self) -> super::ExitReason {
+            super::ExitReason::ManualClose
+        }
+    }
+
+    #[cfg(feature = "orderbook")]
+    fn realistic() -> crate::execution::RealisticFill {
+        let cfg = config();
+        crate::execution::RealisticFill::with_liquidity_profile(
+            cfg.fees,
+            cfg.marketable_cap_ticks,
+            cfg.seed,
+            cfg.liquidity_profile,
+        )
+    }
+
+    /// The carry path end to end: a GTC buy rests at step 0 (ask 610 above the
+    /// 500 limit), the step-1 reseed ask at 500 crosses it, and the engine
+    /// opens the leg from the carried fill under the ORIGINAL order id.
+    #[test]
+    #[cfg(feature = "orderbook")]
+    fn test_engine_resting_gtc_opens_via_carry_with_original_order_id() {
+        let run = BacktestEngine::run(
+            &config(),
+            feed_of(&[600, 490, 490]),
+            realistic(),
+            GtcRest {
+                limit: 500,
+                quantity: 2,
+                cancel_at_step: None,
+            },
+            "gtc-rest",
+        );
+        let Ok(run) = run else {
+            panic!("the carry-path run succeeds: {run:?}");
+        };
+        assert_eq!(run.fills.len(), 1, "exactly the carried fill");
+        let Some(fill) = run.fills.first() else {
+            panic!("one fill record");
+        };
+        assert_eq!(fill.order_id, 1, "the step-0 pre-minted order id");
+        assert_eq!(fill.fill.step.value(), 1, "filled by step 1's refresh");
+        assert_eq!(fill.fill_seq, 0, "the order's first fill");
+        assert_eq!(fill.fill.price.value(), 500);
+        assert_eq!(run.open_at_end.len(), 1, "the carried open stays open");
+        assert_eq!(run.equity_curve.len(), 3);
+    }
+
+    /// Cancelling the resting order before the market crosses means it NEVER
+    /// fills: no fill record, no position, a flat run.
+    #[test]
+    #[cfg(feature = "orderbook")]
+    fn test_engine_cancel_before_cross_never_fills() {
+        let run = BacktestEngine::run(
+            &config(),
+            feed_of(&[600, 600, 490]),
+            realistic(),
+            GtcRest {
+                limit: 500,
+                quantity: 2,
+                cancel_at_step: Some(1),
+            },
+            "gtc-cancel",
+        );
+        let Ok(run) = run else {
+            panic!("the cancel run succeeds: {run:?}");
+        };
+        assert!(run.fills.is_empty(), "a cancelled order never fills");
+        assert!(run.open_at_end.is_empty());
+        assert!(run.trade_log.is_empty());
+    }
+
+    /// A pending open still resting when the feed exhausts is dropped cleanly:
+    /// no phantom fill, no position, the run ends flat.
+    #[test]
+    #[cfg(feature = "orderbook")]
+    fn test_engine_pending_open_at_end_is_dropped_cleanly() {
+        let run = BacktestEngine::run(
+            &config(),
+            feed_of(&[600, 600]),
+            realistic(),
+            GtcRest {
+                limit: 500,
+                quantity: 2,
+                cancel_at_step: None,
+            },
+            "gtc-unfilled",
+        );
+        let Ok(run) = run else {
+            panic!("the unfilled run succeeds: {run:?}");
+        };
+        assert!(run.fills.is_empty(), "no fill was invented at end of data");
+        assert!(run.open_at_end.is_empty());
+        assert!(run.trade_log.is_empty());
+    }
+
+    /// Review F1: a GTC that fills PARTIALLY at submit and completes on a later
+    /// refresh builds ONE position — the carried fill extends the leg (quantity
+    /// and blended entry) under the same position/trade/order identity.
+    #[cfg(feature = "orderbook")]
+    fn sized_feed(specs: &[(u64, u32)]) -> InMemoryFeed {
+        let tape: Vec<ChainSnapshot> = specs
+            .iter()
+            .enumerate()
+            .map(|(step, &(mid, size))| {
+                let step = u32::try_from(step).unwrap_or(u32::MAX);
+                let mut snap = snapshot(step, mid);
+                if let Some(q) = snap.quotes.get_mut(&call_key()) {
+                    q.ask_size = qty(size);
+                    q.bid_size = qty(size);
+                }
+                snap
+            })
+            .collect();
+        let source = DataSourceSpec::Parquet {
+            path: "test.parquet".to_string(),
+            sha256: "test-sha".to_string(),
+        };
+        let Ok(feed) = InMemoryFeed::new("test-sha".to_string(), tape, source) else {
+            panic!("a strictly-ordered non-empty tape builds a feed");
+        };
+        feed
+    }
+
+    #[test]
+    #[cfg(feature = "orderbook")]
+    fn test_engine_partial_fill_across_snapshots_extends_one_position() {
+        // Step 0: ask 500 size 2 — the GTC buy 4 @ 500 fills 2, rests 2.
+        // Step 1: ask 500 size 2 again — the reseed crosses the remainder.
+        let run = BacktestEngine::run(
+            &config(),
+            sized_feed(&[(490, 2), (490, 2), (490, 2)]),
+            realistic(),
+            GtcRest {
+                limit: 500,
+                quantity: 4,
+                cancel_at_step: None,
+            },
+            "gtc-partial",
+        );
+        let Ok(run) = run else {
+            panic!("the partial-fill run succeeds: {run:?}");
+        };
+        assert_eq!(run.fills.len(), 2, "submit fill + carried fill");
+        let (Some(first), Some(second)) = (run.fills.first(), run.fills.get(1)) else {
+            panic!("two fill records");
+        };
+        assert_eq!(first.order_id, second.order_id, "one order");
+        assert_eq!(
+            first.position_id, second.position_id,
+            "ONE position — the carry extends the leg, never mints a second"
+        );
+        assert_eq!(first.trade_id, second.trade_id, "one trade");
+        assert_eq!(
+            (first.fill_seq, second.fill_seq),
+            (0, 1),
+            "fill_seq continues"
+        );
+        assert_eq!(run.open_at_end.len(), 1);
+        let Some(leg) = run.open_at_end.first() else {
+            panic!("one leg");
+        };
+        assert_eq!(leg.quantity.value(), 4, "the leg carries the full size");
+    }
+
+    /// Review F2: a multi-order entry whose GTC opens ALL rest at submit still
+    /// shares ONE step-wide trade when the legs later fill.
+    #[cfg(feature = "orderbook")]
+    struct TwoGtcRest;
+
+    #[cfg(feature = "orderbook")]
+    impl Strategy for TwoGtcRest {
+        fn on_start(
+            &mut self,
+            ctx: &mut ChainContext,
+            out: &mut Vec<OrderCommand>,
+        ) -> Result<(), BacktestError> {
+            let mid = ctx
+                .snapshot
+                .quotes
+                .get(&call_key())
+                .map_or(PriceCents::new(500), |q| q.mid);
+            for _ in 0..2 {
+                out.push(OrderCommand::Submit(OrderIntent {
+                    contract: call_key(),
+                    action: PositionAction::Open,
+                    side: Side::Long,
+                    quantity: qty(1),
+                    limit: Some(PriceCents::new(500)),
+                    tif: crate::domain::TimeInForce::Gtc,
+                    decision_mid: mid,
+                }));
+            }
+            Ok(())
+        }
+
+        fn exits(
+            &mut self,
+            _ctx: &ChainContext,
+            _out: &mut Vec<OrderCommand>,
+        ) -> Result<(), BacktestError> {
+            Ok(())
+        }
+
+        fn on_snapshot(
+            &mut self,
+            _ctx: &mut ChainContext,
+            _out: &mut Vec<OrderCommand>,
+        ) -> Result<(), BacktestError> {
+            Ok(())
+        }
+
+        fn on_end(
+            &mut self,
+            _ctx: &mut ChainContext,
+            _out: &mut Vec<OrderCommand>,
+        ) -> Result<(), BacktestError> {
+            Ok(())
+        }
+
+        fn exit_reason(&self) -> super::ExitReason {
+            super::ExitReason::ManualClose
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "orderbook")]
+    fn test_engine_all_resting_multi_leg_entry_shares_one_trade() {
+        // Both GTC buys rest at step 0 (ask 610) and fill on step 1's reseed
+        // (ask 500) — two orders, two positions, ONE step-wide trade.
+        let run = BacktestEngine::run(
+            &config(),
+            feed_of(&[600, 490, 490]),
+            realistic(),
+            TwoGtcRest,
+            "two-gtc",
+        );
+        let Ok(run) = run else {
+            panic!("the all-resting run succeeds: {run:?}");
+        };
+        assert_eq!(run.fills.len(), 2, "both resting opens filled");
+        let (Some(first), Some(second)) = (run.fills.first(), run.fills.get(1)) else {
+            panic!("two fill records");
+        };
+        assert_ne!(first.order_id, second.order_id, "two orders");
+        assert_ne!(first.position_id, second.position_id, "two legs");
+        assert_eq!(
+            first.trade_id, second.trade_id,
+            "opens emitted together share ONE step-wide trade"
+        );
+    }
+
+    /// The carry path is deterministic: two identical runs produce identical
+    /// equity curves and fill identities.
+    #[test]
+    #[cfg(feature = "orderbook")]
+    fn test_engine_carry_path_run_twice_is_identical() {
+        let go = || {
+            let run = BacktestEngine::run(
+                &config(),
+                feed_of(&[600, 490, 490]),
+                realistic(),
+                GtcRest {
+                    limit: 500,
+                    quantity: 2,
+                    cancel_at_step: None,
+                },
+                "gtc-rest",
+            );
+            let Ok(run) = run else {
+                panic!("the run succeeds");
+            };
+            let fill_ids: Vec<(u64, u32, u32)> = run
+                .fills
+                .iter()
+                .map(|f| (f.order_id, f.fill.step.value(), f.fill_seq))
+                .collect();
+            (run.equity_curve, fill_ids)
+        };
+        let (equity_a, fills_a) = go();
+        let (equity_b, fills_b) = go();
+        assert_eq!(equity_a, equity_b, "byte-identical equity curves");
+        assert_eq!(fills_a, fills_b, "identical fill identities");
+    }
+
+    /// #110: a strategy that opens marketable-IOC at start and rests a GTC
+    /// close that never crosses — the leg must end honestly `open_at_end` (the
+    /// pending close is dropped, never phantom-filled, and the run never
+    /// aborts in `reduce_leg`).
+    #[cfg(feature = "orderbook")]
+    struct OpenThenRestClose {
+        rested: bool,
+    }
+
+    #[cfg(feature = "orderbook")]
+    impl Strategy for OpenThenRestClose {
+        fn on_start(
+            &mut self,
+            ctx: &mut ChainContext,
+            out: &mut Vec<OrderCommand>,
+        ) -> Result<(), BacktestError> {
+            out.push(OrderCommand::Submit(OrderIntent {
+                contract: call_key(),
+                action: PositionAction::Open,
+                side: Side::Long,
+                quantity: qty(1),
+                limit: None,
+                tif: crate::domain::TimeInForce::Ioc,
+                decision_mid: ctx
+                    .snapshot
+                    .quotes
+                    .get(&call_key())
+                    .map_or(PriceCents::new(500), |q| q.mid),
+            }));
+            Ok(())
+        }
+
+        fn exits(
+            &mut self,
+            _ctx: &ChainContext,
+            _out: &mut Vec<OrderCommand>,
+        ) -> Result<(), BacktestError> {
+            Ok(())
+        }
+
+        fn on_snapshot(
+            &mut self,
+            ctx: &mut ChainContext,
+            out: &mut Vec<OrderCommand>,
+        ) -> Result<(), BacktestError> {
+            if !self.rested
+                && let Some(leg) = ctx.open.first()
+            {
+                self.rested = true;
+                out.push(OrderCommand::Submit(OrderIntent {
+                    contract: leg.contract.clone(),
+                    action: PositionAction::Close(leg.position_id),
+                    side: Side::Short,
+                    quantity: leg.quantity,
+                    // A sell limit far ABOVE the market: rests, never crosses.
+                    limit: Some(PriceCents::new(100_000)),
+                    tif: crate::domain::TimeInForce::Gtc,
+                    decision_mid: PriceCents::new(600),
+                }));
+            }
+            Ok(())
+        }
+
+        fn on_end(
+            &mut self,
+            _ctx: &mut ChainContext,
+            _out: &mut Vec<OrderCommand>,
+        ) -> Result<(), BacktestError> {
+            Ok(())
+        }
+
+        fn exit_reason(&self) -> super::ExitReason {
+            super::ExitReason::ManualClose
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "orderbook")]
+    fn test_engine_resting_close_that_never_fills_leaves_leg_open_at_end() {
+        let run = BacktestEngine::run(
+            &config(),
+            feed_of(&[600, 600, 600]),
+            realistic(),
+            OpenThenRestClose { rested: false },
+            "rest-close",
+        );
+        let Ok(run) = run else {
+            panic!("the resting-close run succeeds: {run:?}");
+        };
+        // The open filled marketable at start; the resting close never crossed.
+        assert_eq!(run.open_at_end.len(), 1, "the leg ends honestly open");
+        assert!(
+            run.trade_log.is_empty(),
+            "no close was realised — the resting close never filled"
+        );
+        // Exactly the opening fills exist (marketable walk), none from the
+        // resting close.
+        assert!(
+            run.fills.iter().all(|f| f.fill.step.value() == 0),
+            "every fill is the step-0 open"
+        );
     }
 }

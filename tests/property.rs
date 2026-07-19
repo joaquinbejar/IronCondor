@@ -24,6 +24,19 @@ use ironcondor::{
 use ironcondor::{EquityPoint, FillRow, GreeksAttributionRow, PositionRow, RowCounts, RunId};
 use rand_chacha::rand_core::RngCore;
 
+/// Pre-minted engine order ids for driving an execution model directly in
+/// tests: ample for any test's Submit/Replace count; arbitrary identities.
+const TEST_SUBMIT_IDS: &[ironcondor::OrderId] = &[
+    ironcondor::OrderId::new(9001),
+    ironcondor::OrderId::new(9002),
+    ironcondor::OrderId::new(9003),
+    ironcondor::OrderId::new(9004),
+    ironcondor::OrderId::new(9005),
+    ironcondor::OrderId::new(9006),
+    ironcondor::OrderId::new(9007),
+    ironcondor::OrderId::new(9008),
+];
+
 mod common;
 
 /// The JSON object keys of a serialised value, sorted — the field *shape* of
@@ -444,7 +457,7 @@ proptest! {
             decision_mid: PriceCents::new(mid), // decision_mid == mid
         })];
         let mut out = Vec::new();
-        let result = model.fill(&commands, &snap, &mut out);
+        let result = model.fill(&commands, TEST_SUBMIT_IDS, &snap, &mut out);
         prop_assert!(matches!(result, Ok(())));
         prop_assert_eq!(out.len(), 1); // always single-shot, always fills
         let Some(fill) = out.first() else { return Ok(()); };
@@ -1108,7 +1121,7 @@ proptest! {
             decision_mid: PriceCents::new(price),
         });
         let mut out: Vec<Fill> = Vec::new();
-        prop_assert!(model.fill(&[buy], &snap, &mut out).is_ok());
+        prop_assert!(model.fill(&[buy], TEST_SUBMIT_IDS, &snap, &mut out).is_ok());
         prop_assert_eq!(out.len(), 1);
         let Some(fill) = out.first() else { return Ok(()); };
         prop_assert_eq!(fill.price.value(), price);
@@ -1136,7 +1149,7 @@ proptest! {
             decision_mid: PriceCents::new(price),
         });
         let mut out: Vec<Fill> = Vec::new();
-        let result = model.fill(&[submit], &snap, &mut out);
+        let result = model.fill(&[submit], TEST_SUBMIT_IDS, &snap, &mut out);
         // Bind the match to a bool first: `prop_assert!` stringifies its
         // condition into a format string, and `{ price: p }` braces would be
         // read as format placeholders.
@@ -1192,7 +1205,7 @@ proptest! {
             decision_mid: PriceCents::new(touch),
         });
         let mut out: Vec<Fill> = Vec::new();
-        prop_assert!(model.fill(&[buy], &snap, &mut out).is_ok());
+        prop_assert!(model.fill(&[buy], TEST_SUBMIT_IDS, &snap, &mut out).is_ok());
         prop_assert_eq!(out.len(), 3); // the buy walks all three seeded levels
 
         let mut prev_price = 0u64;
@@ -1309,7 +1322,7 @@ fn test_same_seed_same_result_realistic_multi_snapshot_refresh() {
             } else {
                 Vec::new()
             };
-            match model.fill(&cmds, snap, &mut out) {
+            match model.fill(&cmds, TEST_SUBMIT_IDS, snap, &mut out) {
                 Ok(()) => {}
                 Err(e) => panic!("the multi-snapshot refresh run must succeed: {e}"),
             }

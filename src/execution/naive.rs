@@ -175,6 +175,7 @@ impl ExecutionModel for NaiveFill {
     fn fill(
         &mut self,
         commands: &[OrderCommand],
+        _submit_ids: &[crate::domain::OrderId],
         snap: &ChainSnapshot,
         out_fills: &mut Vec<Fill>,
     ) -> Result<(), BacktestError> {
@@ -392,7 +393,8 @@ mod tests {
         snap: &ChainSnapshot,
     ) -> Vec<crate::domain::Fill> {
         let mut out = Vec::new();
-        let result = model.fill(commands, snap, &mut out);
+        // Naive holds no resting book and ignores the pre-minted order ids.
+        let result = model.fill(commands, &[], snap, &mut out);
         assert!(matches!(result, Ok(())), "naive fill must succeed");
         out
     }
@@ -593,7 +595,12 @@ mod tests {
     fn test_naive_fill_missing_quote_execution_error() {
         let mut m = model(SlippageModel::None);
         let mut out = Vec::new();
-        let result = m.fill(&[submit(Side::Long, 1, 105)], &empty_snapshot(), &mut out);
+        let result = m.fill(
+            &[submit(Side::Long, 1, 105)],
+            &[],
+            &empty_snapshot(),
+            &mut out,
+        );
         assert!(matches!(
             result,
             Err(crate::error::BacktestError::Execution(_))
@@ -614,7 +621,7 @@ mod tests {
         let snap = snapshot_with(100, 110);
         let mut out = run(&mut m, &[submit(Side::Long, 1, 105)], &snap);
         let before = out.len();
-        let result = m.fill(&[submit(Side::Short, 1, 105)], &snap, &mut out);
+        let result = m.fill(&[submit(Side::Short, 1, 105)], &[], &snap, &mut out);
         assert!(matches!(result, Ok(())));
         assert_eq!(out.len(), before + 1);
     }

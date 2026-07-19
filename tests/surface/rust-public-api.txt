@@ -137,6 +137,7 @@ default struct engine::substrate::AttributionSubstrate
 default struct engine::substrate::LegAttributionSample
 default struct engine::substrate::StepAttributionScalars
 default struct engine::tradelog::ClosedTrade
+default struct execution::CarryGroup
 default struct execution::FillGroup
 default struct execution::naive::NaiveFill
 default trait data::feed::DataFeed
