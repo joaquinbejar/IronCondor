@@ -128,7 +128,10 @@ jobs:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
           working-directory: python
-          args: --release --out dist --features "python orderbook simulator"
+          # Comma-separated, unquoted: maturin-action splits `args` on
+          # whitespace WITHOUT shell quoting, so a quoted space-separated
+          # feature list leaks extra tokens to rustc as input filenames.
+          args: --release --out dist --features python,orderbook,simulator
       # Version single-source guard (#41): every produced wheel filename must
       # carry the crate `[package].version`. maturin fills the wheel version from
       # the crate (dynamic version), so a mismatch means the wiring broke — fail
