@@ -1,10 +1,8 @@
 # maturin packaging for the `ironcondor` Python extension (#38, ADR-0005,
 # docs/06 §7). Builds a single `cp310-abi3` wheel per platform from the root
-# crate's `python` feature. The distribution name `ironcondor` is UNREGISTERED
-# on PyPI; wheels are a v0.4 deliverable and publishing needs explicit owner
-# approval (CLAUDE.md, docs/06 §8). The `Private :: Do Not Upload` classifier
-# below is a hard guard against an accidental upload until that approval lands
-# (#41).
+# crate's `python` feature. Publication to PyPI was owner-approved at the
+# 0.5.0 release (the former `Private :: Do Not Upload` hard guard was removed
+# with that approval, per the #41 first-release protocol).
 
 [build-system]
 requires = ["maturin>=1.7,<2.0"]
@@ -30,9 +28,6 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: Implementation :: CPython",
     "Topic :: Office/Business :: Financial :: Investment",
-    # Hard guard: PyPI rejects any upload carrying this classifier. Remove only
-    # when publication is owner-approved (#41).
-    "Private :: Do Not Upload",
 ]
 
 [project.optional-dependencies]

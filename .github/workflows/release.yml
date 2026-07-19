@@ -28,7 +28,7 @@
 #      workflow + environment (a one-time user-side step). Until then the upload
 #      fails LOUDLY with a "no trusted publisher configured" error — it cannot
 #      silently succeed, and there is no long-lived secret in CI to leak.
-#   4. "Private :: Do Not Upload" CLASSIFIER. `python/pyproject.toml` still
+#   4. (RETIRED at 0.5.0) "Private :: Do Not Upload" classifier — removed on
 #      carries this classifier; PyPI/Warehouse REJECTS any upload that declares
 #      it (HTTP 400). Removing it is part of the owner's FIRST-RELEASE commit,
 #      AFTER the name is registered — see the USER-ACTION list in the PR body.
@@ -192,7 +192,7 @@ jobs:
   #     tag-only trigger + `if` guard (tag ref AND the `PYPI_PUBLISH_ENABLED`
   #     repo-variable kill-switch) + `environment: pypi` required reviewers
   #     + OIDC-no-token (needs the owner's trusted-publisher registration).
-  #     The "Private :: Do Not Upload" classifier is a sixth, upload-time guard.
+  #     (The former "Private :: Do Not Upload" classifier guard was retired at 0.5.0.)
   publish-pypi:
     name: publish-pypi
     needs: [build-wheels, build-sdist]
