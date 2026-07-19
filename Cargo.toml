@@ -1,6 +1,6 @@
 [package]
 name = "ironcondor"
-version = "0.0.1"
+version = "0.5.0"
 edition = "2024"
 authors = ["Joaquin Bejar <jb@taunais.com>"]
 description = "High-performance backtesting engine for options trading strategies with order-book-level fill simulation. Built on OptionStratLib."
