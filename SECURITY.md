@@ -96,9 +96,12 @@ place and verified fresh: untrusted-input hardening with fuzz targets over the
 CSV / Parquet / bundle parsers (no panic, hang, or OOM on malformed bytes);
 secrets non-leakage (the captured-log credential test above); and the
 supply-chain / host-integrity controls — `cargo audit` and
-`cargo deny --all-features check` both green, suppressing only the documented
-`RUSTSEC-2024-0436` (`paste` unmaintained, a notice not a vulnerability, mirrored
-in `.cargo/audit.toml` and `deny.toml`), with `#![forbid(unsafe_code)]` intact
+`cargo deny --all-features check` both green, suppressing only two documented
+advisories, mirrored in `.cargo/audit.toml` and `deny.toml`: `RUSTSEC-2024-0436`
+(`paste` unmaintained, a notice not a vulnerability) and `RUSTSEC-2026-0235`
+(`rkyv`, present in the lockfile only as an optional dependency of
+`rust_decimal` that no feature combination compiles), with
+`#![forbid(unsafe_code)]` intact
 and the no-panic-across-FFI control asserted by the Python test suite.
 
 The full threat model, untrusted-input hardening table, and secrets-handling
