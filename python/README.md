@@ -4,11 +4,17 @@ Python bindings for [`ironcondor`](https://github.com/joaquinbejar/IronCondor),
 a high-performance options-strategy backtester with order-book-level fill
 simulation, built on [`optionstratlib`](https://crates.io/crates/optionstratlib).
 
-> **Status: v0.4, #39.** The working backtest API — `BacktestConfig`, `run`,
-> and `Bundle` — is wired over the same Rust engine. The typed exception
-> hierarchy is #40 (errors currently surface as `ValueError` / `RuntimeError`);
-> PyPI wheels are a v0.4 deliverable and are **not published yet** — the
-> distribution name `ironcondor` is unregistered on PyPI.
+> **Status: v0.5.0, published.** The backtest API (`BacktestConfig`, `run`,
+> `Bundle`) is wired over the same Rust engine, and the typed exception
+> hierarchy landed with #40: `IronCondorError` is the base, with
+> `ConfigError`, `DataError`, `ExecutionError`, `StrategyError`,
+> `BundleError`, and `EngineError` beneath it (`ConfigError` is also a
+> `ValueError`; `DataError` and `BundleError` are also `OSError`), and no
+> panic crosses the FFI boundary. The distribution is on PyPI as
+> [`ironcondor`](https://pypi.org/project/ironcondor/): `pip install
+> ironcondor`. The 0.5.0 upload carries the macOS `arm64` `cp310-abi3` wheel
+> plus the sdist; on Linux and macOS `x86_64` pip builds from the sdist for
+> now, which needs a Rust toolchain.
 
 ```python
 import ironcondor as ic
@@ -81,15 +87,17 @@ already lists the same set (plus `pyo3/extension-module`), so a bare
 
 ## Releases and PyPI status
 
-`ironcondor` is **not published on PyPI yet** — the distribution name is
-**unregistered**, and publishing is a deliberate, owner-approved action
-(docs/06 §8, CLAUDE.md).
+`ironcondor` is **published on PyPI**; the name is registered and publishing
+stays a deliberate, owner-approved action (docs/06 §8, CLAUDE.md).
 
 - **On every pipeline**, CI (`.github/workflows/ci.yml`, job `python-wheels`)
   builds and `pytest`-runs a `cp310-abi3` wheel on Linux + macOS.
 - **On a `v*` tag**, the release workflow (`.github/workflows/release.yml`)
-  builds release-grade wheels — Linux (manylinux) + macOS x86_64 + macOS arm64 —
+  builds release-grade wheels (Linux manylinux, macOS x86_64, macOS arm64)
   plus an sdist, then publishes to PyPI via **trusted publishing (OIDC, no
-  token)** — but only behind a manually-approved GitHub `pypi` environment, and
-  only once the owner has registered the name and its trusted publisher. Windows
-  wheels are a deferred wishlist item, not a v0.4 target.
+  token)**, behind a manually-approved GitHub `pypi` environment. Windows
+  wheels remain a deferred wishlist item.
+- **Known gap at 0.5.0.** The index carries only the macOS `arm64` wheel and
+  the sdist: the wheel matrix failed on the v0.5.0 tag run and the fix
+  (`bd7313d`) landed after it, so the Linux and macOS `x86_64` wheels still
+  owe a green release run.

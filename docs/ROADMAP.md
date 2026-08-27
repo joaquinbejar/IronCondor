@@ -3,7 +3,7 @@
 | Field      | Value                                       |
 |------------|---------------------------------------------|
 | Status     | Living                                      |
-| Last edit  | 2026-07-12                                  |
+| Last edit  | 2026-08-27                                  |
 
 This is a living document. Each version has a tight scope and testable
 acceptance criteria. New work that does not fit a version goes to the
@@ -18,34 +18,44 @@ local 3-digit id).
 
 ## Where we are
 
-Pre-code. The published `ironcondor` v0.0.1 on crates.io is a
-name-reservation placeholder; nothing described below is implemented.
-The `docs/` set is **under active review** — bootstrap, six numbered
-design docs, the ADRs, and the specs are maintained locally during the
-design phase and are the working source of truth until the first code
-lands. The engine core will be **migrated, not rewritten**, from the
-private `OptionStratBacktest` project
+**Shipped and public.** `ironcondor` **v0.5.0** is tagged, released on
+[crates.io](https://crates.io/crates/ironcondor) and published to
+[PyPI](https://pypi.org/project/ironcondor/); the v0.0.1 name-reservation
+placeholder is history. Everything from v0.1 to v0.5 is implemented and
+merged: the deterministic replay loop, both fill models, the Parquet and
+CSV feeds, the simulator feed, P&L attribution by Greek, the frozen
+`ironcondor.bundle.v1`, the PyO3 bindings, and the v1.0 hardening gates.
+The engine core was **migrated, not rewritten**, from the private
+`OptionStratBacktest` project
 ([ADR-0001](adr/0001-migrate-optionstratbacktest-core.md)).
 
-> **Status 2026-07-12:** Design **under active review**, not frozen — the
-> v0.1-relevant reviewer recommendations are being cleared before the
-> design set is declared stable for v0.1. **The issues are filed and
-> live.** All **54** issues for this repo are open on
-> [github.com/joaquinbejar/IronCondor](https://github.com/joaquinbejar/IronCondor)
-> — one GitHub issue per `milestones/**/NNN-*.md` spec, with the GitHub
-> number equal to the local 3-digit id (`001` → #1, verified zero drift) —
-> part of **167** issues across the three sibling repos (IronCondor,
-> [ChainView](https://github.com/joaquinbejar/ChainView),
-> [fauxchange](https://github.com/joaquinbejar/fauxchange)). Milestones
-> v0.1 … v1.0, labels, and the assignee are set. **No implementation code
-> exists yet** — the crates.io v0.0.1 is a placeholder, and every `#N`
-> below is a live issue number, **not** a planned allocation. The first
-> milestone is the v0.1 vertical slice: one strategy, one feed, one fill
-> mode, end to end.
+> **Status 2026-08-27:** All **54** roadmap issues are **closed**, plus the
+> post-v0.5 hardening issue #110; 55 in total, delivered as one stacked
+> chain of PRs #55–#113 (see the [changelog](#changelog) below). Every
+> milestone (v0.1 … v1.0) is closed, with **zero open issues and zero open
+> PRs**, and `main` sits on the v0.5.0 tag. What remains is **not
+> implementation work**:
+>
+> - **The v1.0 cut waits on the calendar and on the owner, not on code.**
+>   The four public surfaces are frozen behind fail-closed CI snapshots
+>   (#49–#53) and the cut itself is scripted (#54,
+>   `scripts/release_check.sh`). What is left is the **one-quarter
+>   no-breaking-change window**, confirmed per surface at cut time: it is a
+>   release-time, user-gated value that [SEMVER.md](SEMVER.md) deliberately
+>   does not assert in advance. In practice the four surfaces have been
+>   frozen and CI-gated since the 2026-07-19 v0.5.0 release.
+> - **Wheel coverage is incomplete on the index.** The v0.5.0 PyPI release
+>   carries the macOS `arm64` `cp310-abi3` wheel plus the sdist; the Linux
+>   `manylinux` and macOS `x86_64` wheels are **not** published. The wheel
+>   matrix failed on the v0.5.0 tag run and the fix (`bd7313d`) landed
+>   after it, so the release workflow still owes a green re-run; until
+>   then everyone outside macOS-arm64 installs from the sdist and needs a
+>   Rust toolchain.
 
-Workflow rules for this path: one issue per PR, sequential where a
-later issue builds on an earlier one; `Closes #N` in the PR body; the
-full [Pre-Submission Checklist](TESTING.md#10-pre-submission-checklist-binding)
+Workflow rules for this repo: they governed the whole chain and still bind
+new work. One issue per PR, sequential where a later issue builds on an
+earlier one; `Closes #N` in the PR body; the full
+[Pre-Submission Checklist](TESTING.md#10-pre-submission-checklist-binding)
 per PR; an ADR under [adr/](adr/) for every non-obvious decision. The
 result-bundle contract (v0.3 onward) is coordinated with
 [ChainView](https://github.com/joaquinbejar/ChainView) in the same week
@@ -70,27 +80,27 @@ breadth, not v0.1 gates.
 
 ### Issues
 
-- [ ] #1 — Bootstrap the crate skeleton, module tree, lints, and CI (M; no dependencies)
-- [ ] #2 — Define BacktestError boundary and the BacktestConfig skeleton (M; depends on #1)
-- [ ] #3 — Implement integer-cents money newtypes and ContractKey (M; depends on #1, #2)
-- [ ] #4 — Add market-data and execution-record domain types (M; depends on #3)
-- [ ] #5 — Implement SimClock and the loop event model (M; depends on #3)
-- [ ] #6 — Migrate the OptionStratBacktest core and fix the two MarketSimulator bugs (L; depends on #2, #4)
-- [ ] #7 — Build the ChainResponse to OptionChain conversion layer (L; depends on #3, #4)
-- [ ] #8 — Define the DataFeed trait and feed-catalogue seam (M; depends on #4)
-- [ ] #9 — Implement the Parquet historical feed (the v0.1 release feed) (L; depends on #7, #8)
-- [ ] #10 — Add the Strategy trait and the optionstratlib adapter (M; depends on #6)
-- [ ] #11 — Wire IronCondor as the single v0.1 strategy (M; depends on #10)
-- [ ] #12 — Define the ExecutionModel trait and shared FillReport shape (M; depends on #4)
-- [ ] #13 — Implement the naive fill model (mid/spread + slippage + fees) (M; depends on #12)
-- [ ] #14 — Implement BacktestEngine::run, the normative replay state machine (L; depends on #5, #7, #10, #12)
-- [ ] #15 — Add the mark-to-market ledger and minimal equity curve (M; depends on #14)
-- [ ] #16 — Emit the equity curve plus minimal metrics (M; depends on #15, #11, #13)
-- [ ] #17 — Add the golden determinism test over the v0.1 artifacts (M; depends on #16)
-- [ ] #18 — Stand up the bench suite and record the naive-throughput baseline in BENCH.md (M; depends on #16)
-- [ ] #19 — Enforce the zero-steady-state-allocation replay-loop gate in CI (M; depends on #14, #18)
-- [ ] #20 — Wire cargo audit and cargo deny into CI and land SECURITY.md (S; depends on #1)
-- [ ] #21 — Harden the Parquet feed against malformed and hostile input (M; depends on #9)
+- [x] #1 — Bootstrap the crate skeleton, module tree, lints, and CI (M; no dependencies)
+- [x] #2 — Define BacktestError boundary and the BacktestConfig skeleton (M; depends on #1)
+- [x] #3 — Implement integer-cents money newtypes and ContractKey (M; depends on #1, #2)
+- [x] #4 — Add market-data and execution-record domain types (M; depends on #3)
+- [x] #5 — Implement SimClock and the loop event model (M; depends on #3)
+- [x] #6 — Migrate the OptionStratBacktest core and fix the two MarketSimulator bugs (L; depends on #2, #4)
+- [x] #7 — Build the ChainResponse to OptionChain conversion layer (L; depends on #3, #4)
+- [x] #8 — Define the DataFeed trait and feed-catalogue seam (M; depends on #4)
+- [x] #9 — Implement the Parquet historical feed (the v0.1 release feed) (L; depends on #7, #8)
+- [x] #10 — Add the Strategy trait and the optionstratlib adapter (M; depends on #6)
+- [x] #11 — Wire IronCondor as the single v0.1 strategy (M; depends on #10)
+- [x] #12 — Define the ExecutionModel trait and shared FillReport shape (M; depends on #4)
+- [x] #13 — Implement the naive fill model (mid/spread + slippage + fees) (M; depends on #12)
+- [x] #14 — Implement BacktestEngine::run, the normative replay state machine (L; depends on #5, #7, #10, #12)
+- [x] #15 — Add the mark-to-market ledger and minimal equity curve (M; depends on #14)
+- [x] #16 — Emit the equity curve plus minimal metrics (M; depends on #15, #11, #13)
+- [x] #17 — Add the golden determinism test over the v0.1 artifacts (M; depends on #16)
+- [x] #18 — Stand up the bench suite and record the naive-throughput baseline in BENCH.md (M; depends on #16)
+- [x] #19 — Enforce the zero-steady-state-allocation replay-loop gate in CI (M; depends on #14, #18)
+- [x] #20 — Wire cargo audit and cargo deny into CI and land SECURITY.md (S; depends on #1)
+- [x] #21 — Harden the Parquet feed against malformed and hostile input (M; depends on #9)
 
 Full per-issue specs: `milestones/v0.1-core-engine-naive-fills/` (local).
 
@@ -137,14 +147,14 @@ the feed and strategy seams generalise without engine changes.
 
 ### Issues
 
-- [ ] #22 — Build the `option-chain-orderbook` adapter (L; depends on #12, #7)
-- [ ] #23 — Seed each strike's book from the chain snapshot (M; depends on #22)
-- [ ] #24 — Model queue position and market impact (L; depends on #23)
-- [ ] #25 — Implement normative between-snapshot book transitions (M; depends on #23)
-- [ ] #26 — Add the naive/realistic mode switch and cross-mode parity test (M; depends on #13, #24, #25)
-- [ ] #27 — Add the CSV historical feed (v0.2 breadth) (M; depends on #7, #8)
-- [ ] #28 — Add `ShortStrangle` as a second strategy (v0.2 breadth) (S; depends on #10)
-- [ ] #29 — Record realistic-mode overhead and gate the naive baseline in CI (M; depends on #26, #18, #19)
+- [x] #22 — Build the `option-chain-orderbook` adapter (L; depends on #12, #7)
+- [x] #23 — Seed each strike's book from the chain snapshot (M; depends on #22)
+- [x] #24 — Model queue position and market impact (L; depends on #23)
+- [x] #25 — Implement normative between-snapshot book transitions (M; depends on #23)
+- [x] #26 — Add the naive/realistic mode switch and cross-mode parity test (M; depends on #13, #24, #25)
+- [x] #27 — Add the CSV historical feed (v0.2 breadth) (M; depends on #7, #8)
+- [x] #28 — Add `ShortStrangle` as a second strategy (v0.2 breadth) (S; depends on #10)
+- [x] #29 — Record realistic-mode overhead and gate the naive baseline in CI (M; depends on #26, #18, #19)
 
 Full per-issue specs: `milestones/v0.2-realistic-fills-orderbook/` (local).
 
@@ -171,14 +181,14 @@ SemVer-relevant and ChainView-coordinated.
 
 ### Issues
 
-- [ ] #30 — Enrich the mark-to-market ledger for per-step attribution (M; depends on #15)
-- [ ] #31 — Implement P&L attribution by Greek with an exact residual (L; depends on #30)
-- [ ] #32 — Populate summary metrics into the upstream backtesting types (M; depends on #30)
-- [ ] #33 — Define the result-bundle record types and manifest.json schema (M; depends on #31, #32)
-- [ ] #34 — Implement the result-bundle writer with atomic writes (L; depends on #33)
-- [ ] #35 — Harden bundle read-back against malformed and hostile bundles (M; depends on #34)
-- [ ] #36 — Freeze the bundle schema with golden round-trip tests and SemVer (M; depends on #34, #35)
-- [ ] #37 — Bench the bundle writer for linear time and bounded memory (M; depends on #34, #18)
+- [x] #30 — Enrich the mark-to-market ledger for per-step attribution (M; depends on #15)
+- [x] #31 — Implement P&L attribution by Greek with an exact residual (L; depends on #30)
+- [x] #32 — Populate summary metrics into the upstream backtesting types (M; depends on #30)
+- [x] #33 — Define the result-bundle record types and manifest.json schema (M; depends on #31, #32)
+- [x] #34 — Implement the result-bundle writer with atomic writes (L; depends on #33)
+- [x] #35 — Harden bundle read-back against malformed and hostile bundles (M; depends on #34)
+- [x] #36 — Freeze the bundle schema with golden round-trip tests and SemVer (M; depends on #34, #35)
+- [x] #37 — Bench the bundle writer for linear time and bounded memory (M; depends on #34, #18)
 
 Full per-issue specs: `milestones/v0.3-attribution-result-bundle/` (local).
 
@@ -214,18 +224,22 @@ registration (#41) must precede the first wheel publish.
 
 ### Issues
 
-- [ ] #38 — Scaffold the feature-gated PyO3 module and maturin packaging (M; depends on #36)
-- [ ] #39 — Expose the Python API to define, run, and load backtests (L; depends on #38)
-- [ ] #40 — Map `BacktestError` to Python exceptions with no panic across FFI (M; depends on #39)
-- [ ] #41 — Register the PyPI name and wire Linux+macOS wheel CI (M; depends on #38)
-- [ ] #42 — Prove Python/Rust bundle parity (M; depends on #39, #40, #36)
-- [ ] #43 — Measure per-call PyO3 overhead vs the batch path (S; depends on #39, #18)
+- [x] #38 — Scaffold the feature-gated PyO3 module and maturin packaging (M; depends on #36)
+- [x] #39 — Expose the Python API to define, run, and load backtests (L; depends on #38)
+- [x] #40 — Map `BacktestError` to Python exceptions with no panic across FFI (M; depends on #39)
+- [x] #41 — Register the PyPI name and wire Linux+macOS wheel CI (M; depends on #38)
+- [x] #42 — Prove Python/Rust bundle parity (M; depends on #39, #40, #36)
+- [x] #43 — Measure per-call PyO3 overhead vs the batch path (S; depends on #39, #18)
 
 Full per-issue specs: `milestones/v0.4-pyo3-pypi/` (local).
 
 **Acceptance.**
 - Wheels install on Linux + macOS from PyPI (Windows is a wishlist item,
-  see [PRD Q-6](PRD.md#8-open-questions)).
+  see [PRD Q-6](PRD.md#8-open-questions)). *Delivered with a caveat: the
+  wheel matrix and the trusted-publishing workflow are wired, but the
+  v0.5.0 index release carries only the macOS `arm64` wheel plus the sdist;
+  the Linux and macOS `x86_64` wheels await a green release run (see
+  [Where we are](#where-we-are)).*
 - A Python backtest produces a bundle identical in content to the Rust
   one for the same inputs.
 - No panic can cross the PyO3 boundary — errors surface as Python
@@ -249,11 +263,11 @@ ChainView compatibility proof (#48) rides the **frozen** v0.3 schema
 
 ### Issues
 
-- [ ] #44 — Add the simulator-feature reqwest client and DTOs (L; depends on #8, #7)
-- [ ] #45 — Materialise simulator sessions to a validated tape (M; depends on #44)
-- [ ] #46 — Implement scenario generation and Monte-Carlo sweeps (L; depends on #45)
-- [ ] #47 — Run reproducible batch sweeps over file feeds (M; depends on #46, #9)
-- [ ] #48 — Prove ChainView replay compatibility from shared fixtures (M; depends on #36, #46)
+- [x] #44 — Add the simulator-feature reqwest client and DTOs (L; depends on #8, #7)
+- [x] #45 — Materialise simulator sessions to a validated tape (M; depends on #44)
+- [x] #46 — Implement scenario generation and Monte-Carlo sweeps (L; depends on #45)
+- [x] #47 — Run reproducible batch sweeps over file feeds (M; depends on #46, #9)
+- [x] #48 — Prove ChainView replay compatibility from shared fixtures (M; depends on #36, #46)
 
 Full per-issue specs: `milestones/v0.5-synthetic-chainview/` (local).
 
@@ -261,13 +275,16 @@ Full per-issue specs: `milestones/v0.5-synthetic-chainview/` (local).
 - A synthetic session drives a full backtest with no historical input;
   the run is materialised to a validated tape and is self-consistent
   end to end.
-- **Blocked criterion (upstream-gated): same-seed reproducibility of a
-  synthetic session.** OptionChain-Simulator has **no seed channel**
-  today (`CreateSessionRequest` carries none; the server walk is unseeded,
-  verified 2026-07-12) — so a synthetic run is not repeatable across
-  sessions. This criterion is gated on the upstream **feature request:
-  add a `seed` to `CreateSessionRequest`**; until it lands, v0.5 ships
-  without the same-seed synthetic guarantee and the docs say so plainly
+- **Partly delivered (upstream-gated): same-seed reproducibility of a
+  synthetic session.** The seed channel now exists upstream:
+  OptionChain-Simulator v0.1.0 accepts a walk `seed` on
+  `CreateSessionRequest`, and #44/#45 wire it end to end. `data_seed` is
+  sent as `session.seed`, the effective seed is recorded, and the tape is
+  identified by the `sha256` of its materialised bytes. **Tape identity is
+  still not claimed reproducible:** upstream stamps every `ChainResponse`
+  with a wall-clock timestamp, so the same seed repeats the *walk*, not the
+  tape hash. The closing assertion is the `SIM_LIVE` #45 test, expected to
+  fail until upstream serves deterministic timestamps
   ([03-data-layer.md §6](03-data-layer.md#6-synthetic-feed--optionchain-simulator)).
 - A batch sweep over **file** feeds runs N scenarios reproducibly,
   parallel across runs (file feeds are content-addressed and repeatable).
@@ -304,18 +321,35 @@ engine capability lands in this milestone.
 
 ### Issues
 
-- [ ] #49 — Audit and freeze the public surfaces for SemVer 1.0 (M; depends on #36, #39)
-- [ ] #50 — Harden the determinism golden suite to catch real regressions (M; depends on #36, #17)
-- [ ] #51 — Wire hot-path regression gates into CI against BENCH.md baselines (M; depends on #29, #37, #43)
-- [ ] #52 — Land fuzz targets for the CSV, Parquet, and bundle-read-back parsers (L; depends on #27, #9, #35)
-- [ ] #53 — Prove secrets never leak and supply-chain gates stay green (S; depends on #20, #40)
-- [ ] #54 — Execute the v1.0 acceptance checklist and release cut (M; depends on #49, #50, #51, #52, #53)
+- [x] #49 — Audit and freeze the public surfaces for SemVer 1.0 (M; depends on #36, #39)
+- [x] #50 — Harden the determinism golden suite to catch real regressions (M; depends on #36, #17)
+- [x] #51 — Wire hot-path regression gates into CI against BENCH.md baselines (M; depends on #29, #37, #43)
+- [x] #52 — Land fuzz targets for the CSV, Parquet, and bundle-read-back parsers (L; depends on #27, #9, #35)
+- [x] #53 — Prove secrets never leak and supply-chain gates stay green (S; depends on #20, #40)
+- [x] #54 — Execute the v1.0 acceptance checklist and release cut (M; depends on #49, #50, #51, #52, #53)
 
 Full per-issue specs: `milestones/v1.0-stability/` (local).
+
+**Status.** Every gate above is landed and green as of v0.5.0: the surface
+snapshots fail CI on drift, the determinism golden suite covers the full
+four-table bundle, the hot-path gates H1–H5 run against the `BENCH.md`
+baselines, the parser fuzz targets are committed, and the acceptance
+checklist is scripted. The cut itself is held only by the one-quarter
+stability window (see [Where we are](#where-we-are)).
 
 The mechanics of the cut live in
 [RELEASE-PROCESS.md §11](RELEASE-PROCESS.md); the surface definitions
 live in [SEMVER.md](SEMVER.md).
+
+## Post-v0.5 — unscheduled hardening (merged)
+
+Work filed after the milestone tree and landed outside it:
+
+- [x] #110 — Realistic-mode resting-order lifecycle: refresh-fill identity,
+  `Cancel`/`Replace`, book eviction, and batch error-descriptor caching
+  (L; merged in [#112](https://github.com/joaquinbejar/IronCondor/pull/112),
+  shipped in v0.5.0; IOC-only runs stay byte-identical and all goldens
+  unchanged)
 
 ## Post-1.0 — deferred by decision
 
@@ -341,9 +375,10 @@ Explicitly out of v0.x and v1.0, on the roadmap only after 1.0:
 - **The v0.3 bundle freeze (#34/#36) gates #38–#39 and #48** — the Python
   API loads bundles and ChainView renders them, so both depend on a stable
   schema. Do not open v0.4 against an unfrozen bundle.
-- **PyPI name registration (#41) must precede the first wheel publish.**
-  The name is unregistered today; register it against the earliest wheel
-  that builds green (see [PRD Q-5](PRD.md#8-open-questions)).
+- **PyPI name registration (#41) preceded the first wheel publish**, as
+  required (see [PRD Q-5](PRD.md#8-open-questions)). The name is registered
+  and `ironcondor` 0.5.0 is on the index; the outstanding piece is wheel
+  breadth, not the name (see [Where we are](#where-we-are)).
 - **Benchmark obligations.** The naive baseline (#18) and the realistic
   overhead ratio (#29) carry criterion + hdrhistogram measurements. No
   performance claim ships without numbers in `BENCH.md`
@@ -393,11 +428,69 @@ Ideas worth tracking but not scheduled:
 
 ## Changelog
 
-Merged work is recorded here — `/implement-roadmap` **Step 7** appends one
-row per merged PR (real date, issue number, PR link, one-line summary)
-after each issue closes and its checkbox is ticked above. It starts empty:
-no issue has been implemented yet (code does not exist).
+Merged work is recorded here: one row per merged PR (real date, issue
+number, PR link, one-line summary), appended as each issue closes and its
+checkbox is ticked above. The whole v0.1 → v0.5 chain landed as PRs
+#55–#113; per-release notes with the detail live in
+[CHANGELOG.md](../CHANGELOG.md).
 
 | Date | Issue | PR | Summary |
 |------|-------|----|---------|
-| —    | —     | —  | Empty — the first row lands with the first merged PR (`/implement-roadmap` Step 7). |
+| 2026-07-18 | #1 | [#55](https://github.com/joaquinbejar/IronCondor/pull/55) | Bootstrap the crate skeleton, module tree, lints, and CI |
+| 2026-07-18 | #2 | [#56](https://github.com/joaquinbejar/IronCondor/pull/56) | Add BacktestError boundary and BacktestConfig skeleton |
+| 2026-07-18 | #3 | [#57](https://github.com/joaquinbejar/IronCondor/pull/57) | Add integer-cents money newtypes and ContractKey |
+| 2026-07-18 | #4 | [#58](https://github.com/joaquinbejar/IronCondor/pull/58) | Add market-data and execution-record domain types |
+| 2026-07-18 | #5 | [#59](https://github.com/joaquinbejar/IronCondor/pull/59) | Implement SimClock and the loop event model |
+| 2026-07-18 | #6 | [#60](https://github.com/joaquinbejar/IronCondor/pull/60) | Migrate OptionStratBacktest core and fix the two MarketSimulator bugs |
+| 2026-07-18 | #7 | [#61](https://github.com/joaquinbejar/IronCondor/pull/61) | Add the ChainResponse to OptionChain conversion layer |
+| 2026-07-18 | #8 | [#62](https://github.com/joaquinbejar/IronCondor/pull/62) | Define the DataFeed trait and feed-catalogue seam |
+| 2026-07-18 | #9 | [#63](https://github.com/joaquinbejar/IronCondor/pull/63) | Implement the Parquet historical feed |
+| 2026-07-18 | #10 | [#64](https://github.com/joaquinbejar/IronCondor/pull/64) | Add the Strategy trait and the optionstratlib adapter |
+| 2026-07-18 | #11 | [#65](https://github.com/joaquinbejar/IronCondor/pull/65) | Wire IronCondor as the single v0.1 strategy |
+| 2026-07-18 | #12 | [#66](https://github.com/joaquinbejar/IronCondor/pull/66) | Define the ExecutionModel trait and shared FillReport shape |
+| 2026-07-18 | #13 | [#67](https://github.com/joaquinbejar/IronCondor/pull/67) | Implement the naive fill model |
+| 2026-07-18 | #14 | [#68](https://github.com/joaquinbejar/IronCondor/pull/68) | Implement BacktestEngine::run, the normative replay state machine |
+| 2026-07-18 | #15 | [#69](https://github.com/joaquinbejar/IronCondor/pull/69) | Add the mark-to-market ledger and minimal equity curve |
+| 2026-07-18 | #16 | [#70](https://github.com/joaquinbejar/IronCondor/pull/70) | Emit the equity curve plus minimal metrics |
+| 2026-07-18 | #17 | [#71](https://github.com/joaquinbejar/IronCondor/pull/71) | Add the golden determinism test over the v0.1 artifacts |
+| 2026-07-18 | #18 | [#72](https://github.com/joaquinbejar/IronCondor/pull/72) | Stand up the bench suite and record the naive-throughput baseline in BENCH.md |
+| 2026-07-18 | #19 | [#73](https://github.com/joaquinbejar/IronCondor/pull/73) | Enforce the zero-steady-state-allocation replay-loop gate in CI |
+| 2026-07-18 | #20 | [#74](https://github.com/joaquinbejar/IronCondor/pull/74) | Wire cargo audit and cargo deny into CI and land SECURITY.md |
+| 2026-07-18 | #21 | [#75](https://github.com/joaquinbejar/IronCondor/pull/75) | Harden the Parquet feed against malformed and hostile input |
+| 2026-07-18 | #22 | [#76](https://github.com/joaquinbejar/IronCondor/pull/76) | Build the option-chain-orderbook adapter for realistic fills |
+| 2026-07-18 | #23 | [#77](https://github.com/joaquinbejar/IronCondor/pull/77) | Seed each strike's order book from the chain snapshot |
+| 2026-07-18 | #24 | [#78](https://github.com/joaquinbejar/IronCondor/pull/78) | Model queue position and market impact in realistic fills |
+| 2026-07-18 | #25 | [#79](https://github.com/joaquinbejar/IronCondor/pull/79) | Rebuild seeded liquidity from every snapshot in realistic fills |
+| 2026-07-18 | #26 | [#80](https://github.com/joaquinbejar/IronCondor/pull/80) | Add the naive/realistic mode switch and cross-mode parity test |
+| 2026-07-18 | #27 | [#81](https://github.com/joaquinbejar/IronCondor/pull/81) | Add the CSV historical DataFeed (v0.2 breadth) |
+| 2026-07-18 | #28 | [#82](https://github.com/joaquinbejar/IronCondor/pull/82) | Wire ShortStrangle as a second strategy through the adapter |
+| 2026-07-18 | #29 | [#83](https://github.com/joaquinbejar/IronCondor/pull/83) | Record realistic-mode overhead and gate the naive baseline in CI |
+| 2026-07-18 | #30 | [#84](https://github.com/joaquinbejar/IronCondor/pull/84) | Enrich the mark-to-market ledger for per-step attribution |
+| 2026-07-18 | #31 | [#85](https://github.com/joaquinbejar/IronCondor/pull/85) | Implement P&L attribution by Greek with an exact residual |
+| 2026-07-18 | #32 | [#86](https://github.com/joaquinbejar/IronCondor/pull/86) | Populate summary metrics into the upstream backtesting types |
+| 2026-07-18 | #33 | [#87](https://github.com/joaquinbejar/IronCondor/pull/87) | Define the result-bundle record types and manifest.json schema |
+| 2026-07-18 | #34 | [#88](https://github.com/joaquinbejar/IronCondor/pull/88) | Implement the result-bundle writer with atomic writes |
+| 2026-07-18 | #35 | [#89](https://github.com/joaquinbejar/IronCondor/pull/89) | Harden bundle read-back against malformed and hostile bundles |
+| 2026-07-18 | — | [#90](https://github.com/joaquinbejar/IronCondor/pull/90) | Correlate realistic multi-level fills into one order with fill_seq (prerequisite for #36) |
+| 2026-07-18 | #36 | [#91](https://github.com/joaquinbejar/IronCondor/pull/91) | Freeze the bundle schema with golden round-trip tests and SemVer |
+| 2026-07-18 | #37 | [#92](https://github.com/joaquinbejar/IronCondor/pull/92) | Bench the bundle writer for linear time and bounded memory |
+| 2026-07-18 | #38 | [#93](https://github.com/joaquinbejar/IronCondor/pull/93) | Scaffold the feature-gated PyO3 module and maturin packaging |
+| 2026-07-18 | #39 | [#94](https://github.com/joaquinbejar/IronCondor/pull/94) | Expose the Python API to define, run, and load backtests |
+| 2026-07-18 | #40 | [#95](https://github.com/joaquinbejar/IronCondor/pull/95) | Map BacktestError to Python exceptions with no panic across FFI |
+| 2026-07-18 | #41 | [#96](https://github.com/joaquinbejar/IronCondor/pull/96) | Register the PyPI name and wire Linux+macOS wheel CI |
+| 2026-07-18 | #42 | [#97](https://github.com/joaquinbejar/IronCondor/pull/97) | Prove Python/Rust bundle parity |
+| 2026-07-18 | #43 | [#98](https://github.com/joaquinbejar/IronCondor/pull/98) | Measure per-call PyO3 overhead vs the batch path |
+| 2026-07-18 | #44 | [#99](https://github.com/joaquinbejar/IronCondor/pull/99) | Add the simulator-feature reqwest client and DTOs |
+| 2026-07-18 | #45 | [#100](https://github.com/joaquinbejar/IronCondor/pull/100) | Materialise simulator sessions to a validated tape |
+| 2026-07-18 | #46 | [#101](https://github.com/joaquinbejar/IronCondor/pull/101) | Implement scenario generation and Monte-Carlo sweeps |
+| 2026-07-18 | #47 | [#102](https://github.com/joaquinbejar/IronCondor/pull/102) | Run reproducible batch sweeps over file feeds |
+| 2026-07-18 | #48 | [#103](https://github.com/joaquinbejar/IronCondor/pull/103) | Prove ChainView replay compatibility from shared fixtures |
+| 2026-07-18 | #49 | [#104](https://github.com/joaquinbejar/IronCondor/pull/104) | Freeze the four public surfaces with fail-closed CI gates |
+| 2026-07-18 | #50 | [#105](https://github.com/joaquinbejar/IronCondor/pull/105) | Extend the determinism golden suite to the full four-table bundle |
+| 2026-07-18 | #51 | [#106](https://github.com/joaquinbejar/IronCondor/pull/106) | Wire hot-path regression gates H1-H5 against BENCH.md baselines |
+| 2026-07-18 | #52 | [#107](https://github.com/joaquinbejar/IronCondor/pull/107) | Land parser fuzz targets; fix two fuzzer-found Parquet panics |
+| 2026-07-18 | #53 | [#108](https://github.com/joaquinbejar/IronCondor/pull/108) | Prove credentials never leak; reaffirm supply-chain gates |
+| 2026-07-18 | #54 | [#109](https://github.com/joaquinbejar/IronCondor/pull/109) | Automate the v1.0 acceptance checklist and release-cut gates |
+| 2026-07-18 | — | [#111](https://github.com/joaquinbejar/IronCondor/pull/111) | Close 24 verified stack-review findings in one pass (review response) |
+| 2026-07-19 | #110 | [#112](https://github.com/joaquinbejar/IronCondor/pull/112) | Make resting GTC orders first-class in realistic mode |
+| 2026-07-19 | — | [#113](https://github.com/joaquinbejar/IronCondor/pull/113) | Release v0.5.0 |
