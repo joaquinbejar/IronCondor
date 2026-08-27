@@ -3,16 +3,30 @@
 # Read by the `audit` CI job (`.github/workflows/ci.yml`), which runs
 # `cargo audit --deny warnings` from the repo root so that ANY advisory — a
 # vulnerability OR an unmaintained/unsound warning — fails the build, EXCEPT the
-# single documented ignore below. Kept green from v0.1 (docs/07 §10,
+# two documented ignores below. Kept green from v0.1 (docs/07 §10,
 # docs/TESTING.md §12.4).
 
 [advisories]
-# The ONLY ignored advisory (mirrors deny.toml [advisories].ignore).
+# The two ignored advisories (mirrored in deny.toml [advisories].ignore).
 # RUSTSEC-2024-0436: `paste 1.0.15` is unmaintained (author archived the repo) —
 # an UNMAINTAINED notice, NOT a vulnerability. It is transitive through
 # optionstratlib's numeric stack (optionstratlib -> statrs -> nalgebra -> simba
 # -> paste) and via parquet; it cannot be dropped without dropping
 # optionstratlib. `paste` is a stable, widely-used compile-time proc-macro in
 # maintenance-only mode with no known security impact. Revisit when
-# optionstratlib migrates off it. No other advisory is ignored.
-ignore = ["RUSTSEC-2024-0436"]
+# optionstratlib migrates off it.
+#
+# RUSTSEC-2026-0235: `rkyv 0.7.46` — insufficient archive validation can cause
+# out-of-bounds reads in archives containing `Rc`/`Arc`; fixed in rkyv >= 0.8.17.
+# It reaches `Cargo.lock` ONLY as an OPTIONAL dependency of `rust_decimal`
+# 1.42.1 (that crate's `rkyv` feature), which NO ironcondor feature combination
+# enables: `cargo tree -i rkyv --all-features --target all` prints nothing, so
+# rkyv is never compiled into the crate, the wheel, or the test binaries.
+# cargo-audit scans the LOCKFILE, not the compiled graph, hence the hit. There
+# is no upgrade path today: `rust_decimal` 1.42.1 is the latest release and
+# still declares rkyv 0.7. DROP this ignore as soon as `rust_decimal` ships a
+# release whose optional rkyv is >= 0.8.17.
+#
+# No other advisory is ignored, so a genuinely new vulnerability in compiled
+# code still fails the gate.
+ignore = ["RUSTSEC-2024-0436", "RUSTSEC-2026-0235"]

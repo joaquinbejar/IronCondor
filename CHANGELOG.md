@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **`RUSTSEC-2026-0235` (`rkyv` 0.7.46) suppressed with a documented note.**
+  The advisory (insufficient archive validation causing out-of-bounds reads,
+  fixed in rkyv 0.8.17) reaches `Cargo.lock` only as an **optional**
+  dependency of `rust_decimal` 1.42.1; no feature combination of this crate
+  enables it, so rkyv is never compiled into the crate, the wheel, or the test
+  binaries (`cargo tree -i rkyv --all-features --target all` prints nothing).
+  `rust_decimal` 1.42.1 is the latest release and still declares rkyv 0.7, so
+  there is no upgrade path; the ignore is mirrored in `.cargo/audit.toml` and
+  `deny.toml` and is dropped as soon as upstream moves to rkyv >= 0.8.17. No
+  dependency, lockfile entry, or compiled code changed.
+
 ## [0.5.0] - 2026-07-19
 
 ### Added

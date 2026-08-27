@@ -267,9 +267,11 @@ jobs:
       # docs/TESTING.md §12.4). Pinned tool version installed from source with
       # `--locked` (no third-party install action added in the supply-chain PR
       # itself). `--deny warnings` fails the build on ANY advisory — a
-      # vulnerability OR an unmaintained/unsound warning; the single documented
-      # ignore (RUSTSEC-2024-0436, paste unmaintained) lives in
-      # `.cargo/audit.toml`, auto-read from the repo root.
+      # vulnerability OR an unmaintained/unsound warning; the two documented
+      # ignores (RUSTSEC-2024-0436, `paste` unmaintained; RUSTSEC-2026-0235,
+      # `rkyv` reachable only as an optional, never-compiled dependency of
+      # `rust_decimal`) live in `.cargo/audit.toml`, auto-read from the repo
+      # root.
       - run: cargo install --locked --version 0.22.1 cargo-audit
       - run: cargo audit --deny warnings
 
