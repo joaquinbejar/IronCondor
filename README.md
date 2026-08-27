@@ -1,6 +1,7 @@
 [![Dual License](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
 [![Crates.io](https://img.shields.io/crates/v/ironcondor.svg)](https://crates.io/crates/ironcondor)
 [![Downloads](https://img.shields.io/crates/d/ironcondor.svg)](https://crates.io/crates/ironcondor)
+[![PyPI](https://img.shields.io/pypi/v/ironcondor.svg)](https://pypi.org/project/ironcondor/)
 [![Stars](https://img.shields.io/github/stars/joaquinbejar/IronCondor.svg)](https://github.com/joaquinbejar/IronCondor/stargazers)
 [![Issues](https://img.shields.io/github/issues/joaquinbejar/IronCondor.svg)](https://github.com/joaquinbejar/IronCondor/issues)
 [![PRs](https://img.shields.io/github/issues-pr/joaquinbejar/IronCondor.svg)](https://github.com/joaquinbejar/IronCondor/pulls)
@@ -84,7 +85,7 @@ is mode-agnostic.
 | *(none)* | yes | Replay engine, naive execution, Parquet/CSV historical feeds, and the result bundle. |
 | `orderbook` | | Realistic, liquidity-aware fills routed through `option-chain-orderbook`. |
 | `simulator` | | Synthetic chain sessions from OptionChain-Simulator over HTTP. |
-| `python` | | PyO3 bindings, built as a wheel with maturin (PyPI publication planned). |
+| `python` | | PyO3 bindings, built as an `abi3` wheel with maturin and published to PyPI. |
 
 ### Quick start (Rust)
 
@@ -153,8 +154,18 @@ fn main() -> Result<(), ironcondor::BacktestError> {
 
 ### Quick start (Python)
 
-The `python` feature builds a PyO3 extension module. Wheels are **not yet on
-PyPI**; build one locally with [maturin](https://www.maturin.rs):
+The `python` feature builds a PyO3 extension module, published to PyPI as
+[`ironcondor`](https://pypi.org/project/ironcondor/) — one `cp310-abi3` wheel
+serves Python 3.10+:
+
+```bash
+pip install ironcondor
+```
+
+The `0.5.0` release carries a macOS `arm64` wheel plus the sdist; on Linux and
+macOS `x86_64`, pip builds from the sdist for now and needs a Rust toolchain.
+For local development, build the module in place with
+[maturin](https://www.maturin.rs):
 
 ```bash
 maturin develop --release --features python,orderbook,simulator
@@ -213,8 +224,13 @@ an accident.
 full analytics and result bundle, and the Python bindings — with the v1.0
 stability gates wired: the Rust public surface, the configuration surface,
 and the bundle schema are each pinned by a committed snapshot that fails CI
-on drift. Under SemVer `0.x`, breaking changes may still land in minor
-releases; the `1.0` cut follows the documented one-quarter stability window.
+on drift. It is published on
+[crates.io](https://crates.io/crates/ironcondor) and
+[PyPI](https://pypi.org/project/ironcondor/). Under SemVer `0.x`, breaking
+changes may still land in minor releases; the `1.0` cut follows the documented
+one-quarter stability window. The roadmap is otherwise complete: every
+v0.1–v1.0 issue is closed
+([docs/ROADMAP.md](docs/ROADMAP.md#where-we-are)).
 Documentation states present-tense claims only for behaviour that exists,
 and no benchmark number is written before it is measured.
 
