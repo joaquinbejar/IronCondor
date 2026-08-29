@@ -180,9 +180,14 @@ pub(crate) fn run_spec_with_feed<F: DataFeed>(
 /// runner), and a caller with a hand-written [`Strategy`] — a research strategy
 /// the spec grammar does not describe — drives it here directly.
 ///
-/// `config` MUST already have passed [`BacktestConfig::validate`] — the feed
-/// (which reads `config.limits`) is opened by the caller before this runs, so
-/// validation happens there, once, and this core does not re-validate.
+/// `config` is **validated here**. It was not, while this was a crate-internal
+/// core whose only callers had already validated: as a public entry point it
+/// takes a raw [`BacktestConfig`] from an arbitrary caller, and skipping the
+/// check would let an over-cap `liquidity_profile.depth_levels` reach the
+/// per-contract seeding loop of a [`RealisticFill`] — a hard resource ceiling
+/// bypassed by a safe-looking call. The cost is one validation per **run**, off
+/// every step path. [`run_backtest`] validates before opening its feed, so it
+/// pays it twice and harmlessly.
 ///
 /// Determinism is unchanged from [`run_backtest`]: no wall clock and no RNG of
 /// its own; `(seed, config, data)` is byte-reproducible.
@@ -203,9 +208,11 @@ pub(crate) fn run_spec_with_feed<F: DataFeed>(
 ///
 /// # Errors
 ///
-/// - [`BacktestError::Config`] if `config.mode` is [`ExecutionMode::Realistic`]
-///   but the crate was built without the `orderbook` feature, or the initial
-///   capital exceeds the `i64` cents range.
+/// - [`BacktestError::Config`] if `config` fails [`BacktestConfig::validate`]
+///   (including an over-cap resource limit or liquidity profile), or
+///   `config.mode` is [`ExecutionMode::Realistic`] but the crate was built
+///   without the `orderbook` feature, or the initial capital exceeds the `i64`
+///   cents range.
 /// - Any [`BacktestError`] the replay loop or the metrics pass raises
 ///   (including [`BacktestError::ArithmeticOverflow`]).
 pub fn run_with_feed<F: DataFeed, S: Strategy>(
@@ -214,6 +221,10 @@ pub fn run_with_feed<F: DataFeed, S: Strategy>(
     strategy: S,
     strategy_name: &str,
 ) -> Result<BacktestRun, BacktestError> {
+    // A public entry point validates its own input: the resource ceilings this
+    // checks (`limits`, `liquidity_profile`) are the ones a hostile or careless
+    // config would otherwise walk straight past.
+    config.validate()?;
     // The strategy is mode-agnostic — it never sees which fill model runs.
     // `feed` and `strategy` are built once and moved into whichever
     // mutually-exclusive `config.mode` arm executes below.

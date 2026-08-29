@@ -1642,3 +1642,60 @@ fn test_run_backtest_accepts_a_short_strangle() {
     };
     assert_eq!(run.equity_curve.len(), 6);
 }
+
+/// The now-public `run_with_feed` validates its own config (#117 review): a
+/// caller can hand it a raw `BacktestConfig`, so skipping the check would let an
+/// over-cap `liquidity_profile.depth_levels` reach the per-contract seeding loop
+/// of a realistic fill — a hard resource ceiling walked past by a safe-looking
+/// call. The entry point must reject it as a typed `Config` error before any
+/// work happens.
+#[test]
+fn test_run_with_feed_rejects_an_over_cap_liquidity_profile() {
+    use ironcondor::{
+        BacktestError, LegSetStrategy, LiquidityProfile, ParquetFeed, ResourceLimits, run_with_feed,
+    };
+    use optionstratlib::simulation::ExitPolicy;
+
+    let Ok(dir) = tempfile::tempdir() else {
+        panic!("tempdir must create");
+    };
+    let path = dir.path().join("legs.parquet");
+    if let Err(e) = common::write_parquet_multi_expiry(&path, &common::legs_rows(4)) {
+        panic!("the fixture must write: {e}");
+    }
+
+    let mut config = common::condor_config(&path, 7);
+    config.liquidity_profile = LiquidityProfile {
+        depth_levels: LiquidityProfile::MAX_DEPTH_LEVELS + 1,
+        ..LiquidityProfile::default()
+    };
+    let Ok(feed) = ParquetFeed::open(&path, &ResourceLimits::default()) else {
+        panic!("the fixture must open");
+    };
+    let Ok(strategy) =
+        LegSetStrategy::from_spec(&common::legs_spec(), ExitPolicy::TimeSteps(1_000_000))
+    else {
+        panic!("the leg set strategy must build");
+    };
+
+    // The over-cap profile is rejected at the boundary, not seeded into a book.
+    let result = run_with_feed(&config, feed, strategy, "legs");
+    assert!(
+        matches!(result, Err(BacktestError::Config(_))),
+        "an over-cap liquidity profile must be a typed Config error at the public entry point"
+    );
+
+    // …and the same config is accepted once the profile is back within its cap,
+    // so the guard rejects the violation rather than the entry point.
+    let mut ok_config = config.clone();
+    ok_config.liquidity_profile = LiquidityProfile::default();
+    let Ok(feed) = ParquetFeed::open(&path, &ResourceLimits::default()) else {
+        panic!("the fixture must re-open");
+    };
+    let Ok(strategy) =
+        LegSetStrategy::from_spec(&common::legs_spec(), ExitPolicy::TimeSteps(1_000_000))
+    else {
+        panic!("the leg set strategy must build");
+    };
+    assert!(run_with_feed(&ok_config, feed, strategy, "legs").is_ok());
+}

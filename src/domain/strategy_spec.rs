@@ -304,8 +304,13 @@ pub struct LegSpec {
     /// Strike in integer cents.
     pub strike: PriceCents,
     /// This leg's contract expiry — reused from `optionstratlib`. A resolved
-    /// (`DateTime`) expiry is expected; a relative `Days(n)` is resolved once at
-    /// tape materialisation ([01 §5](../../../docs/01-domain-model.md#5-contract-identity)).
+    /// (`DateTime`) expiry is **required**: this record can still *represent* a
+    /// relative `Days(n)` (it serialises and orders like any other), but the
+    /// strategy refuses to run one — `LegSetStrategy::from_spec` returns a typed
+    /// error, because tape materialisation resolves the **chain's** quotes, not
+    /// a spec's legs, so a relative leg could never match a chain key
+    /// ([01 §5](../../../docs/01-domain-model.md#5-contract-identity)).
+    /// Resolving it against the tape anchor instead is issue #120.
     pub expiration: ExpirationDate,
     /// Contract count for this leg (strictly positive).
     pub quantity: Quantity,
@@ -330,10 +335,16 @@ impl LegSpec {
     /// an ordinary sort.
     ///
     /// The `Decimal` tiebreak matches serde's output exactly **because
-    /// `rust_decimal` is built without `serde-float` / `serde-arbitrary-precision`**
-    /// (`Cargo.toml`), which is what makes its wire form its `Display` form; a
-    /// feature unification that enabled either would change the serialised form
-    /// out from under this comparator. The [`ExpirationDate`] tiebreak is
+    /// `rust_decimal`'s `serde-float` / `serde-arbitrary-precision` are off**,
+    /// which is what makes its wire form its `Display` form. Note that
+    /// `cargo tree -e features -i rust_decimal --all-features` DOES show
+    /// `serde-with-float` (pulled by `option-chain-orderbook`); that is harmless
+    /// and does not make this note stale — the implication runs one way only
+    /// (`serde-float = ["serde-with-float"]`, not the reverse) and the default
+    /// `Serialize` is gated `#[cfg(not(feature = "serde-float"))]`, so the string
+    /// form still wins. What *enforces* it is not the manifest — feature
+    /// unification could override that — but the **frozen goldens**: a flip to
+    /// the float form changes the manifest bytes and fails `bundle_golden`. The [`ExpirationDate`] tiebreak is
     /// scale-carrying rather than byte-exact — its `DateTime` arm is unreachable
     /// anyway, since two instants equal under `Ord` are the same instant and
     /// serialise identically, so only the `Days` arm can decide anything.
