@@ -35,8 +35,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   matched on its full `ContractKey` identity, and for a resolved expiry the match
   is **exact** — a mis-specified calendar leg is a typed error, not a silent fill
   against whatever else sits at that strike and style (the named specs, whose
-  legs share one expiration by construction, keep the single-candidate fallback,
-  as does an unresolved `Days(n)` leg). Exit evaluation, the terminal flatten and
+  legs share one expiration by construction, keep the single-candidate fallback).
+  A leg carrying an unresolved relative `Days(n)` expiry is rejected at
+  construction: matched against the chain's resolved keys it would either match
+  nothing on a multi-expiry chain or match whatever single contract shared its
+  strike and style, with `n` read and then ignored. Resolving it against the tape
+  anchor is deferred to its own change. Exit evaluation, the terminal flatten and
   the recorded `ExitReason` are the seam's shared implementations, called
   verbatim by both strategies — the adapter now adds only its gated `inner`
   reprice.

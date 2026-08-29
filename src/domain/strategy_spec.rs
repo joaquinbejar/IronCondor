@@ -324,10 +324,19 @@ impl LegSpec {
     /// cannot reach the `run_id` or the manifest. Value equality alone is not
     /// enough for that, because `Decimal` compares **scale-insensitively**:
     /// `0.20` and `0.200` are equal numbers that serialise as different strings.
-    /// The last two tiebreaks compare the `Display` form of the analytic fields
-    /// — the same form serde writes — so a scale difference orders rather than
-    /// ties. They are reached only when every value field already matched, so
-    /// the two small allocations never occur on an ordinary sort.
+    /// The last two tiebreaks order by the written form instead, so a scale
+    /// difference orders rather than ties. They are reached only when every
+    /// value field already matched, so the two small allocations never occur on
+    /// an ordinary sort.
+    ///
+    /// The `Decimal` tiebreak matches serde's output exactly **because
+    /// `rust_decimal` is built without `serde-float` / `serde-arbitrary-precision`**
+    /// (`Cargo.toml`), which is what makes its wire form its `Display` form; a
+    /// feature unification that enabled either would change the serialised form
+    /// out from under this comparator. The [`ExpirationDate`] tiebreak is
+    /// scale-carrying rather than byte-exact — its `DateTime` arm is unreachable
+    /// anyway, since two instants equal under `Ord` are the same instant and
+    /// serialise identically, so only the `Days` arm can decide anything.
     ///
     /// The expiration comparison is the crate's single rule, shared with
     /// [`crate::domain::ContractKey`]'s `Ord`: `Days` before `DateTime`, exact

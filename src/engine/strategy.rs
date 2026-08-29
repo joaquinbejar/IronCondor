@@ -738,9 +738,10 @@ impl LegSetStrategy {
     ///
     /// Returns [`BacktestError::Strategy`] when the spec is not a
     /// [`StrategySpec::Legs`], when its leg set is empty (a position with no
-    /// legs is not a position), or when the dividend yield or any leg's implied
+    /// legs is not a position), when the dividend yield or any leg's implied
     /// volatility is negative (the analytic fields are validated here, at the
-    /// construction seam, exactly as the named specs' are).
+    /// construction seam, exactly as the named specs' are), or when any leg
+    /// carries an unresolved relative `Days(n)` expiry (see [`Self::new`]).
     pub fn from_spec(spec: &StrategySpec, exit: ExitPolicy) -> Result<Self, BacktestError> {
         match spec {
             StrategySpec::Legs(inner) => Self::new(inner, exit),
@@ -759,8 +760,9 @@ impl LegSetStrategy {
     ///
     /// # Errors
     ///
-    /// Returns [`BacktestError::Strategy`] for an empty leg set or a negative
-    /// dividend yield / per-leg implied volatility.
+    /// Returns [`BacktestError::Strategy`] for an empty leg set, a negative
+    /// dividend yield or per-leg implied volatility, or a leg whose expiry is an
+    /// unresolved relative `Days(n)`.
     fn new(spec: &LegSetSpec, exit: ExitPolicy) -> Result<Self, BacktestError> {
         if spec.legs.is_empty() {
             return Err(BacktestError::Strategy(
@@ -773,6 +775,26 @@ impl LegSetStrategy {
         let _ = positive_rate(spec.dividend_yield, "leg set dividend yield")?;
         for leg in &spec.legs {
             let _ = positive_rate(leg.implied_volatility, "leg set implied volatility")?;
+            // A leg set REQUIRES a resolved expiry. A relative `Days(n)` cannot
+            // mean what it says here: entry matches a snapshot whose contract
+            // keys are all resolved `DateTime`s, so an unresolved leg either
+            // matches nothing (a multi-expiry chain — the very shape this
+            // variant exists for) or matches whatever single contract shares its
+            // strike and style, with `n` read and then ignored. Rejecting it at
+            // construction is honest about that; resolving it against the tape
+            // anchor (`ts_0`, the rule in
+            // [01 §5.1](../../../docs/01-domain-model.md#51-expiration-resolves-to-one-absolute-instant))
+            // is the principled version and is deferred to its own change.
+            if let ExpirationDate::Days(days) = leg.expiration {
+                return Err(BacktestError::Strategy(format!(
+                    "leg set leg strike {} style {:?} carries an unresolved relative \
+                     expiration Days({days}); a leg set requires a resolved DateTime \
+                     expiry, because it is matched against the chain's resolved \
+                     contract keys",
+                    leg.strike.value(),
+                    leg.style
+                )));
+            }
         }
         // Canonicalise HERE, at the one place every entry path funnels through
         // (`run_spec_with_feed`, and a caller building the strategy directly).
@@ -1090,34 +1112,29 @@ fn select_leg_quote(
 
 /// Select the snapshot quote for one [`LegSpec`] of an explicit leg set.
 ///
-/// A leg set exists to express a **per-leg** expiration, so a leg that names a
-/// resolved (`DateTime`) expiry is matched on its exact [`ContractKey`] identity
-/// and nothing else: if the chain does not quote that contract, that is a typed
-/// error, **not** a licence to fill on whatever else happens to sit at the same
-/// strike and style. This is the one place a leg set deliberately diverges from
-/// [`select_leg_quote`], whose single-candidate fallback exists for the named
-/// specs — there a mismatch cannot arise, because every leg shares the one
-/// strategy-level expiration the tape was chosen for. Here it can: a
-/// mis-specified calendar leg would otherwise open silently against the wrong
-/// week and the bundle would record a contract the spec never asked for.
+/// A leg set exists to express a **per-leg** expiration, so its legs are matched
+/// on their exact [`ContractKey`] identity and nothing else: if the chain does
+/// not quote that contract, that is a typed error, **not** a licence to fill on
+/// whatever else happens to sit at the same strike and style. This is the one
+/// place a leg set deliberately diverges from [`select_leg_quote`], whose
+/// single-candidate fallback exists for the named specs — there a mismatch
+/// cannot arise, because every leg shares the one strategy-level expiration the
+/// tape was chosen for. Here it can: a mis-specified calendar leg would
+/// otherwise open silently against the wrong week and the bundle would record a
+/// contract the spec never asked for.
 ///
-/// An **unresolved** `Days(n)` leg keeps the fallback, because the strategy has
-/// no anchor to resolve it against (resolution happens once at tape
-/// materialisation, [01 §5.1](../../../docs/01-domain-model.md#51-expiration-resolves-to-one-absolute-instant));
-/// matching it exactly against a resolved chain would reject every such spec.
+/// Every leg reaching this point carries a resolved (`DateTime`) expiry —
+/// [`LegSetStrategy::new`] rejects an unresolved `Days(n)` at construction — so
+/// there is no second matching mode to reason about.
 ///
 /// # Errors
 ///
 /// Returns [`BacktestError::Execution`] when no snapshot quote carries the leg's
-/// exact identity (resolved leg), or when no quote matches its strike/style at
-/// all (unresolved leg).
+/// exact identity.
 fn select_leg_set_quote<'a>(
     snapshot: &'a ChainSnapshot,
     leg: &LegSpec,
 ) -> Result<&'a QuoteView, BacktestError> {
-    if matches!(leg.expiration, ExpirationDate::Days(_)) {
-        return select_leg_quote(snapshot, leg.strike, leg.style, leg.expiration);
-    }
     let contract = ContractKey {
         underlying: snapshot.underlying.clone(),
         expiration: leg.expiration,
@@ -2974,29 +2991,18 @@ mod tests {
     }
 
     #[test]
-    fn test_leg_set_unresolved_days_expiration_keeps_the_single_candidate_match() {
-        // An unresolved `Days(n)` leg has no anchor to resolve against inside the
-        // strategy, so it keeps the single-candidate fallback — matching it
-        // exactly against a resolved chain would reject every such spec.
-        let mut rng = ChaCha8Rng::seed_from_u64(124);
-        let snap = snapshot(0);
-        let mut ctx = ChainContext {
-            snapshot: &snap,
-            open: &[],
-            pending: &[],
-            marks: &NO_MARKS,
-            rng: &mut rng,
-            step: StepIndex::new(0),
-        };
+    fn test_leg_set_rejects_an_unresolved_relative_expiration() {
+        // A relative `Days(n)` cannot mean what it says in a leg set: entry
+        // matches resolved chain keys, so an unresolved leg either matches
+        // nothing (a multi-expiry chain — the shape this variant exists for) or
+        // matches whatever single contract shares its strike and style, with `n`
+        // read and then ignored. Both are wrong, so it is rejected up front.
         let mut relative = leg(510_000, OptionStyle::Call, Side::Short, EXP_NS);
         relative.expiration = ExpirationDate::Days(pos(dec!(30)));
-        let spec = leg_set_spec_from(vec![relative]);
-        let Ok(mut strategy) = LegSetStrategy::from_spec(&spec, ExitPolicy::Expiration) else {
-            panic!("the leg set strategy must build from its spec");
-        };
-        let mut out = Vec::new();
-        assert!(matches!(strategy.on_start(&mut ctx, &mut out), Ok(())));
-        assert_eq!(out.len(), 1, "the relative leg opens on the sole candidate");
+        assert!(matches!(
+            LegSetStrategy::from_spec(&leg_set_spec_from(vec![relative]), ExitPolicy::Expiration),
+            Err(BacktestError::Strategy(_))
+        ));
     }
 
     #[test]
