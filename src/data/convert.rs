@@ -216,8 +216,14 @@ const fn floor_to_tick(value: u64, tick: u64) -> u64 {
 ///
 /// Returns [`BacktestError::ArithmeticOverflow`] when the day-to-ns scaling
 /// or the anchor addition overflows the `i64` nanosecond range.
+///
+/// `pub(crate)` because it is the crate's **single** implementation of the
+/// [01 §5.1](../../../docs/01-domain-model.md#51-expiration-resolves-to-one-absolute-instant)
+/// rule, and the engine seam needs it too: `LegSetStrategy` resolves an explicit
+/// leg's relative expiry against the tape anchor before matching it (#120).
+/// Re-deriving the arithmetic there would let the two drift.
 #[must_use = "the resolved expiration must be used"]
-fn resolve_expiration(
+pub(crate) fn resolve_expiration(
     expiration: &ExpirationDate,
     anchor_ts: SimTime,
 ) -> Result<ExpirationDate, BacktestError> {

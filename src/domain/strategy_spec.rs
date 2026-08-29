@@ -303,14 +303,18 @@ pub struct LegSpec {
     pub style: OptionStyle,
     /// Strike in integer cents.
     pub strike: PriceCents,
-    /// This leg's contract expiry — reused from `optionstratlib`. A resolved
-    /// (`DateTime`) expiry is **required**: this record can still *represent* a
-    /// relative `Days(n)` (it serialises and orders like any other), but the
-    /// strategy refuses to run one — `LegSetStrategy::from_spec` returns a typed
-    /// error, because tape materialisation resolves the **chain's** quotes, not
-    /// a spec's legs, so a relative leg could never match a chain key
-    /// ([01 §5](../../../docs/01-domain-model.md#5-contract-identity)).
-    /// Resolving it against the tape anchor instead is issue #120.
+    /// This leg's contract expiry — reused from `optionstratlib`. Either form
+    /// works: a resolved (`DateTime`) expiry is used as written, and a relative
+    /// `Days(n)` is resolved at entry against the tape anchor `ts_0` by the same
+    /// rule the chain's own quotes go through
+    /// ([01 §5.1](../../../docs/01-domain-model.md#51-expiration-resolves-to-one-absolute-instant)),
+    /// so `n` means what it says.
+    ///
+    /// The two forms are **not interchangeable for identity**: a relative spec
+    /// and the resolved spec naming the same position are different specs, hash
+    /// to different `run_id`s, and are recorded differently in the manifest.
+    /// That is correct — the manifest records what it hashed — and it is also
+    /// why the canonical leg order is taken over the spec as written.
     pub expiration: ExpirationDate,
     /// Contract count for this leg (strictly positive).
     pub quantity: Quantity,
