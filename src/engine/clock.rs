@@ -164,6 +164,7 @@ impl Default for SimClock {
 /// deltas); it never peeks at `S_{n+1}` — no look-ahead, by construction
 /// ([docs/02 §3](../../../docs/02-engine-architecture.md#3-the-replay-loop--normative-state-machine)).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum Event {
     /// New market data for this step — the sole source of forward time motion.
     Snapshot(ChainSnapshot),

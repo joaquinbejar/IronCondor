@@ -240,16 +240,36 @@ fn capture_inline_body(lines: &[&str], start: usize) -> (String, usize) {
     (body, i)
 }
 
+/// The variant names of an enum body captured by [`capture_inline_body`] (one
+/// dedent already applied, so a variant sits at column 0 and a struct-variant's
+/// own fields stay indented).
+///
+/// A variant is a column-0 line whose first character is an ASCII uppercase
+/// letter — which is what every Rust variant is, and what no attribute (`#[…]`),
+/// doc comment (`///`), field, or closing brace can be. The leading identifier
+/// stops at `(`, `{`, `=`, `,` or whitespace, so tuple, struct and
+/// discriminant forms all yield the bare name.
+fn enum_variants(body: &str) -> Vec<String> {
+    body.lines()
+        .filter(|line| !line.starts_with(|c: char| c.is_whitespace()))
+        .filter(|line| line.starts_with(|c: char| c.is_ascii_uppercase()))
+        .map(leading_ident)
+        .filter(|name| !name.is_empty())
+        .collect()
+}
+
 /// Extract the public surface declared **directly** in one module's text.
 ///
 /// `prefix` is the module's path prefix (`""` for `lib.rs`, `"engine::"` for
 /// `src/engine/mod.rs`, …) and `base_feature` the cfg feature it inherits.
 /// Records every `pub mod`, `pub use` leaf, and tracked `pub` item, each tagged
-/// with its effective feature; inline `pub mod X { … }` bodies are extracted in
+/// with its effective feature, **plus every public enum's variants** (an added
+/// variant is a breaking change for a downstream exhaustive `match`, so it has
+/// to be visible in the diff). Inline `pub mod X { … }` bodies are extracted in
 /// place (recursively), while file-based `pub mod X;` declarations are returned
-/// as [`ChildMod`]s for the driver to read and recurse into. Only column-0
-/// (module-level) lines are items, so struct fields and `impl` methods — always
-/// indented in rustfmt'd code — are excluded. Returns the sorted
+/// as [`ChildMod`]s for the driver to read and recurse into. Apart from those
+/// variants, only column-0 (module-level) lines are items, so struct fields and
+/// `impl` methods — always indented in rustfmt'd code — are excluded. Returns the sorted
 /// `"<feature> <kind> <path>"` lines plus the file-based children.
 fn extract_module(
     text: &str,
@@ -330,6 +350,21 @@ fn extract_module(
         // Any other tracked `pub` item (fn / struct / enum / trait / type / …).
         if let Some((kind, name)) = item_kind_and_name(line) {
             out.insert(format!("{effective} {kind} {prefix}{name}"));
+            // An enum's VARIANTS are part of the surface too: adding one is a
+            // breaking change for a downstream exhaustive `match`, and tracking
+            // only the enum's name made exactly that change invisible to this
+            // gate (#117 added `StrategySpec::Legs` without moving the snapshot
+            // by one line). Variants are indented, so the module-level scan
+            // above skips them; capture the body and record them explicitly.
+            if kind == "enum" && line.contains('{') {
+                let (body, next) = capture_inline_body(&lines, i);
+                for variant in enum_variants(&body) {
+                    out.insert(format!("{effective} variant {prefix}{name}::{variant}"));
+                }
+                pending_feature = None;
+                i = next;
+                continue;
+            }
             pending_feature = None;
             i += 1;
             continue;
@@ -608,6 +643,66 @@ pub use execution::RealisticFill;
     }
 
     #[test]
+    fn test_extract_module_records_every_variant_form() {
+        // The gate exists because an added variant is breaking for a downstream
+        // exhaustive `match` and was previously invisible here (#117 added
+        // `StrategySpec::Legs` without moving this snapshot by one line). Every
+        // variant shape must be recorded: unit, tuple, struct-like, and one
+        // carrying an explicit discriminant.
+        let src = "\
+pub enum Shape {
+    /// A unit variant.
+    Unit,
+    Tuple(u8, String),
+    #[serde(rename = \"renamed\")]
+    Struct {
+        field: u8,
+        other: u8,
+    },
+    Discriminant = 7,
+}
+";
+        let (out, _children) = extract_module(src, "domain::", None);
+        for variant in ["Unit", "Tuple", "Struct", "Discriminant"] {
+            assert!(
+                out.contains(&format!("default variant domain::Shape::{variant}")),
+                "{variant} must be recorded: {out:?}"
+            );
+        }
+        // A struct-like variant's own FIELDS are one level deeper, so they are
+        // not variants and must not leak in.
+        assert!(
+            !out.iter()
+                .any(|l| l.contains("field") || l.contains("other")),
+            "variant fields are not surface items: {out:?}"
+        );
+        // The enum itself is still recorded alongside its variants.
+        assert!(out.contains("default enum domain::Shape"));
+    }
+
+    #[test]
+    fn test_extract_module_variants_inherit_the_enum_feature() {
+        // A cfg-gated enum's variants carry the same feature tag, so a
+        // feature-gated surface change is as visible as a default one.
+        let src = "\
+#[cfg(feature = \"simulator\")]
+pub enum Gated {
+    One,
+    Two,
+}
+";
+        let (out, _children) = extract_module(src, "data::", None);
+        assert!(
+            out.contains("simulator variant data::Gated::One"),
+            "{out:?}"
+        );
+        assert!(
+            out.contains("simulator variant data::Gated::Two"),
+            "{out:?}"
+        );
+    }
+
+    #[test]
     fn test_extract_module_captures_pub_items_with_prefix() {
         let src = "\
 pub struct Foo {
@@ -638,6 +733,8 @@ pub type Alias = u8;
         );
         // Struct fields are indented, so they never appear.
         assert!(!out.iter().any(|l| l.contains("field")));
+        // An enum's variants ARE recorded (#121).
+        assert!(out.contains("default variant engine::Bar::A"), "{out:?}");
     }
 
     #[test]

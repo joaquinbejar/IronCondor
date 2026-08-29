@@ -185,6 +185,7 @@ pub trait DataFeed {
 /// only under the `simulator` feature, matching the `DataSourceSpec::Simulator`
 /// variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum FeedKind {
     /// A directory of per-step CSV chain files (feature `default`).
     Csv,

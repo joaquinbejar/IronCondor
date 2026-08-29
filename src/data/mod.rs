@@ -54,6 +54,7 @@ use crate::data::simulator::CreateSessionRequest;
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum DataSourceSpec {
     /// A directory of per-step CSV chain files (v0.2 breadth).
     Csv {

@@ -359,6 +359,7 @@ pub struct ErrorResponse {
 /// [`SessionState::Unknown`] rather than being guessed at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum SessionState {
     /// Freshly created, not yet advanced.
     Initialized = 0,
