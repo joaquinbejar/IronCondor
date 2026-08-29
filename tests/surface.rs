@@ -11,8 +11,11 @@
 //!   `pub use` leaf, and every `pub` item (`fn` / `struct` / `enum` / `trait` /
 //!   `type` / `const` / `static`) declared at module level in `lib.rs` **and in
 //!   each module transitively reachable through a `pub mod`** (resolved from
-//!   `src/X.rs` / `src/X/mod.rs`), each annotated with its effective cfg feature
-//!   (or `default`). Because a `pub mod` re-exports every `pub` item beneath it
+//!   `src/X.rs` / `src/X/mod.rs`), **plus every public enum's variants** — each
+//!   annotated with its effective cfg feature (or `default`), a variant's own
+//!   `#[cfg]` included. Variants are tracked because adding one is a breaking
+//!   change for a downstream exhaustive `match`, and recording only the enum's
+//!   name let exactly that change land invisibly (#117/#121). Because a `pub mod` re-exports every `pub` item beneath it
 //!   under `ironcondor::<path>`, those items are part of the contract even when
 //!   they are not re-exported at the crate root — so the snapshot tracks them
 //!   too (that is the #44 gap the earlier lib.rs-only extractor missed).
@@ -231,13 +234,21 @@ fn capture_inline_body(lines: &[&str], start: usize) -> (String, usize) {
     while i < lines.len() {
         if lines[i] == "}" {
             i += 1;
-            break;
+            return (body, i);
         }
         body.push_str(dedent_one(lines[i]));
         body.push('\n');
         i += 1;
     }
-    (body, i)
+    // Reaching EOF means the assumed shape did not hold, and this scan has just
+    // swallowed every item to the end of the file — the failure mode that
+    // silently SHRINKS the snapshot. Be loud: a quietly missing item is exactly
+    // what this gate exists to prevent.
+    panic!(
+        "unterminated body opened at line {}: no column-0 `}}` before EOF \
+         (the capture would silently drop every later item)",
+        start + 1
+    );
 }
 
 /// Capture the body of a `pub enum` whose declaration opens at `lines[start]`,
@@ -276,9 +287,28 @@ fn capture_enum_body(lines: &[&str], start: usize) -> Option<(String, usize)> {
         brace += 1;
     }
     let opening = lines.get(brace)?;
-    // `pub enum Never {}` — no variants, and the body must not be scanned.
-    if opening.contains('}') {
-        return Some((String::new(), brace + 1));
+    // The body opens and closes on this line: `pub enum Never {}`, or an inline
+    // `pub enum Inline { A, B }` (which `#[rustfmt::skip]` reaches). Take what
+    // sits between the braces — treating it as empty would drop `A` and `B` as
+    // silently as the runaway capture drops later items.
+    if let Some(open_at) = opening.find('{')
+        && let Some(close_at) = opening.rfind('}')
+        && close_at > open_at
+    {
+        let inner = opening
+            .get(open_at + 1..close_at)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        // One variant per comma, each on its own line, so `enum_variants` sees
+        // the same column-0 shape it sees for a multi-line body.
+        let body = inner
+            .split(',')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Some((body, brace + 1));
     }
     Some(capture_inline_body(lines, brace))
 }
@@ -288,10 +318,15 @@ fn capture_enum_body(lines: &[&str], start: usize) -> Option<(String, usize)> {
 /// fields stay indented), each paired with its **effective feature**.
 ///
 /// A variant is a column-0 line whose first character is an ASCII uppercase
-/// letter — which is what every Rust variant is, and what no attribute (`#[…]`),
-/// doc comment (`///`), field, or closing brace can be. The leading identifier
-/// stops at `(`, `{`, `=`, `,` or whitespace, so tuple, struct and
-/// discriminant forms all yield the bare name.
+/// letter. Nothing else at column 0 can be — not an attribute (`#[…]`), a doc
+/// comment (`///`), a field, or a closing brace — but the converse does not
+/// hold: a raw identifier (`r#Type`) or a variant starting with a non-ASCII
+/// uppercase letter is **not** matched. Neither exists in this crate, and
+/// `test_every_public_enum_records_at_least_one_variant` fails loudly if one
+/// ever leaves an enum with no recorded variants. The name is then
+/// [`leading_ident`], which stops at the first character that is neither
+/// alphanumeric nor `_`, so tuple, struct-like and discriminant forms all yield
+/// the bare name.
 ///
 /// A variant may carry its **own** `#[cfg(feature = "…")]` on top of the enum's
 /// — `DataSourceSpec::Simulator` and `FeedKind::Simulator` both do — so the same
@@ -782,6 +817,37 @@ pub enum Gated {
         assert!(
             out.contains("simulator variant data::Gated::Two"),
             "{out:?}"
+        );
+    }
+
+    #[test]
+    fn test_every_public_enum_records_at_least_one_variant() {
+        // The backstop for the whole silent-miss class. Every failure found in
+        // review — a wrapped brace, a single-line body, a runaway capture —
+        // showed up the same way: the enum's own name was recorded and its
+        // variants were not, so the snapshot looked healthy while a breaking
+        // change slipped past. An enum with zero variants is either uninhabited
+        // or a parse failure, and this repo has none of the former, so demand
+        // one either way and the next member of the class fails CI loudly.
+        let surface = extract_tree(&crate_root().join("src"));
+        let mut missing = Vec::new();
+        for line in &surface {
+            let Some((feature, rest)) = line.split_once(' ') else {
+                continue;
+            };
+            let Some(path) = rest.strip_prefix("enum ") else {
+                continue;
+            };
+            let variant_prefix = format!("{feature} variant {path}::");
+            if !surface.iter().any(|l| l.starts_with(&variant_prefix)) {
+                missing.push(line.clone());
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "these enums recorded no variants — either they are uninhabited (add \
+             them to this test as a documented exception) or the extractor failed \
+             to parse them, which would silently hide a breaking change: {missing:?}"
         );
     }
 

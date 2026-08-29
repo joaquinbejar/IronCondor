@@ -63,8 +63,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`DataSourceSpec::Simulator` and `FeedKind::Simulator` do), that an enum whose
   brace wraps onto its own line after generics or a `where` clause still records
   its variants, and that an empty enum does not swallow the items after it. Each
-  of those three was a **silent** miss: the enum's own name still appeared, so
-  nothing in the snapshot looked broken while a breaking change slipped past.
+  of those was a **silent** miss: the enum's own name still appeared, so nothing
+  in the snapshot looked broken while a breaking change slipped past. A
+  single-line body (`pub enum Inline { A, B }`, reachable through
+  `#[rustfmt::skip]`) is parsed rather than treated as empty, for the same
+  reason. Two backstops turn the whole class into a loud CI failure instead of a
+  quietly shrinking snapshot: the capture **panics** if it reaches EOF without a
+  closing brace — the shape that swallows later items — and a test asserts every
+  recorded enum has at least one recorded variant.
 
   `#[non_exhaustive]` is itself breaking for a downstream exhaustive `match`,
   which the pre-`v1.0.0` window admits in a minor bump — and is exactly why it is
