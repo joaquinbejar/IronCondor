@@ -8,6 +8,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The `audit` gate is green again: `chacha20` 0.10.1 → 0.10.2 (#119).**
+  `chacha20 0.10.1` was **yanked** upstream, and `cargo audit --deny warnings`
+  counts a yanked crate as a denied warning, so the gate turned red on every
+  branch — `main` included — without anything in this repo changing. It reaches
+  `Cargo.lock` only transitively (`rand 0.10.2` via `rand_distr`/`optionstratlib`,
+  and via `quinn-proto` → `reqwest`). The fix is a lockfile bump and **not** a
+  suppression: no entry was added to `.cargo/audit.toml` or `deny.toml`, and the
+  lockfile moves exactly two lines (version + checksum) with nothing else
+  resolving differently.
+
+  Because `lockfile_sha256` is part of the build identity hashed into every
+  `run_id`, the bump moves the identity of all five frozen bundles, which are
+  re-blessed in the same commit. The change is **behaviour-neutral**, and that
+  was verified rather than asserted: across the 20 committed Parquet tables the
+  only column whose bytes moved is `fills.strategy_run_id`, and the only manifest
+  keys that changed are `run_id` and `lockfile_sha256`. `equity_curve`,
+  `positions` and `greeks_attribution` are byte-identical everywhere.
+
 ### Added
 
 - **`StrategySpec::Legs` — an explicit leg set with a per-leg expiration
