@@ -775,16 +775,18 @@ impl LegSetStrategy {
         let _ = positive_rate(spec.dividend_yield, "leg set dividend yield")?;
         for leg in &spec.legs {
             let _ = positive_rate(leg.implied_volatility, "leg set implied volatility")?;
-            // A leg set REQUIRES a resolved expiry. A relative `Days(n)` cannot
-            // mean what it says here: entry matches a snapshot whose contract
-            // keys are all resolved `DateTime`s, so an unresolved leg either
-            // matches nothing (a multi-expiry chain — the very shape this
-            // variant exists for) or matches whatever single contract shares its
-            // strike and style, with `n` read and then ignored. Rejecting it at
-            // construction is honest about that; resolving it against the tape
-            // anchor (`ts_0`, the rule in
-            // [01 §5.1](../../../docs/01-domain-model.md#51-expiration-resolves-to-one-absolute-instant))
-            // is the principled version and is deferred to its own change.
+            // A leg set REQUIRES a resolved expiry. Every snapshot contract key
+            // is a resolved `DateTime` — `data::convert::resolve_expiration`
+            // returns that variant for BOTH input forms, so a `Days` key cannot
+            // exist in a chain — and therefore a relative leg can never match
+            // one. It would only ever fall through to a looser strike+style
+            // match, where `n` is read and then ignored, or match nothing at all
+            // on a multi-expiry chain, the very shape this variant exists for.
+            // Rejecting it at construction is honest about that; resolving it
+            // against the tape anchor (`ts_0`, the rule in
+            // [01 §5.1](../../../docs/01-domain-model.md#51-expiration-resolves-to-one-absolute-instant),
+            // already implemented by that same `resolve_expiration`) is the
+            // principled version and is deferred to its own change.
             if let ExpirationDate::Days(days) = leg.expiration {
                 return Err(BacktestError::Strategy(format!(
                     "leg set leg strike {} style {:?} carries an unresolved relative \
