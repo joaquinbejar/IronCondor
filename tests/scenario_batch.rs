@@ -19,7 +19,10 @@ use ironcondor::{
 };
 use optionstratlib::simulation::ExitPolicy;
 
-use common::{condor_config, condor_rows, iron_condor_spec, write_parquet};
+use common::{
+    condor_config, condor_rows, iron_condor_spec, legs_rows, legs_spec, write_parquet,
+    write_parquet_multi_expiry,
+};
 
 /// The four Parquet tables in a result bundle (the manifest is compared
 /// separately, canonicalised).
@@ -549,4 +552,102 @@ fn test_batch_missing_file_is_recorded_typed_error() {
             "a missing file is a recorded typed error, not an abort"
         );
     }
+}
+
+/// A batch over a `StrategySpec::Legs` leg set (#117): `run_scenario_batch`
+/// accepts the variant and produces bundles indistinguishable in **shape** from
+/// an `IronCondor` batch — same tables, same index structure, same per-run
+/// `read_bundle` verification. The batch runner threads the spec to the same
+/// factory `run_backtest` uses, so neither entry point is closed to a kind.
+#[test]
+fn test_batch_over_a_multi_expiration_leg_set_produces_the_same_bundle_shape() {
+    let Ok(dir) = tempfile::tempdir() else {
+        panic!("tempdir");
+    };
+    let parquet = dir.path().join("legs.parquet");
+    if let Err(e) = write_parquet_multi_expiry(&parquet, &legs_rows(6)) {
+        panic!("write leg-set fixture: {e}");
+    }
+    let out = dir.path().join("out");
+    let base = batch_base(&parquet, &out);
+    let params = ScenarioParams {
+        kind: ScenarioType::MonteCarlo,
+        base_seed: 42,
+        count: 2,
+        sweep: Vec::new(),
+    };
+
+    let index = match run_scenario_batch(&params, &base, &legs_spec(), &exit(), None) {
+        Ok(index) => index,
+        Err(e) => panic!("the leg-set batch must run: {e}"),
+    };
+    assert_eq!(index.run_count, 2);
+
+    let mut run_ids = Vec::new();
+    for entry in &index.runs {
+        let (run_id, path) = ok_entry(entry);
+        assert!(path.is_dir(), "bundle dir {} must exist", path.display());
+        // The full four-table shape, verified through the reader gate.
+        for table in TABLE_FILES {
+            assert!(path.join(table).is_file(), "{table} must be written");
+        }
+        let Ok(bundle) = read_bundle(path, &ResourceLimits::default()) else {
+            panic!("bundle {run_id} must verify");
+        };
+        assert_eq!(bundle.manifest.strategy.kind(), "legs");
+        assert_eq!(bundle.equity_curve.len(), 6);
+        run_ids.push(run_id.to_string());
+    }
+    run_ids.sort();
+    run_ids.dedup();
+    assert_eq!(run_ids.len(), 2, "each run has a distinct run_id");
+}
+
+/// A permuted leg set is the **same batch** (#117): `batch_id` folds the strategy
+/// in canonical form, so writing the same position's legs in a different order
+/// reuses the same `batch_<id>/` directory and the same per-run `run_id`s.
+#[test]
+fn test_batch_id_is_leg_order_independent() {
+    let Ok(dir) = tempfile::tempdir() else {
+        panic!("tempdir");
+    };
+    let parquet = dir.path().join("legs.parquet");
+    if let Err(e) = write_parquet_multi_expiry(&parquet, &legs_rows(6)) {
+        panic!("write leg-set fixture: {e}");
+    }
+    let out = dir.path().join("out");
+    let base = batch_base(&parquet, &out);
+    let params = ScenarioParams {
+        kind: ScenarioType::MonteCarlo,
+        base_seed: 42,
+        count: 2,
+        sweep: Vec::new(),
+    };
+
+    let spec = legs_spec();
+    let ironcondor::StrategySpec::Legs(mut permuted) = spec.clone() else {
+        panic!("the leg-set fixture is a leg set");
+    };
+    permuted.legs.reverse();
+    let permuted = ironcondor::StrategySpec::Legs(permuted);
+    assert_ne!(permuted, spec, "the fixture permutation changes the input");
+
+    let (Ok(first), Ok(second)) = (
+        run_scenario_batch(&params, &base, &spec, &exit(), None),
+        run_scenario_batch(&params, &base, &permuted, &exit(), None),
+    ) else {
+        panic!("both leg-order batches must run");
+    };
+    assert_eq!(
+        first.batch_id, second.batch_id,
+        "a permuted leg set is the same batch"
+    );
+    let ids = |index: &BatchIndex| -> Vec<String> {
+        index
+            .runs
+            .iter()
+            .map(|e| ok_entry(e).0.to_string())
+            .collect()
+    };
+    assert_eq!(ids(&first), ids(&second), "and the same per-run run_ids");
 }

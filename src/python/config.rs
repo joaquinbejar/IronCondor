@@ -17,15 +17,18 @@
 //! per-leg implied volatility and the two rates, and the `ExitPolicy`
 //! percentages — which convert to `Decimal` at the boundary.
 //!
-//! # What is deliberately NOT exposed (the deferred composition-root dispatch)
+//! # What is deliberately NOT exposed
 //!
-//! [`crate::run_backtest`] currently wires only a **Parquet** data source and
-//! the **iron condor** strategy; a CSV source or a short strangle spec returns a
-//! typed error there (the dispatch matrix is deferred). So this wrapper exposes
-//! only [`BacktestConfig::data_parquet`] and
-//! [`BacktestConfig::strategy_iron_condor`] — no `data_csv`, no
-//! `strategy_short_strangle` — to keep the Python surface to what genuinely runs
-//! end to end. Both execution modes **do** work
+//! Two different reasons, no longer one. [`crate::run_backtest`] still wires
+//! only a **Parquet** data source — a CSV source returns a typed error there
+//! (the data-source dispatch is deferred) — so no `data_csv` builder exists.
+//! The **strategy** side is no longer deferred: since #117 `run_backtest`
+//! accepts every [`crate::StrategySpec`] kind, including a short strangle and an
+//! explicit leg set. This wrapper still exposes only
+//! [`BacktestConfig::strategy_iron_condor`], so the missing
+//! `strategy_short_strangle` / `strategy_legs` builders are a **binding not yet
+//! written**, not a Rust capability that is missing. Keeping the Python surface
+//! to what it genuinely wraps. Both execution modes **do** work
 //! ([`BacktestConfig::execution_naive`] / [`BacktestConfig::execution_realistic`],
 //! #26), so both are exposed; realistic mode needs a wheel built with the
 //! `orderbook` feature or [`crate::run_backtest`] returns a typed config error.

@@ -11,7 +11,7 @@
 //! The **generator** (seed derivation, walk presets, `ScenarioParams → configs`
 //! expansion) is a pure, downward-only function and lives in
 //! [`crate::engine::scenario`]. The **runner** must call the analytics core
-//! ([`crate::run::run_with_feed`]) and the bundle writer
+//! ([`crate::run::run_spec_with_feed`]) and the bundle writer
 //! ([`crate::bundle::write_bundle`]) — both **upstream** of the engine layer.
 //! Placing it inside `src/engine/` would make the engine import `analytics` /
 //! `bundle`, inverting the layering the module boundaries forbid
@@ -33,10 +33,10 @@
 //! they live in [`SimulatorMaterialisation`], which the runner owns. The runner
 //! therefore does the per-run feed dispatch itself — `Parquet → ParquetFeed`,
 //! `Simulator → SimulatorFeed::open` — then delegates the identical run +
-//! analytics + bundle pipeline through the shared [`crate::run::run_with_feed`]
-//! core. `Csv` and non-`IronCondor` strategies stay deferred exactly as
-//! `run_backtest` defers them (a typed [`BacktestError::Config`]); this issue
-//! extends dispatch to the **simulator arm only**.
+//! analytics + bundle pipeline through the shared [`crate::run::run_spec_with_feed`]
+//! core, which builds whichever strategy the spec names (both named kinds and an
+//! explicit [`StrategySpec::Legs`] leg set, #117). `Csv` stays deferred exactly
+//! as `run_backtest` defers it (a typed [`BacktestError::Config`]).
 //!
 //! # Independence and determinism
 //!
@@ -99,7 +99,7 @@ use crate::data::{DataSourceSpec, ParquetFeed, SharedParquetTape};
 use crate::domain::{InstrumentSpec, Quantity, StrategySpec};
 use crate::engine::{BacktestRun, ScenarioParams, ScenarioType, expand};
 use crate::error::BacktestError;
-use crate::run::run_with_feed;
+use crate::run::run_spec_with_feed;
 
 /// The parent-index schema tag. **Not** part of `ironcondor.bundle.v1` — the
 /// batch index is a batch-level convenience artifact whose shape is **not
@@ -472,7 +472,7 @@ fn run_one(
 }
 
 /// Open the feed named by `config.data_source` and drive the shared run +
-/// analytics core ([`run_with_feed`]). `Parquet` and (feature `simulator`)
+/// analytics core ([`run_spec_with_feed`]). `Parquet` and (feature `simulator`)
 /// `Simulator` are dispatched; `Csv` and everything else are deferred, matching
 /// `run_backtest`.
 ///
@@ -514,7 +514,7 @@ fn open_and_run(
                 // Cache miss / bypass — a per-run verified open (identical tape).
                 _ => ParquetFeed::open_verified(path, sha256, &config.limits)?,
             };
-            run_with_feed(config, feed, strategy, exit.clone())
+            run_spec_with_feed(config, feed, strategy, exit.clone())
         }
         #[cfg(feature = "simulator")]
         DataSourceSpec::Simulator(spec) => {
@@ -532,7 +532,7 @@ fn open_and_run(
                 knobs.timeout,
                 &config.limits,
             )?;
-            run_with_feed(config, feed, strategy, exit.clone())
+            run_spec_with_feed(config, feed, strategy, exit.clone())
         }
         other => Err(BacktestError::Config(format!(
             "scenario batch supports a parquet or simulator data source; got {other:?}"
@@ -562,10 +562,13 @@ fn derive_batch_id(
 ) -> Result<String, BacktestError> {
     let mut hasher = Sha256::new();
     hasher.update(BATCH_ID_TAG);
+    // The strategy folds in CANONICAL form, exactly as `RunId::derive` hashes it
+    // — an explicit leg set written in a different leg order is the same batch.
+    let canonical_strategy = strategy.canonical();
     for part in [
         serde_json::to_vec(params),
         serde_json::to_vec(base_config),
-        serde_json::to_vec(strategy),
+        serde_json::to_vec(&canonical_strategy),
     ] {
         let bytes = part
             .map_err(|e| BacktestError::Bundle(format!("batch id preimage serialisation: {e}")))?;

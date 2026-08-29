@@ -44,6 +44,7 @@ default fn engine::scenario::child_data_seed
 default fn engine::scenario::child_seed
 default fn engine::scenario::expand
 default fn run::run_backtest
+default fn run::run_with_feed
 default mod analytics
 default mod analytics::attribution
 default mod analytics::metrics
@@ -118,6 +119,8 @@ default struct domain::result::FillRow
 default struct domain::result::GreeksAttributionRow
 default struct domain::result::PositionRow
 default struct domain::strategy_spec::IronCondorSpec
+default struct domain::strategy_spec::LegSetSpec
+default struct domain::strategy_spec::LegSpec
 default struct domain::strategy_spec::ShortStrangleSpec
 default struct domain::time::SimTime
 default struct domain::time::StepIndex
@@ -132,6 +135,7 @@ default struct engine::ledger::UnitGreeks
 default struct engine::scenario::ConfigOverride
 default struct engine::scenario::ScenarioParams
 default struct engine::strategy::ChainContext
+default struct engine::strategy::LegSetStrategy
 default struct engine::strategy::OptStratAdapter
 default struct engine::substrate::AttributionSubstrate
 default struct engine::substrate::LegAttributionSample
@@ -223,6 +227,8 @@ default use domain::FillRow
 default use domain::GreeksAttributionRow
 default use domain::InstrumentSpec
 default use domain::IronCondorSpec
+default use domain::LegSetSpec
+default use domain::LegSpec
 default use domain::OpenPosition
 default use domain::OrderCommand
 default use domain::OrderId
@@ -267,6 +273,8 @@ default use domain::result::FillRow
 default use domain::result::GreeksAttributionRow
 default use domain::result::PositionRow
 default use domain::strategy_spec::IronCondorSpec
+default use domain::strategy_spec::LegSetSpec
+default use domain::strategy_spec::LegSpec
 default use domain::strategy_spec::ShortStrangleSpec
 default use domain::strategy_spec::StrategySpec
 default use domain::time::SimTime
@@ -280,6 +288,7 @@ default use engine::Event
 default use engine::FillRecord
 default use engine::Ledger
 default use engine::LegAttributionSample
+default use engine::LegSetStrategy
 default use engine::OptStratAdapter
 default use engine::PositionMark
 default use engine::PositionSnapshot
@@ -311,6 +320,7 @@ default use engine::scenario::child_data_seed
 default use engine::scenario::child_seed
 default use engine::scenario::expand
 default use engine::strategy::ChainContext
+default use engine::strategy::LegSetStrategy
 default use engine::strategy::OptStratAdapter
 default use engine::strategy::PositionableStrategy
 default use engine::strategy::Strategy
@@ -324,6 +334,7 @@ default use execution::FillGroup
 default use execution::NaiveFill
 default use execution::naive::NaiveFill
 default use run::run_backtest
+default use run::run_with_feed
 orderbook mod execution::realistic
 orderbook struct execution::realistic::RealisticFill
 orderbook use execution::RealisticFill

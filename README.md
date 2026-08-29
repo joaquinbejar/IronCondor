@@ -51,6 +51,11 @@ is mode-agnostic.
   money as integer cents; order-book prices are `u128` ticks. `f64` is
   confined to the upstream pricing/Greeks kernel and the documented
   derived-analytics columns.
+- **Any position shape.** A run is described by a `StrategySpec`: a named
+  upstream strategy (`iron_condor`, `short_strangle`) or an explicit **leg
+  set** whose expiration is per leg — a diagonal, a calendar, a condor with
+  wings in a further week. Every kind drives the same replay loop and
+  publishes the same bundle.
 - **Dual execution modes.** `naive` (mid/spread plus slippage) and
   `realistic` (a real order book: queue position, partial fills, multi-level
   walks, resting GTC orders), selected once from config with no per-step

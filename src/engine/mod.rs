@@ -30,6 +30,6 @@ pub use ledger::{Ledger, PositionMark, UnitGreeks};
 pub use scenario::{
     ConfigOverride, ScenarioParams, ScenarioType, WalkPreset, child_data_seed, child_seed, expand,
 };
-pub use strategy::{ChainContext, OptStratAdapter, PositionableStrategy, Strategy};
+pub use strategy::{ChainContext, LegSetStrategy, OptStratAdapter, PositionableStrategy, Strategy};
 pub use substrate::{AttributionSubstrate, LegAttributionSample, StepAttributionScalars};
 pub use tradelog::ClosedTrade;

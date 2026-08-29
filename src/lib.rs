@@ -37,6 +37,11 @@
 //!   money as integer cents; order-book prices are `u128` ticks. `f64` is
 //!   confined to the upstream pricing/Greeks kernel and the documented
 //!   derived-analytics columns.
+//! - **Any position shape.** A run is described by a `StrategySpec`: a named
+//!   upstream strategy (`iron_condor`, `short_strangle`) or an explicit **leg
+//!   set** whose expiration is per leg — a diagonal, a calendar, a condor with
+//!   wings in a further week. Every kind drives the same replay loop and
+//!   publishes the same bundle.
 //! - **Dual execution modes.** `naive` (mid/spread plus slippage) and
 //!   `realistic` (a real order book: queue position, partial fills, multi-level
 //!   walks, resting GTC orders), selected once from config with no per-step
@@ -71,7 +76,7 @@
 //! | *(none)* | yes | Replay engine, naive execution, Parquet/CSV historical feeds, and the result bundle. |
 //! | `orderbook` | | Realistic, liquidity-aware fills routed through `option-chain-orderbook`. |
 //! | `simulator` | | Synthetic chain sessions from OptionChain-Simulator over HTTP. |
-//! | `python` | | PyO3 bindings, built as a wheel with maturin (PyPI publication planned). |
+//! | `python` | | PyO3 bindings, built as an `abi3` wheel with maturin and published to PyPI. |
 //!
 //! ## Quick start (Rust)
 //!
@@ -140,8 +145,18 @@
 //!
 //! ## Quick start (Python)
 //!
-//! The `python` feature builds a PyO3 extension module. Wheels are **not yet on
-//! PyPI**; build one locally with [maturin](https://www.maturin.rs):
+//! The `python` feature builds a PyO3 extension module, published to PyPI as
+//! [`ironcondor`](https://pypi.org/project/ironcondor/) — one `cp310-abi3` wheel
+//! serves Python 3.10+:
+//!
+//! ```bash
+//! pip install ironcondor
+//! ```
+//!
+//! The `0.5.0` release carries a macOS `arm64` wheel plus the sdist; on Linux and
+//! macOS `x86_64`, pip builds from the sdist for now and needs a Rust toolchain.
+//! For local development, build the module in place with
+//! [maturin](https://www.maturin.rs):
 //!
 //! ```bash
 //! maturin develop --release --features python,orderbook,simulator
@@ -200,8 +215,13 @@
 //! full analytics and result bundle, and the Python bindings — with the v1.0
 //! stability gates wired: the Rust public surface, the configuration surface,
 //! and the bundle schema are each pinned by a committed snapshot that fails CI
-//! on drift. Under SemVer `0.x`, breaking changes may still land in minor
-//! releases; the `1.0` cut follows the documented one-quarter stability window.
+//! on drift. It is published on
+//! [crates.io](https://crates.io/crates/ironcondor) and
+//! [PyPI](https://pypi.org/project/ironcondor/). Under SemVer `0.x`, breaking
+//! changes may still land in minor releases; the `1.0` cut follows the documented
+//! one-quarter stability window. The roadmap is otherwise complete: every
+//! v0.1–v1.0 issue is closed
+//! ([docs/ROADMAP.md](docs/ROADMAP.md#where-we-are)).
 //! Documentation states present-tense claims only for behaviour that exists,
 //! and no benchmark number is written before it is measured.
 //!
@@ -253,22 +273,22 @@ pub use data::{
 };
 pub use domain::{
     Cents, ChainSnapshot, ContractKey, EquityPoint, ExecutionMode, Fill, FillRow,
-    GreeksAttributionRow, InstrumentSpec, IronCondorSpec, OpenPosition, OrderCommand, OrderId,
-    OrderIntent, PendingOrder, PositionAction, PositionId, PositionRow, PriceCents, Quantity,
-    QuoteView, ShortStrangleSpec, SimTime, StepIndex, StrategySpec, Ticks, TimeInForce, TradeId,
-    Underlying,
+    GreeksAttributionRow, InstrumentSpec, IronCondorSpec, LegSetSpec, LegSpec, OpenPosition,
+    OrderCommand, OrderId, OrderIntent, PendingOrder, PositionAction, PositionId, PositionRow,
+    PriceCents, Quantity, QuoteView, ShortStrangleSpec, SimTime, StepIndex, StrategySpec, Ticks,
+    TimeInForce, TradeId, Underlying,
 };
 pub use engine::{
     AttributionSubstrate, BacktestEngine, BacktestRun, ChainContext, ConfigOverride, Event,
-    FillRecord, Ledger, LegAttributionSample, OptStratAdapter, PositionMark, PositionSnapshot,
-    PositionableStrategy, ScenarioParams, ScenarioType, SimClock, StepAttributionScalars, Strategy,
-    UnitGreeks, WalkPreset, child_data_seed, child_seed, expand,
+    FillRecord, Ledger, LegAttributionSample, LegSetStrategy, OptStratAdapter, PositionMark,
+    PositionSnapshot, PositionableStrategy, ScenarioParams, ScenarioType, SimClock,
+    StepAttributionScalars, Strategy, UnitGreeks, WalkPreset, child_data_seed, child_seed, expand,
 };
 pub use error::BacktestError;
 #[cfg(feature = "orderbook")]
 pub use execution::RealisticFill;
 pub use execution::{ExecutionModel, FillGroup, NaiveFill};
-pub use run::run_backtest;
+pub use run::{run_backtest, run_with_feed};
 
 #[cfg(feature = "simulator")]
 pub use data::SimulatorSourceSpec;

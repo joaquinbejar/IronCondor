@@ -14,12 +14,13 @@ use parquet::arrow::ArrowWriter;
 
 use ironcondor::{
     BacktestConfig, BacktestEngine, BacktestRun, CsvFeed, DataSourceSpec, ExecutionMode,
-    FeeSchedule, IronCondorSpec, NaiveFill, OptStratAdapter, ParquetFeed, PriceCents, Quantity,
-    ResourceLimits, ShortStrangleSpec, SlippageModel, StrategySpec, Underlying,
+    FeeSchedule, IronCondorSpec, LegSetSpec, LegSetStrategy, LegSpec, NaiveFill, OptStratAdapter,
+    ParquetFeed, PriceCents, Quantity, ResourceLimits, ShortStrangleSpec, SlippageModel,
+    StrategySpec, Underlying,
 };
-use optionstratlib::ExpirationDate;
 use optionstratlib::simulation::ExitPolicy;
 use optionstratlib::strategies::{IronCondor, ShortStrangle};
+use optionstratlib::{ExpirationDate, OptionStyle, Side};
 use rust_decimal::Decimal;
 
 /// The tape anchor `ts_0` (ns since epoch, UTC).
@@ -28,9 +29,17 @@ pub const TS0: i64 = 1_750_291_200_000_000_000;
 pub const NANOS_PER_DAY: i64 = 86_400_000_000_000;
 /// The four condor legs' absolute expiry: `ts_0 + 30 days`.
 pub const EXPIRY: i64 = TS0 + 30 * NANOS_PER_DAY;
+/// The FAR expiry of the multi-expiration leg-set tape: `ts_0 + 60 days`.
+pub const FAR_EXPIRY: i64 = TS0 + 60 * NANOS_PER_DAY;
 
-/// One quote row: `(step, ts, strike_cents, style, bid_cents, ask_cents)`.
+/// One quote row: `(step, ts, strike_cents, style, bid_cents, ask_cents)` — all
+/// at the single [`EXPIRY`].
 pub type Row = (i32, i64, i64, &'static str, i64, i64);
+
+/// One quote row carrying its **own** expiry:
+/// `(step, ts, expiration_ns, strike_cents, style, bid_cents, ask_cents)` — the
+/// multi-expiration tape a [`StrategySpec::Legs`] leg set is quoted by.
+pub type ExpiryRow = (i32, i64, i64, i64, &'static str, i64, i64);
 
 /// A single-row override applied to a built tape (used to perturb a future
 /// snapshot in the no-look-ahead test).
@@ -120,14 +129,52 @@ pub fn strangle_rows(steps: u32) -> Vec<Row> {
     rows
 }
 
-/// Encode the rows as one Parquet batch and write them to `path`.
+/// Build `steps` snapshots of a four-leg set spanning TWO expirations: the two
+/// body legs (short call 510000 / short put 490000) at [`EXPIRY`], the two wings
+/// (long call 520000 / long put 480000) a month later at [`FAR_EXPIRY`]. The
+/// shape no named strategy spec can describe, and the tape [`legs_spec`] is
+/// quoted by.
+pub fn legs_rows(steps: u32) -> Vec<ExpiryRow> {
+    // (expiration, strike, style, bid, ask) — mids are 2000/1800/800/700.
+    let legs: [(i64, i64, &'static str, i64, i64); 4] = [
+        (EXPIRY, 510_000, "call", 1_995, 2_005),
+        (EXPIRY, 490_000, "put", 1_795, 1_805),
+        (FAR_EXPIRY, 520_000, "call", 795, 805),
+        (FAR_EXPIRY, 480_000, "put", 695, 705),
+    ];
+    let mut rows = Vec::new();
+    for step in 0..steps {
+        let step_i = i32::try_from(step).unwrap_or(i32::MAX);
+        let ts = TS0 + i64::from(step) * NANOS_PER_DAY;
+        for (expiration, strike, style, bid, ask) in legs {
+            rows.push((step_i, ts, expiration, strike, style, bid, ask));
+        }
+    }
+    rows
+}
+
+/// Encode the rows as one Parquet batch and write them to `path` — every quote
+/// at the single [`EXPIRY`]. A thin wrapper over [`write_parquet_multi_expiry`],
+/// so the single- and multi-expiry tapes share one encoder (and the existing
+/// tapes keep their exact bytes).
 pub fn write_parquet(path: &Path, rows: &[Row]) -> Result<(), String> {
+    let rows: Vec<ExpiryRow> = rows
+        .iter()
+        .map(|&(step, ts, strike, style, bid, ask)| (step, ts, EXPIRY, strike, style, bid, ask))
+        .collect();
+    write_parquet_multi_expiry(path, &rows)
+}
+
+/// Encode rows that carry their **own** per-row expiry as one Parquet batch and
+/// write them to `path`.
+pub fn write_parquet_multi_expiry(path: &Path, rows: &[ExpiryRow]) -> Result<(), String> {
     let step: Vec<i32> = rows.iter().map(|r| r.0).collect();
     let ts: Vec<i64> = rows.iter().map(|r| r.1).collect();
-    let strike: Vec<i64> = rows.iter().map(|r| r.2).collect();
-    let style: Vec<&str> = rows.iter().map(|r| r.3).collect();
-    let bid: Vec<i64> = rows.iter().map(|r| r.4).collect();
-    let ask: Vec<i64> = rows.iter().map(|r| r.5).collect();
+    let expiration: Vec<i64> = rows.iter().map(|r| r.2).collect();
+    let strike: Vec<i64> = rows.iter().map(|r| r.3).collect();
+    let style: Vec<&str> = rows.iter().map(|r| r.4).collect();
+    let bid: Vec<i64> = rows.iter().map(|r| r.5).collect();
+    let ask: Vec<i64> = rows.iter().map(|r| r.6).collect();
     let n = rows.len();
 
     let columns: Vec<ArrayRef> = vec![
@@ -137,7 +184,7 @@ pub fn write_parquet(path: &Path, rows: &[Row]) -> Result<(), String> {
         Arc::new(Int64Array::from(vec![500_000i64; n])),
         Arc::new(Int64Array::from(vec![5i64; n])),
         Arc::new(Int32Array::from(vec![100i32; n])),
-        Arc::new(Int64Array::from(vec![EXPIRY; n])),
+        Arc::new(Int64Array::from(expiration)),
         Arc::new(Int64Array::from(strike)),
         Arc::new(StringArray::from(style)),
         Arc::new(Int64Array::from(bid)),
@@ -258,6 +305,47 @@ pub fn short_strangle_spec() -> StrategySpec {
     })
 }
 
+/// The **leg-set** spec whose four legs match [`legs_rows`]: a short call /
+/// short put body at [`EXPIRY`] and a long call / long put pair of wings at
+/// [`FAR_EXPIRY`] — a position spanning TWO expirations, which neither
+/// [`iron_condor_spec`] nor [`short_strangle_spec`] can express (both carry a
+/// single strategy-level expiration).
+///
+/// The legs are deliberately written in a NON-canonical order (a wing first), so
+/// any test that hashes or writes this spec exercises the canonicalisation.
+pub fn legs_spec() -> StrategySpec {
+    let Ok(underlying) = Underlying::new("SPX") else {
+        panic!("SPX is valid");
+    };
+    StrategySpec::Legs(LegSetSpec {
+        underlying,
+        underlying_price: cents(500_000),
+        legs: vec![
+            leg(520_000, OptionStyle::Call, Side::Long, FAR_EXPIRY),
+            leg(510_000, OptionStyle::Call, Side::Short, EXPIRY),
+            leg(480_000, OptionStyle::Put, Side::Long, FAR_EXPIRY),
+            leg(490_000, OptionStyle::Put, Side::Short, EXPIRY),
+        ],
+        risk_free_rate: Decimal::new(5, 2),
+        dividend_yield: Decimal::ZERO,
+    })
+}
+
+/// One leg of [`legs_spec`]: a single contract at its own expiry.
+pub fn leg(strike: u64, style: OptionStyle, side: Side, expiration_ns: i64) -> LegSpec {
+    let Ok(quantity) = Quantity::new(1) else {
+        panic!("1 is a valid quantity");
+    };
+    LegSpec {
+        side,
+        style,
+        strike: cents(strike),
+        expiration: ExpirationDate::DateTime(chrono::DateTime::from_timestamp_nanos(expiration_ns)),
+        quantity,
+        implied_volatility: Decimal::new(20, 2),
+    }
+}
+
 /// A valid `BacktestConfig` for a naive run over `path`, with the given seed.
 pub fn condor_config(path: &Path, seed: u64) -> BacktestConfig {
     BacktestConfig {
@@ -342,4 +430,17 @@ pub fn run_strangle(path: &Path, seed: u64) -> Result<BacktestRun, String> {
     let execution = NaiveFill::new(config.slippage.clone(), config.fees);
     BacktestEngine::run(&config, feed, execution, adapter, "short_strangle")
         .map_err(|e| e.to_string())
+}
+
+/// Open `path` as a `ParquetFeed`, drive the [`legs_spec`] leg set through
+/// [`LegSetStrategy`] with a non-triggering exit policy, and run to completion —
+/// the leg-set analogue of [`run_condor`], driving the **same** engine loop
+/// without an upstream adapter. `strategy_name` is `"legs"`.
+pub fn run_legs(path: &Path, seed: u64) -> Result<BacktestRun, String> {
+    let config = condor_config(path, seed);
+    let feed = ParquetFeed::open(path, &ResourceLimits::default()).map_err(|e| e.to_string())?;
+    let exit = ExitPolicy::TimeSteps(1_000_000);
+    let strategy = LegSetStrategy::from_spec(&legs_spec(), exit).map_err(|e| e.to_string())?;
+    let execution = NaiveFill::new(config.slippage.clone(), config.fees);
+    BacktestEngine::run(&config, feed, execution, strategy, "legs").map_err(|e| e.to_string())
 }

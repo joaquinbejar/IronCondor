@@ -1575,3 +1575,127 @@ fn test_cross_mode_parity_same_strategy_shape_identical_pnl_differs() {
         "the Fill shape must be mode-agnostic (identical serialised key set)"
     );
 }
+
+/// `run_backtest` accepts **every** strategy kind (#117): the composition root
+/// builds whichever strategy the spec names, so a `StrategySpec::Legs` — an
+/// explicit four-leg set across TWO expirations — runs end to end and produces a
+/// bundle indistinguishable in shape from an `IronCondor` one.
+#[test]
+fn test_run_backtest_accepts_a_multi_expiration_leg_set() {
+    use ironcondor::{ResourceLimits, read_bundle, write_bundle};
+    use optionstratlib::simulation::ExitPolicy;
+
+    let Ok(dir) = tempfile::tempdir() else {
+        panic!("tempdir must create");
+    };
+    let path = dir.path().join("legs.parquet");
+    if let Err(e) = common::write_parquet_multi_expiry(&path, &common::legs_rows(6)) {
+        panic!("the leg-set fixture must write: {e}");
+    }
+    let mut config = common::condor_config(&path, 7);
+    config.output_dir = dir.path().join("out");
+    let spec = common::legs_spec();
+
+    let Ok(run) = ironcondor::run_backtest(&config, &spec, ExitPolicy::TimeSteps(1_000_000)) else {
+        panic!("run_backtest must accept a leg-set spec");
+    };
+    assert_eq!(run.equity_curve.len(), 6, "one equity point per snapshot");
+    assert_eq!(
+        run.greeks_attribution.len(),
+        6,
+        "the analytics tail runs for a leg set exactly as for a named kind"
+    );
+
+    // The four legs opened, across two distinct expirations, and closed at the
+    // terminal step — the same 4-open/4-close lifecycle a condor produces.
+    let Ok(bundle_dir) = write_bundle(&run, &config, &spec) else {
+        panic!("a leg-set run must write a bundle");
+    };
+    let Ok(bundle) = read_bundle(&bundle_dir, &ResourceLimits::default()) else {
+        panic!("a leg-set bundle must read back");
+    };
+    assert_eq!(bundle.fills.len(), 8, "four opens plus four closes");
+    let mut expiries: Vec<i64> = bundle.fills.iter().map(|f| f.expiration_ns).collect();
+    expiries.sort_unstable();
+    expiries.dedup();
+    assert_eq!(expiries.len(), 2, "the fills span two expirations");
+}
+
+/// `run_backtest` accepts a `ShortStrangle` too (#117): the spec → strategy
+/// factory removed the composition root's single-kind restriction, so the second
+/// named kind is no longer a typed error at this entry point.
+#[test]
+fn test_run_backtest_accepts_a_short_strangle() {
+    use optionstratlib::simulation::ExitPolicy;
+
+    let Ok(dir) = tempfile::tempdir() else {
+        panic!("tempdir must create");
+    };
+    let path = dir.path().join("strangle.parquet");
+    if let Err(e) = common::write_parquet(&path, &common::strangle_rows(6)) {
+        panic!("the strangle fixture must write: {e}");
+    }
+    let config = common::condor_config(&path, 7);
+    let spec = common::short_strangle_spec();
+    let Ok(run) = ironcondor::run_backtest(&config, &spec, ExitPolicy::TimeSteps(1_000_000)) else {
+        panic!("run_backtest must accept a short-strangle spec");
+    };
+    assert_eq!(run.equity_curve.len(), 6);
+}
+
+/// The now-public `run_with_feed` validates its own config (#117 review): a
+/// caller can hand it a raw `BacktestConfig`, so skipping the check would let an
+/// over-cap `liquidity_profile.depth_levels` reach the per-contract seeding loop
+/// of a realistic fill — a hard resource ceiling walked past by a safe-looking
+/// call. The entry point must reject it as a typed `Config` error before any
+/// work happens.
+#[test]
+fn test_run_with_feed_rejects_an_over_cap_liquidity_profile() {
+    use ironcondor::{
+        BacktestError, LegSetStrategy, LiquidityProfile, ParquetFeed, ResourceLimits, run_with_feed,
+    };
+    use optionstratlib::simulation::ExitPolicy;
+
+    let Ok(dir) = tempfile::tempdir() else {
+        panic!("tempdir must create");
+    };
+    let path = dir.path().join("legs.parquet");
+    if let Err(e) = common::write_parquet_multi_expiry(&path, &common::legs_rows(4)) {
+        panic!("the fixture must write: {e}");
+    }
+
+    let mut config = common::condor_config(&path, 7);
+    config.liquidity_profile = LiquidityProfile {
+        depth_levels: LiquidityProfile::MAX_DEPTH_LEVELS + 1,
+        ..LiquidityProfile::default()
+    };
+    let Ok(feed) = ParquetFeed::open(&path, &ResourceLimits::default()) else {
+        panic!("the fixture must open");
+    };
+    let Ok(strategy) =
+        LegSetStrategy::from_spec(&common::legs_spec(), ExitPolicy::TimeSteps(1_000_000))
+    else {
+        panic!("the leg set strategy must build");
+    };
+
+    // The over-cap profile is rejected at the boundary, not seeded into a book.
+    let result = run_with_feed(&config, feed, strategy, "legs");
+    assert!(
+        matches!(result, Err(BacktestError::Config(_))),
+        "an over-cap liquidity profile must be a typed Config error at the public entry point"
+    );
+
+    // …and the same config is accepted once the profile is back within its cap,
+    // so the guard rejects the violation rather than the entry point.
+    let mut ok_config = config.clone();
+    ok_config.liquidity_profile = LiquidityProfile::default();
+    let Ok(feed) = ParquetFeed::open(&path, &ResourceLimits::default()) else {
+        panic!("the fixture must re-open");
+    };
+    let Ok(strategy) =
+        LegSetStrategy::from_spec(&common::legs_spec(), ExitPolicy::TimeSteps(1_000_000))
+    else {
+        panic!("the leg set strategy must build");
+    };
+    assert!(run_with_feed(&ok_config, feed, strategy, "legs").is_ok());
+}

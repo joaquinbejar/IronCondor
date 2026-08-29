@@ -8,6 +8,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`StrategySpec::Legs` — an explicit leg set with a per-leg expiration
+  (#117).** The two named kinds each mirror an `optionstratlib` constructor and
+  carry one strategy-level `expiration`, so a position whose legs sit in
+  different expiries — a diagonal, a calendar, a condor with wings in a further
+  week — could not be described in a bundle at all. The new variant carries
+  `LegSetSpec { underlying, underlying_price, legs, risk_free_rate,
+  dividend_yield }` with `LegSpec { side, style, strike, expiration, quantity,
+  implied_volatility }` per leg (money in integer cents; the rates and IVs are
+  the documented analytic `Decimal` exception), and `kind()` returns `"legs"`.
+  Legs hash and serialise in **canonical order** — `(expiration, strike, style,
+  side, quantity, implied_volatility)`, sharing `ContractKey`'s expiration rule
+  — so the same position written in a different leg order derives the same
+  `run_id`, lands in the same `<run_id>/` directory and records the same
+  manifest bytes (`StrategySpec::canonical`, applied by `RunId::derive`,
+  `write_bundle`, and the batch `batch_id` fold).
+- **`LegSetStrategy` — the second entry into the engine's strategy seam
+  (#117).** A leg set has no upstream strategy object for `OptStratAdapter` to
+  wrap, so this strategy opens the legs at the first snapshot and holds them. It
+  opens them in **canonical order**, which it sorts itself rather than trusting
+  the caller's spec: `order_id` / `position_id` / `trade_id` are minted in
+  submission order, so running the caller's order would put a permuted
+  `fills`/`positions` table under an identical `run_id` and manifest. Each leg is
+  matched on its full `ContractKey` identity, and for a resolved expiry the match
+  is **exact** — a mis-specified calendar leg is a typed error, not a silent fill
+  against whatever else sits at that strike and style (the named specs, whose
+  legs share one expiration by construction, keep the single-candidate fallback).
+  A leg carrying an unresolved relative `Days(n)` expiry is rejected at
+  construction: matched against the chain's resolved keys it would either match
+  nothing on a multi-expiry chain or match whatever single contract shared its
+  strike and style, with `n` read and then ignored. Resolving it against the tape
+  anchor is deferred to its own change. Exit evaluation, the terminal flatten and
+  the recorded `ExitReason` are the seam's shared implementations, called
+  verbatim by both strategies — the adapter now adds only its gated `inner`
+  reprice.
+- **`run_with_feed` is public and generic over the strategy (#117).** The
+  composition core takes an already-built `Strategy`, and the new
+  `run_spec_with_feed` factory builds whichever strategy a `StrategySpec` names.
+  `run_backtest` and `run_scenario_batch` therefore accept **every** kind: the
+  new leg set, and `ShortStrangle`, which was previously a typed error at those
+  entry points despite running fine through the adapter.
+- **Every `StrategySpec` kind is now byte-comparable, not just value-comparable
+  (#117).** `LegSpec::canonical_cmp` gained a textual tiebreak on the analytic
+  fields, because `Decimal` compares scale-insensitively: `0.20` and `0.200` are
+  equal numbers that serialise differently, so without it a stable sort could
+  leave two byte-different legs in input order and one position could hash to two
+  `run_id`s. A tie now means "serialises identically".
+- **A frozen `legs_multi_expiry_naive` golden bundle (#117)** — a four-leg
+  position across two expirations, held to the same write → read → equal oracle
+  and run-twice byte-identity as the existing scenarios, and read back by
+  `tests/chainview_replay.rs` through `read_bundle` alone. The
+  `iron_condor_naive`, `short_strangle_naive`, `iron_condor_realistic` goldens
+  and the shared conformance fixture are byte-unchanged: the variant is purely
+  additive to what already ships (`docs/SEMVER.md`).
+
 ### Security
 
 - **`RUSTSEC-2026-0235` (`rkyv` 0.7.46) suppressed with a documented note.**
