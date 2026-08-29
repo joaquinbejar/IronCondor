@@ -879,12 +879,22 @@ impl Strategy for LegSetStrategy {
         evaluate_exits(&self.exit, ctx, out)
     }
 
+    /// Nothing. Entry is **`on_start` only** for a leg set, which is what makes
+    /// the anchor claim structural instead of a comment: the one snapshot a
+    /// relative expiry resolves against is the one the loop opens with. Were
+    /// entry retried here, a `Days(30)` leg reaching this at step k would
+    /// resolve to `ts_k + 30d` — usually a typed miss, but on a chain quoting
+    /// several tenors it lands on a REAL contract and silently opens a position
+    /// the spec never named. `on_start` either enters or propagates, so this is
+    /// not a behaviour change under [`crate::BacktestEngine::run`]; it removes
+    /// the reach of a driver that would call `on_snapshot` alone.
     fn on_snapshot(
         &mut self,
         ctx: &mut ChainContext,
         out: &mut Vec<OrderCommand>,
     ) -> Result<(), BacktestError> {
-        self.open_entries(ctx.snapshot, out)
+        let _ = (ctx, out);
+        Ok(())
     }
 
     fn on_end(
@@ -2701,7 +2711,11 @@ mod tests {
             panic!("valid instrument spec");
         };
         ChainSnapshot {
-            ts: SimTime::new(TS_NS),
+            // Step-DEPENDENT on purpose: a fixture that pins `ts` for every step
+            // cannot tell "resolved against this snapshot" apart from "resolved
+            // against the anchor", and it lets a one-shot-entry test pass on a
+            // timestamp coincidence rather than on the guard.
+            ts: SimTime::new(TS_NS + i64::from(step) * super::NANOS_PER_DAY as i64),
             step: StepIndex::new(step),
             underlying: und(),
             underlying_price: PriceCents::new(500_000),
@@ -2757,17 +2771,50 @@ mod tests {
     }
 
     #[test]
-    fn test_leg_set_entry_is_one_shot_across_steps() {
+    fn test_leg_set_never_enters_outside_on_start() {
+        // Entry is `on_start`-only, and that is what makes the anchor claim
+        // structural: the snapshot a relative expiry resolves against is the one
+        // the loop opens with, not whichever step happened to enter. A driver
+        // calling `on_snapshot` must not be able to enter at step k — where
+        // `Days(30)` would resolve to `ts_k + 30d` and, on a chain quoting
+        // several tenors, silently open a contract the spec never named.
         let mut rng = ChaCha8Rng::seed_from_u64(118);
-        let snap = multi_expiry_snapshot(0);
         let Ok(mut strategy) = LegSetStrategy::from_spec(&leg_set_spec(), ExitPolicy::Expiration)
         else {
             panic!("the leg set strategy must build from its spec");
         };
         let mut out = Vec::new();
+
+        // Never entered, and a LATER snapshot (its own ts, one day on): still
+        // nothing. Before the fix this opened the position against `ts_1`.
+        let later = multi_expiry_snapshot(1);
+        assert_ne!(
+            later.ts.value(),
+            multi_expiry_snapshot(0).ts.value(),
+            "the fixture must carry a step-dependent ts or this proves nothing"
+        );
         {
             let mut ctx = ChainContext {
-                snapshot: &snap,
+                snapshot: &later,
+                open: &[],
+                pending: &[],
+                marks: &NO_MARKS,
+                rng: &mut rng,
+                step: StepIndex::new(1),
+            };
+            assert!(matches!(strategy.on_snapshot(&mut ctx, &mut out), Ok(())));
+        }
+        assert!(
+            out.is_empty(),
+            "on_snapshot must never open a leg set, entered or not"
+        );
+        assert!(!strategy.has_entered(), "and must not mark it entered");
+
+        // `on_start` is the sole entry, and it is still one-shot.
+        let first = multi_expiry_snapshot(0);
+        {
+            let mut ctx = ChainContext {
+                snapshot: &first,
                 open: &[],
                 pending: &[],
                 marks: &NO_MARKS,
@@ -2776,8 +2823,10 @@ mod tests {
             };
             assert!(matches!(strategy.on_start(&mut ctx, &mut out), Ok(())));
         }
+        assert_eq!(out.len(), 4, "on_start opens every leg");
+        assert!(strategy.has_entered());
+
         out.clear();
-        let later = multi_expiry_snapshot(1);
         let mut ctx = ChainContext {
             snapshot: &later,
             open: &[],
@@ -2786,7 +2835,7 @@ mod tests {
             rng: &mut rng,
             step: StepIndex::new(1),
         };
-        assert!(matches!(strategy.on_snapshot(&mut ctx, &mut out), Ok(())));
+        assert!(matches!(strategy.on_start(&mut ctx, &mut out), Ok(())));
         assert!(out.is_empty(), "entry is guarded after the first snapshot");
     }
 

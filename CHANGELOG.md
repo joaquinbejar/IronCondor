@@ -17,8 +17,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   already existed and was already implemented — `data::convert::resolve_expiration`,
   the same function the chain's own quotes go through — so `LegSetStrategy` now
   calls it at entry against the tape anchor `ts_0`. `Days(n)` means what it says,
-  and there is one matching mode rather than two: resolve, then match the exact
-  `ContractKey`, or a typed error.
+  and within a leg set there is one matching mode rather than two: resolve, then
+  match the exact `ContractKey`, or a typed error.
+
+  **The rule is not yet crate-wide**, and that is worth stating rather than
+  implying otherwise: the named kinds still match through `select_leg_quote`,
+  which is agnostic to the expiry form, so a relative expiry on an
+  `IronCondorSpec` is still read-and-discarded on a single-expiry chain and
+  unmatchable on a multi-expiry one. `IronCondorSpec::expiration` now says so.
+  Unifying the two would change the adapter's matching path and is deliberately
+  not folded into this change.
+
+  Entry for a leg set is now **`on_start`-only**. That is what makes the anchor
+  claim structural rather than a comment: the snapshot a relative expiry resolves
+  against is the one the loop opens with. `on_snapshot` no longer opens a leg set
+  — under the shipped driver it never did, since `on_start` either enters or
+  propagates — which removes the reach of a caller driving the public `Strategy`
+  seam directly, where a retried entry at step k would resolve `Days(30)` to
+  `ts_k + 30d` and, on a chain quoting several tenors, silently open a contract
+  the spec never named.
 
   Correctness depends on entry being one-shot at step 0, so the snapshot it
   resolves against is the anchor; that is stated in the code because it is

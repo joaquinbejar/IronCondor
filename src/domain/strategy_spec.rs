@@ -141,9 +141,17 @@ pub struct IronCondorSpec {
     pub long_call_strike: PriceCents,
     /// Long-put strike in integer cents.
     pub long_put_strike: PriceCents,
-    /// Contract expiry — reused from `optionstratlib`. A resolved
-    /// (`DateTime`) expiry is expected; a relative `Days(n)` is resolved once
-    /// at tape materialisation ([01 §5](../../../docs/01-domain-model.md#5-contract-identity)).
+    /// Contract expiry — reused from `optionstratlib`. A resolved (`DateTime`)
+    /// expiry is expected.
+    ///
+    /// **A relative `Days(n)` is not resolved on this path.** The named kinds
+    /// match through `select_leg_quote`, which is agnostic to the form: on a
+    /// chain quoting one contract per strike/style it returns that contract, so
+    /// `n` is read and discarded, and on a multi-expiry chain it cannot match at
+    /// all. Only [`StrategySpec::Legs`] resolves `n` against the tape anchor
+    /// (#120), because that is where a per-leg expiry is the point. Passing a
+    /// relative expiry here is therefore a caller error that this type cannot
+    /// reject; use a resolved `DateTime`.
     pub expiration: ExpirationDate,
     /// Implied volatility as a decimal fraction (e.g. `0.20`) — analytic
     /// `Decimal`, validated non-negative at construction.
