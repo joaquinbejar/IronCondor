@@ -7,6 +7,21 @@
 //! upstream strategy behind [`Strategy`]
 //! ([docs/02 §4/§4.1](../../../docs/02-engine-architecture.md#4-the-strategy-trait)).
 //!
+//! # Two ways into the seam
+//!
+//! - [`OptStratAdapter`] wraps a **preconstructed** `optionstratlib` strategy
+//!   and opens the legs `Positionable::get_positions` reports — the path for the
+//!   named kinds ([`StrategySpec::IronCondor`], [`StrategySpec::ShortStrangle`]).
+//! - [`LegSetStrategy`] drives a [`StrategySpec::Legs`] **explicit leg set**,
+//!   whose expiration is per leg, so there is no upstream object to wrap. It
+//!   opens the listed legs at the first snapshot and holds them.
+//!
+//! Both are the same seam: they share the entry quote matching
+//! (`select_leg_quote`), the exit decision (`evaluate_exits`), the terminal
+//! flatten (`close_all`), and the recorded reason (`exit_policy_to_reason`).
+//! The adapter adds exactly one thing — the gated reprice of its wrapped
+//! `inner` — and nothing else differs.
+//!
 //! # The seam contract
 //!
 //! Every [`Strategy`] callback **appends** its intents into a caller-owned
@@ -44,9 +59,9 @@ use optionstratlib::{ExpirationDate, OptionStyle, Side};
 
 use crate::data::convert::{positive_from_price, snapshot_to_option_chain};
 use crate::domain::{
-    ChainSnapshot, ContractKey, IronCondorSpec, OpenPosition, OrderCommand, OrderId, OrderIntent,
-    PendingOrder, PositionAction, PriceCents, Quantity, QuoteView, ShortStrangleSpec, SimTime,
-    StepIndex, StrategySpec, TimeInForce,
+    ChainSnapshot, ContractKey, IronCondorSpec, LegSetSpec, LegSpec, OpenPosition, OrderCommand,
+    OrderId, OrderIntent, PendingOrder, PositionAction, PriceCents, Quantity, QuoteView,
+    ShortStrangleSpec, SimTime, StepIndex, StrategySpec, TimeInForce, Underlying,
 };
 use crate::error::BacktestError;
 
@@ -347,63 +362,6 @@ impl<S: PositionableStrategy> OptStratAdapter<S> {
         Ok(())
     }
 
-    /// Append a `Close` for every open leg **not already fully scheduled for
-    /// close** by an earlier phase this step (the exit policy, or an in-step
-    /// adjustment), flattening a partially-closed leg for its remaining size.
-    ///
-    /// On the terminal step the exit phase and `on_end` append into the **same**
-    /// buffer. A leg the exit policy already closed must not be closed again:
-    /// `apply_step_fills` removes a fully-closed leg from the inventory, and a
-    /// second `Close` of the now-absent leg aborts the run in `reduce_leg` (F11).
-    /// This reconciles against the commands already in `out` so each leg is
-    /// closed exactly once.
-    ///
-    /// It scans the already-appended commands rather than allocating a scratch
-    /// set: `on_end` runs once, at the terminal step (off the warm-step path), so
-    /// the `O(legs × commands)` scan allocates nothing (PB-1).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BacktestError::ArithmeticOverflow`] if the scheduled-quantity sum
-    /// or the remainder overflows, and [`BacktestError::InvalidQuantity`] never
-    /// (the remainder is guarded strictly positive before it becomes a `Quantity`).
-    fn close_all(
-        open: &[OpenPosition],
-        pending: &[PendingOrder],
-        snapshot: &ChainSnapshot,
-        out: &mut Vec<OrderCommand>,
-    ) -> Result<(), BacktestError> {
-        for leg in open {
-            let open_qty = leg.quantity.value();
-            let mut scheduled = scheduled_close_qty(out, leg.position_id)?;
-            // A resting (GTC) close is also scheduled coverage (#110): if it
-            // fills in this final step's refresh it closes the leg itself, and
-            // double-closing here would overshoot in reduce_leg. A pending
-            // remainder that never fills leaves the leg honestly open_at_end.
-            for pend in pending {
-                if let PositionAction::Close(pid) = pend.intent.action
-                    && pid == leg.position_id
-                {
-                    scheduled = scheduled
-                        .checked_add(pend.intent.quantity.value())
-                        .ok_or(BacktestError::ArithmeticOverflow)?;
-                }
-            }
-            if scheduled >= open_qty {
-                // Already fully closed this step — appending another close would
-                // duplicate it and abort the run in reduce_leg.
-                continue;
-            }
-            // `scheduled < open_qty`, so the remainder is strictly positive.
-            let remaining = open_qty
-                .checked_sub(scheduled)
-                .ok_or(BacktestError::ArithmeticOverflow)?;
-            let quantity = Quantity::new(remaining)?;
-            out.push(close_command_qty(snapshot, leg, quantity));
-        }
-        Ok(())
-    }
-
     /// Reprice `inner` from `snapshot` so a Greek-driven exit policy can read
     /// the wrapped strategy's updated state.
     ///
@@ -476,6 +434,12 @@ impl OptStratAdapter<IronCondor> {
                  build it with OptStratAdapter::<ShortStrangle>::from_spec",
                 spec.kind()
             ))),
+            StrategySpec::Legs(_) => Err(BacktestError::Strategy(format!(
+                "OptStratAdapter::<IronCondor>::from_spec received a {} spec; \
+                 an explicit leg set has no upstream strategy object — \
+                 build it with LegSetStrategy::from_spec",
+                spec.kind()
+            ))),
         }
     }
 }
@@ -514,6 +478,12 @@ impl OptStratAdapter<ShortStrangle> {
             StrategySpec::IronCondor(_) => Err(BacktestError::Strategy(format!(
                 "OptStratAdapter::<ShortStrangle>::from_spec received a {} spec; \
                  build it with OptStratAdapter::<IronCondor>::from_spec",
+                spec.kind()
+            ))),
+            StrategySpec::Legs(_) => Err(BacktestError::Strategy(format!(
+                "OptStratAdapter::<ShortStrangle>::from_spec received a {} spec; \
+                 an explicit leg set has no upstream strategy object — \
+                 build it with LegSetStrategy::from_spec",
                 spec.kind()
             ))),
         }
@@ -659,19 +629,6 @@ impl<S: PositionableStrategy> Strategy for OptStratAdapter<S> {
         if ctx.open.is_empty() {
             return Ok(());
         }
-        // `underlying` is the ONLY repricing output the v0.1 exit DECISION
-        // reads: `check_exit_policy` (docs/specs/optionstratlib.md §9) consumes
-        // snapshot-derived scalars only and never reads the wrapped `inner`'s
-        // repriced Greeks. Source it directly from the snapshot scalar through
-        // the SAME derivation `convert.rs` uses for `chain.underlying_price`
-        // (`positive_from_price`), so the value is byte-identical to the old
-        // `snapshot_to_option_chain(ctx.snapshot)?.underlying_price` — without
-        // rebuilding the whole `OptionChain` each step (~44 alloc events/step,
-        // #18/#19) or reaching the upstream `Utc::now()` expiry-check
-        // wall-clock. A conversion failure is a genuine data error and
-        // propagates.
-        let underlying = positive_from_price("underlying", ctx.snapshot.underlying_price)?;
-
         // Reprice `inner` ONLY when the configured policy reads its repriced
         // state. No v0.1 policy does — `policy_reads_inner` is `false` for all
         // of them (`ExitPolicy::DeltaThreshold` is unsupported and never
@@ -688,21 +645,10 @@ impl<S: PositionableStrategy> Strategy for OptStratAdapter<S> {
         if policy_reads_inner(&self.exit) {
             self.reprice_inner(ctx.snapshot)?;
         }
-
-        let step = ctx.step.value() as usize;
-        let snapshot = ctx.snapshot;
-        for leg in ctx.open {
-            let days_left = days_to_expiry(&leg.contract, snapshot.ts)?;
-            let is_long = matches!(leg.side, Side::Long);
-            let initial = leg.entry_premium.to_decimal_dollars();
-            let current = current_premium(snapshot, ctx.marks, leg);
-            if policy_triggered(
-                &self.exit, initial, current, step, days_left, underlying, is_long,
-            ) {
-                out.push(close_command(snapshot, leg));
-            }
-        }
-        Ok(())
+        // The per-leg decision itself is the seam-wide rule, shared verbatim
+        // with [`LegSetStrategy`]: this adapter owns only the `inner` reprice
+        // above, which the policy gate keeps off the v0.1 step path.
+        evaluate_exits(&self.exit, ctx, out)
     }
 
     fn on_snapshot(
@@ -722,12 +668,305 @@ impl<S: PositionableStrategy> Strategy for OptStratAdapter<S> {
         // Closing commands only — the loop rejects a Submit(Open) from on_end.
         // close_all skips legs the exit phase already closed this step (F11)
         // and quantity covered by resting (GTC) closes still working (#110).
-        Self::close_all(ctx.open, ctx.pending, ctx.snapshot, out)
+        close_all(ctx.open, ctx.pending, ctx.snapshot, out)
     }
 
     fn exit_reason(&self) -> ExitReason {
         exit_policy_to_reason(&self.exit)
     }
+}
+
+/// The strategy that drives a [`StrategySpec::Legs`] explicit leg set: open the
+/// listed legs at the first snapshot and hold them, evaluating the configured
+/// [`ExitPolicy`] each step exactly as [`OptStratAdapter`] does.
+///
+/// # Why this is not an [`OptStratAdapter`]
+///
+/// The adapter's entry reads `Positionable::get_positions` on a
+/// **preconstructed** `optionstratlib` strategy. A leg set has no such object —
+/// that is the point of the variant: it describes positions with a **per-leg**
+/// expiration (a diagonal, a calendar, a condor with wings in a further week)
+/// that no named upstream constructor covers. So the `Legs` kind goes through
+/// the same [`Strategy`] seam without the adapter, reusing the seam's shared
+/// pieces verbatim — `select_leg_quote` for entry matching, `evaluate_exits`
+/// for the exit decision, `close_all` for the terminal flatten, and
+/// `exit_policy_to_reason` for the recorded reason.
+///
+/// # Determinism
+///
+/// Entry iterates the spec's legs in the order the spec carries them — the
+/// canonical order after [`StrategySpec::canonical`], which every hash of a spec
+/// and the manifest apply — and matches each leg by exact [`ContractKey`]
+/// identity. No wall clock, no RNG, no map-iteration-order dependence. After
+/// entry, [`Strategy::on_snapshot`] returns immediately, so a warm step
+/// allocates nothing on this seam (PB-1).
+pub struct LegSetStrategy {
+    /// The legs to open, in the spec's (canonical) order.
+    legs: Vec<LegSpec>,
+    /// The underlying every leg shares — the [`ContractKey`] prefix.
+    underlying: Underlying,
+    /// `true` once the opening intents have been emitted (entry is one-shot).
+    entered: bool,
+    /// The exit policy evaluated each step.
+    exit: ExitPolicy,
+}
+
+impl LegSetStrategy {
+    /// Build a leg-set strategy from a [`StrategySpec`] and the [`ExitPolicy`]
+    /// it evaluates each step.
+    ///
+    /// This is the `StrategySpec::Legs → engine` construction path, the
+    /// counterpart of the two `OptStratAdapter::from_spec` constructors: it
+    /// validates the spec's analytic fields and takes the legs in the order the
+    /// spec carries them. It is **kind-checked** — an [`StrategySpec::IronCondor`]
+    /// or [`StrategySpec::ShortStrangle`] returns [`BacktestError::Strategy`]
+    /// pointing at the right constructor, never a silent wrong build — and the
+    /// match stays exhaustive, so a future fourth kind forces this arm to be
+    /// revisited.
+    ///
+    /// # Determinism
+    ///
+    /// A pure function of the spec: no wall clock, no RNG.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BacktestError::Strategy`] when the spec is not a
+    /// [`StrategySpec::Legs`], when its leg set is empty (a position with no
+    /// legs is not a position), or when the dividend yield or any leg's implied
+    /// volatility is negative (the analytic fields are validated here, at the
+    /// construction seam, exactly as the named specs' are).
+    pub fn from_spec(spec: &StrategySpec, exit: ExitPolicy) -> Result<Self, BacktestError> {
+        match spec {
+            StrategySpec::Legs(inner) => Self::new(inner, exit),
+            StrategySpec::IronCondor(_) | StrategySpec::ShortStrangle(_) => {
+                Err(BacktestError::Strategy(format!(
+                    "LegSetStrategy::from_spec received a {} spec; \
+                     build it with OptStratAdapter::from_spec",
+                    spec.kind()
+                )))
+            }
+        }
+    }
+
+    /// Build the strategy from an already-narrowed [`LegSetSpec`] — the
+    /// validation body of [`Self::from_spec`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BacktestError::Strategy`] for an empty leg set or a negative
+    /// dividend yield / per-leg implied volatility.
+    fn new(spec: &LegSetSpec, exit: ExitPolicy) -> Result<Self, BacktestError> {
+        if spec.legs.is_empty() {
+            return Err(BacktestError::Strategy(
+                "a leg set must carry at least one leg".to_string(),
+            ));
+        }
+        // The analytic Decimals are validated here rather than at deserialisation
+        // so a hostile manifest surfaces as a typed error at construction, the
+        // same seam the named specs validate at (`positive_rate`).
+        let _ = positive_rate(spec.dividend_yield, "leg set dividend yield")?;
+        for leg in &spec.legs {
+            let _ = positive_rate(leg.implied_volatility, "leg set implied volatility")?;
+        }
+        Ok(Self {
+            legs: spec.legs.clone(),
+            underlying: spec.underlying.clone(),
+            entered: false,
+            exit,
+        })
+    }
+
+    /// `true` once the opening intents have been emitted (entry is one-shot).
+    #[must_use]
+    pub const fn has_entered(&self) -> bool {
+        self.entered
+    }
+
+    /// Build the opening intents (one `Submit(Open)` per spec leg), matched to
+    /// `snapshot` quotes by the leg's **full contract identity** (underlying,
+    /// expiration, strike, style) through the same `select_leg_quote` the
+    /// adapter uses — so a multi-expiry snapshot resolves each leg by its OWN
+    /// expiration, never whichever expiry sorts first in the map. Guarded by
+    /// `entered`, so it is a no-op after the first successful entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BacktestError::Execution`] when a leg has no matching snapshot
+    /// quote.
+    fn open_entries(
+        &mut self,
+        snapshot: &ChainSnapshot,
+        out: &mut Vec<OrderCommand>,
+    ) -> Result<(), BacktestError> {
+        if self.entered {
+            return Ok(());
+        }
+        // The underlying is checked once: a leg set is quoted by ONE chain, so a
+        // spec written against another underlying is a configuration error, not
+        // a per-leg "no quote" mismatch.
+        if snapshot.underlying != self.underlying {
+            return Err(BacktestError::Execution(format!(
+                "leg set underlying {} is not the snapshot underlying {}",
+                self.underlying.as_str(),
+                snapshot.underlying.as_str()
+            )));
+        }
+        for leg in &self.legs {
+            let quote = select_leg_quote(snapshot, leg.strike, leg.style, leg.expiration)?;
+            out.push(OrderCommand::Submit(OrderIntent {
+                contract: quote.contract.clone(),
+                action: PositionAction::Open,
+                side: leg.side,
+                quantity: leg.quantity,
+                limit: None,
+                tif: TimeInForce::Ioc,
+                decision_mid: quote.mid,
+            }));
+        }
+        self.entered = true;
+        Ok(())
+    }
+}
+
+impl Strategy for LegSetStrategy {
+    fn on_start(
+        &mut self,
+        ctx: &mut ChainContext,
+        out: &mut Vec<OrderCommand>,
+    ) -> Result<(), BacktestError> {
+        self.open_entries(ctx.snapshot, out)
+    }
+
+    fn exits(
+        &mut self,
+        ctx: &ChainContext,
+        out: &mut Vec<OrderCommand>,
+    ) -> Result<(), BacktestError> {
+        if ctx.open.is_empty() {
+            return Ok(());
+        }
+        // No `inner` to reprice — a leg set has no upstream strategy object — so
+        // this is the shared per-leg decision and nothing else.
+        evaluate_exits(&self.exit, ctx, out)
+    }
+
+    fn on_snapshot(
+        &mut self,
+        ctx: &mut ChainContext,
+        out: &mut Vec<OrderCommand>,
+    ) -> Result<(), BacktestError> {
+        self.open_entries(ctx.snapshot, out)
+    }
+
+    fn on_end(
+        &mut self,
+        ctx: &mut ChainContext,
+        out: &mut Vec<OrderCommand>,
+    ) -> Result<(), BacktestError> {
+        close_all(ctx.open, ctx.pending, ctx.snapshot, out)
+    }
+
+    fn exit_reason(&self) -> ExitReason {
+        exit_policy_to_reason(&self.exit)
+    }
+}
+
+/// Evaluate the configured [`ExitPolicy`] over the open inventory and append a
+/// **closing** command for every triggered leg — the seam's single exit
+/// decision, shared by [`OptStratAdapter`] and [`LegSetStrategy`].
+///
+/// `underlying` is the ONLY repricing output the v0.1 exit DECISION reads:
+/// `check_exit_policy` (docs/specs/optionstratlib.md §9) consumes
+/// snapshot-derived scalars only and never reads a wrapped strategy's repriced
+/// Greeks. It is sourced directly from the snapshot scalar through the SAME
+/// derivation `convert.rs` uses for `chain.underlying_price`
+/// ([`positive_from_price`]), so the value is byte-identical to the old
+/// `snapshot_to_option_chain(ctx.snapshot)?.underlying_price` — without
+/// rebuilding the whole `OptionChain` each step (~44 alloc events/step, #18/#19)
+/// or reaching the upstream `Utc::now()` expiry-check wall-clock. A conversion
+/// failure is a genuine data error and propagates.
+///
+/// # Errors
+///
+/// Returns [`BacktestError::Conversion`] if the snapshot's underlying price is
+/// not a valid `Positive`, or if a leg's expiry is unresolved, and
+/// [`BacktestError::ArithmeticOverflow`] if the days-to-expiry scaling overflows.
+fn evaluate_exits(
+    exit: &ExitPolicy,
+    ctx: &ChainContext,
+    out: &mut Vec<OrderCommand>,
+) -> Result<(), BacktestError> {
+    let underlying = positive_from_price("underlying", ctx.snapshot.underlying_price)?;
+    let step = ctx.step.value() as usize;
+    let snapshot = ctx.snapshot;
+    for leg in ctx.open {
+        let days_left = days_to_expiry(&leg.contract, snapshot.ts)?;
+        let is_long = matches!(leg.side, Side::Long);
+        let initial = leg.entry_premium.to_decimal_dollars();
+        let current = current_premium(snapshot, ctx.marks, leg);
+        if policy_triggered(exit, initial, current, step, days_left, underlying, is_long) {
+            out.push(close_command(snapshot, leg));
+        }
+    }
+    Ok(())
+}
+
+/// Append a `Close` for every open leg **not already fully scheduled for close**
+/// by an earlier phase this step (the exit policy, or an in-step adjustment),
+/// flattening a partially-closed leg for its remaining size — the seam's single
+/// terminal flatten, shared by [`OptStratAdapter`] and [`LegSetStrategy`].
+///
+/// On the terminal step the exit phase and `on_end` append into the **same**
+/// buffer. A leg the exit policy already closed must not be closed again:
+/// `apply_step_fills` removes a fully-closed leg from the inventory, and a
+/// second `Close` of the now-absent leg aborts the run in `reduce_leg` (F11).
+/// This reconciles against the commands already in `out` so each leg is closed
+/// exactly once.
+///
+/// It scans the already-appended commands rather than allocating a scratch set:
+/// `on_end` runs once, at the terminal step (off the warm-step path), so the
+/// `O(legs × commands)` scan allocates nothing (PB-1).
+///
+/// # Errors
+///
+/// Returns [`BacktestError::ArithmeticOverflow`] if the scheduled-quantity sum
+/// or the remainder overflows, and [`BacktestError::InvalidQuantity`] never (the
+/// remainder is guarded strictly positive before it becomes a `Quantity`).
+fn close_all(
+    open: &[OpenPosition],
+    pending: &[PendingOrder],
+    snapshot: &ChainSnapshot,
+    out: &mut Vec<OrderCommand>,
+) -> Result<(), BacktestError> {
+    for leg in open {
+        let open_qty = leg.quantity.value();
+        let mut scheduled = scheduled_close_qty(out, leg.position_id)?;
+        // A resting (GTC) close is also scheduled coverage (#110): if it fills
+        // in this final step's refresh it closes the leg itself, and
+        // double-closing here would overshoot in reduce_leg. A pending remainder
+        // that never fills leaves the leg honestly open_at_end.
+        for pend in pending {
+            if let PositionAction::Close(pid) = pend.intent.action
+                && pid == leg.position_id
+            {
+                scheduled = scheduled
+                    .checked_add(pend.intent.quantity.value())
+                    .ok_or(BacktestError::ArithmeticOverflow)?;
+            }
+        }
+        if scheduled >= open_qty {
+            // Already fully closed this step — appending another close would
+            // duplicate it and abort the run in reduce_leg.
+            continue;
+        }
+        // `scheduled < open_qty`, so the remainder is strictly positive.
+        let remaining = open_qty
+            .checked_sub(scheduled)
+            .ok_or(BacktestError::ArithmeticOverflow)?;
+        let quantity = Quantity::new(remaining)?;
+        out.push(close_command_qty(snapshot, leg, quantity));
+    }
+    Ok(())
 }
 
 /// Map an applied [`ExitPolicy`] to the [`ExitReason`] recorded on a
@@ -1043,13 +1282,14 @@ mod tests {
     use optionstratlib::{ExpirationDate, OptionStyle, Side};
 
     use super::{
-        ChainContext, OptStratAdapter, PositionableStrategy, Strategy, policy_reads_inner,
-        policy_triggered,
+        ChainContext, LegSetStrategy, OptStratAdapter, PositionableStrategy, Strategy,
+        policy_reads_inner, policy_triggered,
     };
     use crate::domain::{
-        ChainSnapshot, ContractKey, InstrumentSpec, IronCondorSpec, OpenPosition, OrderCommand,
-        OrderId, OrderIntent, PendingOrder, PositionAction, PositionId, PriceCents, Quantity,
-        QuoteView, ShortStrangleSpec, SimTime, StepIndex, StrategySpec, Underlying,
+        ChainSnapshot, ContractKey, InstrumentSpec, IronCondorSpec, LegSetSpec, LegSpec,
+        OpenPosition, OrderCommand, OrderId, OrderIntent, PendingOrder, PositionAction, PositionId,
+        PriceCents, Quantity, QuoteView, ShortStrangleSpec, SimTime, StepIndex, StrategySpec,
+        Underlying,
     };
     use crate::error::BacktestError;
 
@@ -2297,8 +2537,7 @@ mod tests {
             },
         }];
         let mut out: Vec<OrderCommand> = Vec::new();
-        let result =
-            OptStratAdapter::<IronCondor>::close_all(&legs, &pending, &snapshot(9), &mut out);
+        let result = super::close_all(&legs, &pending, &snapshot(9), &mut out);
         assert!(matches!(result, Ok(())));
         // Leg 1 is fully covered by the pending close ⇒ skipped; the other
         // three legs are flattened.
@@ -2312,5 +2551,325 @@ mod tests {
             };
             assert_ne!(pid, first.position_id, "leg 1 must not be re-closed");
         }
+    }
+
+    // --- LegSetStrategy (the explicit leg set, #117) ------------------------
+
+    /// The far expiry the leg-set fixtures put their wings in — 7 days beyond
+    /// the near [`EXP_NS`], so the fixture set spans TWO expirations.
+    const FAR_EXP_NS: i64 = EXP_NS + 7 * super::NANOS_PER_DAY as i64;
+
+    fn leg(strike: u64, style: OptionStyle, side: Side, exp_ns: i64) -> LegSpec {
+        LegSpec {
+            side,
+            style,
+            strike: PriceCents::new(strike),
+            expiration: ExpirationDate::DateTime(DateTime::from_timestamp_nanos(exp_ns)),
+            quantity: qty(1),
+            implied_volatility: dec!(0.20),
+        }
+    }
+
+    /// A four-leg set the named specs cannot express: the two body legs at the
+    /// near expiry, the two wings a week later.
+    fn leg_set_legs() -> Vec<LegSpec> {
+        vec![
+            leg(510_000, OptionStyle::Call, Side::Short, EXP_NS),
+            leg(490_000, OptionStyle::Put, Side::Short, EXP_NS),
+            leg(520_000, OptionStyle::Call, Side::Long, FAR_EXP_NS),
+            leg(480_000, OptionStyle::Put, Side::Long, FAR_EXP_NS),
+        ]
+    }
+
+    fn leg_set_spec_from(legs: Vec<LegSpec>) -> StrategySpec {
+        StrategySpec::Legs(LegSetSpec {
+            underlying: und(),
+            underlying_price: PriceCents::new(500_000),
+            legs,
+            risk_free_rate: dec!(0.05),
+            dividend_yield: Decimal::ZERO,
+        })
+    }
+
+    fn leg_set_spec() -> StrategySpec {
+        leg_set_spec_from(leg_set_legs())
+    }
+
+    /// A snapshot quoting every condor strike/style at BOTH expirations, so a
+    /// leg is only resolvable by its full contract identity.
+    fn multi_expiry_snapshot(step: u32) -> ChainSnapshot {
+        let mut quotes = BTreeMap::new();
+        for (strike, style, mid) in [
+            (490_000u64, OptionStyle::Put, 1_800u64),
+            (480_000, OptionStyle::Put, 700),
+            (510_000, OptionStyle::Call, 2_000),
+            (520_000, OptionStyle::Call, 800),
+        ] {
+            for exp_ns in [EXP_NS, FAR_EXP_NS] {
+                let q = quote_at(strike, style, mid, exp_ns);
+                quotes.insert(q.contract.clone(), q);
+            }
+        }
+        let Ok(spec) = InstrumentSpec::new(PriceCents::new(5), 100) else {
+            panic!("valid instrument spec");
+        };
+        ChainSnapshot {
+            ts: SimTime::new(TS_NS),
+            step: StepIndex::new(step),
+            underlying: und(),
+            underlying_price: PriceCents::new(500_000),
+            spec,
+            quotes,
+        }
+    }
+
+    #[test]
+    fn test_leg_set_from_spec_opens_every_leg_at_its_own_expiration() {
+        let mut rng = ChaCha8Rng::seed_from_u64(117);
+        let snap = multi_expiry_snapshot(0);
+        let mut ctx = ChainContext {
+            snapshot: &snap,
+            open: &[],
+            pending: &[],
+            marks: &NO_MARKS,
+            rng: &mut rng,
+            step: StepIndex::new(0),
+        };
+        let Ok(mut strategy) = LegSetStrategy::from_spec(&leg_set_spec(), ExitPolicy::Expiration)
+        else {
+            panic!("the leg set strategy must build from its spec");
+        };
+        let mut out = Vec::new();
+        assert!(matches!(strategy.on_start(&mut ctx, &mut out), Ok(())));
+        assert_eq!(out.len(), 4, "one open per spec leg");
+        assert!(strategy.has_entered());
+
+        // Every leg lands on its OWN expiration — the two body legs near, the
+        // two wings far — never whichever expiry sorts first in the map.
+        let mut opened: Vec<(i64, u64, Side)> = Vec::new();
+        for cmd in &out {
+            let OrderCommand::Submit(intent) = cmd else {
+                panic!("entry emits Submit intents");
+            };
+            assert!(matches!(intent.action, PositionAction::Open));
+            let Ok(exp_ns) = intent.contract.expiration_ns() else {
+                panic!("the fixture legs carry resolved expiries");
+            };
+            opened.push((exp_ns, intent.contract.strike.value(), intent.side));
+        }
+        opened.sort_unstable_by_key(|(exp, strike, _)| (*exp, *strike));
+        assert_eq!(
+            opened,
+            vec![
+                (EXP_NS, 490_000, Side::Short),
+                (EXP_NS, 510_000, Side::Short),
+                (FAR_EXP_NS, 480_000, Side::Long),
+                (FAR_EXP_NS, 520_000, Side::Long),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_leg_set_entry_is_one_shot_across_steps() {
+        let mut rng = ChaCha8Rng::seed_from_u64(118);
+        let snap = multi_expiry_snapshot(0);
+        let Ok(mut strategy) = LegSetStrategy::from_spec(&leg_set_spec(), ExitPolicy::Expiration)
+        else {
+            panic!("the leg set strategy must build from its spec");
+        };
+        let mut out = Vec::new();
+        {
+            let mut ctx = ChainContext {
+                snapshot: &snap,
+                open: &[],
+                pending: &[],
+                marks: &NO_MARKS,
+                rng: &mut rng,
+                step: StepIndex::new(0),
+            };
+            assert!(matches!(strategy.on_start(&mut ctx, &mut out), Ok(())));
+        }
+        out.clear();
+        let later = multi_expiry_snapshot(1);
+        let mut ctx = ChainContext {
+            snapshot: &later,
+            open: &[],
+            pending: &[],
+            marks: &NO_MARKS,
+            rng: &mut rng,
+            step: StepIndex::new(1),
+        };
+        assert!(matches!(strategy.on_snapshot(&mut ctx, &mut out), Ok(())));
+        assert!(out.is_empty(), "entry is guarded after the first snapshot");
+    }
+
+    #[test]
+    fn test_leg_set_unquoted_leg_is_a_typed_execution_error() {
+        let mut rng = ChaCha8Rng::seed_from_u64(119);
+        // The single-expiry snapshot quotes nothing at 500000.
+        let snap = snapshot(0);
+        let mut ctx = ChainContext {
+            snapshot: &snap,
+            open: &[],
+            pending: &[],
+            marks: &NO_MARKS,
+            rng: &mut rng,
+            step: StepIndex::new(0),
+        };
+        let spec = leg_set_spec_from(vec![leg(500_000, OptionStyle::Call, Side::Short, EXP_NS)]);
+        let Ok(mut strategy) = LegSetStrategy::from_spec(&spec, ExitPolicy::Expiration) else {
+            panic!("the leg set strategy must build from its spec");
+        };
+        let mut out = Vec::new();
+        assert!(matches!(
+            strategy.on_start(&mut ctx, &mut out),
+            Err(BacktestError::Execution(_))
+        ));
+    }
+
+    #[test]
+    fn test_leg_set_foreign_underlying_is_a_typed_execution_error() {
+        let mut rng = ChaCha8Rng::seed_from_u64(120);
+        let snap = snapshot(0);
+        let mut ctx = ChainContext {
+            snapshot: &snap,
+            open: &[],
+            pending: &[],
+            marks: &NO_MARKS,
+            rng: &mut rng,
+            step: StepIndex::new(0),
+        };
+        let Ok(other) = Underlying::new("NDX") else {
+            panic!("NDX is a valid underlying");
+        };
+        let StrategySpec::Legs(mut inner) = leg_set_spec() else {
+            panic!("the fixture is a leg set");
+        };
+        inner.underlying = other;
+        let Ok(mut strategy) =
+            LegSetStrategy::from_spec(&StrategySpec::Legs(inner), ExitPolicy::Expiration)
+        else {
+            panic!("the leg set strategy must build from its spec");
+        };
+        let mut out = Vec::new();
+        assert!(matches!(
+            strategy.on_start(&mut ctx, &mut out),
+            Err(BacktestError::Execution(_))
+        ));
+    }
+
+    #[test]
+    fn test_leg_set_from_spec_rejects_an_empty_leg_set() {
+        let spec = leg_set_spec_from(Vec::new());
+        assert!(matches!(
+            LegSetStrategy::from_spec(&spec, ExitPolicy::Expiration),
+            Err(BacktestError::Strategy(_))
+        ));
+    }
+
+    #[test]
+    fn test_leg_set_from_spec_rejects_a_negative_implied_volatility() {
+        let mut legs = leg_set_legs();
+        let Some(first) = legs.first_mut() else {
+            panic!("the fixture carries legs");
+        };
+        first.implied_volatility = dec!(-0.20);
+        assert!(matches!(
+            LegSetStrategy::from_spec(&leg_set_spec_from(legs), ExitPolicy::Expiration),
+            Err(BacktestError::Strategy(_))
+        ));
+    }
+
+    #[test]
+    fn test_leg_set_from_spec_rejects_a_negative_dividend_yield() {
+        let StrategySpec::Legs(mut inner) = leg_set_spec() else {
+            panic!("the fixture is a leg set");
+        };
+        inner.dividend_yield = dec!(-0.01);
+        assert!(matches!(
+            LegSetStrategy::from_spec(&StrategySpec::Legs(inner), ExitPolicy::Expiration),
+            Err(BacktestError::Strategy(_))
+        ));
+    }
+
+    #[test]
+    fn test_leg_set_from_spec_rejects_a_named_kind() {
+        // Kind-checked, exactly as the two adapter constructors are: a named
+        // spec points the caller at OptStratAdapter rather than building wrong.
+        assert!(matches!(
+            LegSetStrategy::from_spec(&iron_condor_spec(), ExitPolicy::Expiration),
+            Err(BacktestError::Strategy(_))
+        ));
+        assert!(matches!(
+            LegSetStrategy::from_spec(&short_strangle_spec(), ExitPolicy::Expiration),
+            Err(BacktestError::Strategy(_))
+        ));
+    }
+
+    #[test]
+    fn test_adapter_from_spec_rejects_a_leg_set_kind() {
+        // The mirror of the above: neither adapter can build a leg set (there
+        // is no upstream strategy object for one).
+        assert!(matches!(
+            OptStratAdapter::<IronCondor>::from_spec(&leg_set_spec(), ExitPolicy::Expiration),
+            Err(BacktestError::Strategy(_))
+        ));
+        assert!(matches!(
+            OptStratAdapter::<ShortStrangle>::from_spec(&leg_set_spec(), ExitPolicy::Expiration),
+            Err(BacktestError::Strategy(_))
+        ));
+    }
+
+    #[test]
+    fn test_leg_set_exits_emits_closes_when_the_policy_triggers() {
+        let mut rng = ChaCha8Rng::seed_from_u64(121);
+        let snap = snapshot(7);
+        let legs = open_legs();
+        let ctx = ChainContext {
+            snapshot: &snap,
+            open: &legs,
+            pending: &[],
+            marks: &NO_MARKS,
+            rng: &mut rng,
+            step: StepIndex::new(7),
+        };
+        // The SAME shared exit decision the adapter runs: a step-count hold that
+        // has elapsed closes every open leg.
+        let Ok(mut strategy) = LegSetStrategy::from_spec(&leg_set_spec(), ExitPolicy::TimeSteps(1))
+        else {
+            panic!("the leg set strategy must build from its spec");
+        };
+        let mut out = Vec::new();
+        assert!(matches!(strategy.exits(&ctx, &mut out), Ok(())));
+        assert_eq!(out.len(), legs.len(), "every open leg is closed");
+        for cmd in &out {
+            let OrderCommand::Submit(intent) = cmd else {
+                panic!("exits emits Submit intents");
+            };
+            assert!(matches!(intent.action, PositionAction::Close(_)));
+        }
+    }
+
+    #[test]
+    fn test_leg_set_on_end_flattens_the_open_inventory() {
+        let mut rng = ChaCha8Rng::seed_from_u64(122);
+        let snap = snapshot(9);
+        let legs = open_legs();
+        let mut ctx = ChainContext {
+            snapshot: &snap,
+            open: &legs,
+            pending: &[],
+            marks: &NO_MARKS,
+            rng: &mut rng,
+            step: StepIndex::new(9),
+        };
+        let Ok(mut strategy) =
+            LegSetStrategy::from_spec(&leg_set_spec(), ExitPolicy::TimeSteps(1_000_000))
+        else {
+            panic!("the leg set strategy must build from its spec");
+        };
+        let mut out = Vec::new();
+        assert!(matches!(strategy.on_end(&mut ctx, &mut out), Ok(())));
+        assert_eq!(out.len(), legs.len(), "on_end closes every open leg");
     }
 }
