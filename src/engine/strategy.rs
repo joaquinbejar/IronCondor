@@ -694,14 +694,20 @@ impl<S: PositionableStrategy> Strategy for OptStratAdapter<S> {
 ///
 /// # Determinism
 ///
-/// Entry iterates the spec's legs in the order the spec carries them — the
-/// canonical order after [`StrategySpec::canonical`], which every hash of a spec
-/// and the manifest apply — and matches each leg by exact [`ContractKey`]
-/// identity. No wall clock, no RNG, no map-iteration-order dependence. After
-/// entry, [`Strategy::on_snapshot`] returns immediately, so a warm step
-/// allocates nothing on this seam (PB-1).
+/// Entry iterates the legs in **canonical** order — [`Self::new`] sorts them by
+/// [`LegSpec::canonical_cmp`], the same order [`StrategySpec::canonical`] gives
+/// the `run_id` hash and the manifest — and matches each leg by exact
+/// [`ContractKey`] identity. That is what makes one `run_id` name one byte-set:
+/// the engine mints `order_id` / `position_id` / `trade_id` in submission order,
+/// so running the caller's arbitrary leg order would put a permuted
+/// `fills`/`positions` table under an identical `run_id` and manifest. No wall
+/// clock, no RNG, no map-iteration-order dependence. After entry,
+/// [`Strategy::on_snapshot`] returns immediately, so a warm step allocates
+/// nothing on this seam (PB-1).
 pub struct LegSetStrategy {
-    /// The legs to open, in the spec's (canonical) order.
+    /// The legs to open, in **canonical** order — sorted by
+    /// [`LegSpec::canonical_cmp`] at construction, never taken on trust from the
+    /// caller's spec (see [`Self::new`]).
     legs: Vec<LegSpec>,
     /// The underlying every leg shares — the [`ContractKey`] prefix.
     underlying: Underlying,
@@ -768,8 +774,20 @@ impl LegSetStrategy {
         for leg in &spec.legs {
             let _ = positive_rate(leg.implied_volatility, "leg set implied volatility")?;
         }
+        // Canonicalise HERE, at the one place every entry path funnels through
+        // (`run_spec_with_feed`, and a caller building the strategy directly).
+        // The `run_id` and the manifest already record the canonical spec, so
+        // the ORDER THE ENGINE RUNS must be that same order: entry emits one
+        // `Submit` per leg in this vector's order, and the engine mints
+        // `order_id` / `position_id` / `trade_id` from monotonic counters in
+        // submission order. Storing the caller's order instead would let one
+        // `run_id` name two different `fills`/`positions` byte-sets — and under
+        // realistic fills the arrival order reaches the book, so the divergence
+        // would not even be confined to labels.
+        let mut legs = spec.legs.clone();
+        legs.sort_by(LegSpec::canonical_cmp);
         Ok(Self {
-            legs: spec.legs.clone(),
+            legs,
             underlying: spec.underlying.clone(),
             entered: false,
             exit,
@@ -782,17 +800,18 @@ impl LegSetStrategy {
         self.entered
     }
 
-    /// Build the opening intents (one `Submit(Open)` per spec leg), matched to
-    /// `snapshot` quotes by the leg's **full contract identity** (underlying,
-    /// expiration, strike, style) through the same `select_leg_quote` the
-    /// adapter uses — so a multi-expiry snapshot resolves each leg by its OWN
-    /// expiration, never whichever expiry sorts first in the map. Guarded by
+    /// Build the opening intents (one `Submit(Open)` per leg, in the canonical
+    /// order [`Self::new`] stored), matched to `snapshot` quotes by the leg's
+    /// **full contract identity** (underlying, expiration, strike, style) —
+    /// see [`select_leg_set_quote`] for why a leg set demands the exact expiry
+    /// rather than the adapter's single-candidate fallback. Guarded by
     /// `entered`, so it is a no-op after the first successful entry.
     ///
     /// # Errors
     ///
-    /// Returns [`BacktestError::Execution`] when a leg has no matching snapshot
-    /// quote.
+    /// Returns [`BacktestError::Execution`] when the spec's underlying is not
+    /// the snapshot's, or when a leg has no matching snapshot quote at its own
+    /// expiration.
     fn open_entries(
         &mut self,
         snapshot: &ChainSnapshot,
@@ -812,7 +831,7 @@ impl LegSetStrategy {
             )));
         }
         for leg in &self.legs {
-            let quote = select_leg_quote(snapshot, leg.strike, leg.style, leg.expiration)?;
+            let quote = select_leg_set_quote(snapshot, leg)?;
             out.push(OrderCommand::Submit(OrderIntent {
                 contract: quote.contract.clone(),
                 action: PositionAction::Open,
@@ -1065,6 +1084,53 @@ fn select_leg_quote(
             "no snapshot quote for leg strike {} style {style:?} at expiration \
              {expiration:?} in a multi-expiry snapshot",
             strike.value()
+        ))
+    })
+}
+
+/// Select the snapshot quote for one [`LegSpec`] of an explicit leg set.
+///
+/// A leg set exists to express a **per-leg** expiration, so a leg that names a
+/// resolved (`DateTime`) expiry is matched on its exact [`ContractKey`] identity
+/// and nothing else: if the chain does not quote that contract, that is a typed
+/// error, **not** a licence to fill on whatever else happens to sit at the same
+/// strike and style. This is the one place a leg set deliberately diverges from
+/// [`select_leg_quote`], whose single-candidate fallback exists for the named
+/// specs — there a mismatch cannot arise, because every leg shares the one
+/// strategy-level expiration the tape was chosen for. Here it can: a
+/// mis-specified calendar leg would otherwise open silently against the wrong
+/// week and the bundle would record a contract the spec never asked for.
+///
+/// An **unresolved** `Days(n)` leg keeps the fallback, because the strategy has
+/// no anchor to resolve it against (resolution happens once at tape
+/// materialisation, [01 §5.1](../../../docs/01-domain-model.md#51-expiration-resolves-to-one-absolute-instant));
+/// matching it exactly against a resolved chain would reject every such spec.
+///
+/// # Errors
+///
+/// Returns [`BacktestError::Execution`] when no snapshot quote carries the leg's
+/// exact identity (resolved leg), or when no quote matches its strike/style at
+/// all (unresolved leg).
+fn select_leg_set_quote<'a>(
+    snapshot: &'a ChainSnapshot,
+    leg: &LegSpec,
+) -> Result<&'a QuoteView, BacktestError> {
+    if matches!(leg.expiration, ExpirationDate::Days(_)) {
+        return select_leg_quote(snapshot, leg.strike, leg.style, leg.expiration);
+    }
+    let contract = ContractKey {
+        underlying: snapshot.underlying.clone(),
+        expiration: leg.expiration,
+        strike: leg.strike,
+        style: leg.style,
+    };
+    snapshot.quotes.get(&contract).ok_or_else(|| {
+        BacktestError::Execution(format!(
+            "no snapshot quote for leg set leg strike {} style {:?} at expiration \
+             {:?}; a leg set matches its own expiration exactly",
+            leg.strike.value(),
+            leg.style,
+            leg.expiration
         ))
     })
 }
@@ -2871,5 +2937,120 @@ mod tests {
         let mut out = Vec::new();
         assert!(matches!(strategy.on_end(&mut ctx, &mut out), Ok(())));
         assert_eq!(out.len(), legs.len(), "on_end closes every open leg");
+    }
+
+    #[test]
+    fn test_leg_set_wrong_expiration_is_an_error_not_a_silent_fill() {
+        // A leg set exists to name a per-leg expiry, so a leg at FAR_EXP_NS
+        // against a chain that quotes only EXP_NS at that strike/style must be a
+        // typed error. The adapter's single-candidate fallback would have filled
+        // it silently on the wrong week, and the bundle would then record a
+        // contract the spec never asked for.
+        let mut rng = ChaCha8Rng::seed_from_u64(123);
+        let snap = snapshot(0); // single-expiry chain, all legs at EXP_NS
+        let mut ctx = ChainContext {
+            snapshot: &snap,
+            open: &[],
+            pending: &[],
+            marks: &NO_MARKS,
+            rng: &mut rng,
+            step: StepIndex::new(0),
+        };
+        let spec = leg_set_spec_from(vec![leg(
+            510_000,
+            OptionStyle::Call,
+            Side::Short,
+            FAR_EXP_NS,
+        )]);
+        let Ok(mut strategy) = LegSetStrategy::from_spec(&spec, ExitPolicy::Expiration) else {
+            panic!("the leg set strategy must build from its spec");
+        };
+        let mut out = Vec::new();
+        assert!(matches!(
+            strategy.on_start(&mut ctx, &mut out),
+            Err(BacktestError::Execution(_))
+        ));
+        assert!(out.is_empty(), "no leg opens on the wrong expiration");
+    }
+
+    #[test]
+    fn test_leg_set_unresolved_days_expiration_keeps_the_single_candidate_match() {
+        // An unresolved `Days(n)` leg has no anchor to resolve against inside the
+        // strategy, so it keeps the single-candidate fallback — matching it
+        // exactly against a resolved chain would reject every such spec.
+        let mut rng = ChaCha8Rng::seed_from_u64(124);
+        let snap = snapshot(0);
+        let mut ctx = ChainContext {
+            snapshot: &snap,
+            open: &[],
+            pending: &[],
+            marks: &NO_MARKS,
+            rng: &mut rng,
+            step: StepIndex::new(0),
+        };
+        let mut relative = leg(510_000, OptionStyle::Call, Side::Short, EXP_NS);
+        relative.expiration = ExpirationDate::Days(pos(dec!(30)));
+        let spec = leg_set_spec_from(vec![relative]);
+        let Ok(mut strategy) = LegSetStrategy::from_spec(&spec, ExitPolicy::Expiration) else {
+            panic!("the leg set strategy must build from its spec");
+        };
+        let mut out = Vec::new();
+        assert!(matches!(strategy.on_start(&mut ctx, &mut out), Ok(())));
+        assert_eq!(out.len(), 1, "the relative leg opens on the sole candidate");
+    }
+
+    #[test]
+    fn test_leg_set_runs_the_canonical_order_not_the_input_order() {
+        // The `run_id` and the manifest record the canonical spec, so the ORDER
+        // THE ENGINE RUNS must be that same order: the engine mints order and
+        // position ids in submission order, so running the caller's order would
+        // put a permuted fills/positions table under an identical run_id.
+        let mut rng = ChaCha8Rng::seed_from_u64(125);
+        let snap = multi_expiry_snapshot(0);
+        let emitted = |spec: &StrategySpec, rng: &mut ChaCha8Rng| -> Vec<(i64, u64)> {
+            let mut ctx = ChainContext {
+                snapshot: &snap,
+                open: &[],
+                pending: &[],
+                marks: &NO_MARKS,
+                rng,
+                step: StepIndex::new(0),
+            };
+            let Ok(mut strategy) = LegSetStrategy::from_spec(spec, ExitPolicy::Expiration) else {
+                panic!("the leg set strategy must build from its spec");
+            };
+            let mut out = Vec::new();
+            assert!(matches!(strategy.on_start(&mut ctx, &mut out), Ok(())));
+            out.iter()
+                .map(|cmd| {
+                    let OrderCommand::Submit(intent) = cmd else {
+                        panic!("entry emits Submit intents");
+                    };
+                    let Ok(exp) = intent.contract.expiration_ns() else {
+                        panic!("the fixture legs carry resolved expiries");
+                    };
+                    (exp, intent.contract.strike.value())
+                })
+                .collect()
+        };
+
+        let mut reversed = leg_set_legs();
+        reversed.reverse();
+        let canonical = emitted(&leg_set_spec(), &mut rng);
+        let permuted = emitted(&leg_set_spec_from(reversed), &mut rng);
+        assert_eq!(
+            canonical, permuted,
+            "both leg orders must submit in the same (canonical) order"
+        );
+        assert_eq!(
+            canonical,
+            vec![
+                (EXP_NS, 490_000),
+                (EXP_NS, 510_000),
+                (FAR_EXP_NS, 480_000),
+                (FAR_EXP_NS, 520_000),
+            ],
+            "submission follows the canonical (expiration, strike, ...) order"
+        );
     }
 }

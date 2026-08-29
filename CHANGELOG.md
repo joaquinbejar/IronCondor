@@ -27,9 +27,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `write_bundle`, and the batch `batch_id` fold).
 - **`LegSetStrategy` — the second entry into the engine's strategy seam
   (#117).** A leg set has no upstream strategy object for `OptStratAdapter` to
-  wrap, so this strategy opens the listed legs at the first snapshot (matched by
-  full `ContractKey` identity, so a multi-expiry snapshot resolves each leg by
-  its own expiration) and holds them. Exit evaluation, the terminal flatten and
+  wrap, so this strategy opens the legs at the first snapshot and holds them. It
+  opens them in **canonical order**, which it sorts itself rather than trusting
+  the caller's spec: `order_id` / `position_id` / `trade_id` are minted in
+  submission order, so running the caller's order would put a permuted
+  `fills`/`positions` table under an identical `run_id` and manifest. Each leg is
+  matched on its full `ContractKey` identity, and for a resolved expiry the match
+  is **exact** — a mis-specified calendar leg is a typed error, not a silent fill
+  against whatever else sits at that strike and style (the named specs, whose
+  legs share one expiration by construction, keep the single-candidate fallback,
+  as does an unresolved `Days(n)` leg). Exit evaluation, the terminal flatten and
   the recorded `ExitReason` are the seam's shared implementations, called
   verbatim by both strategies — the adapter now adds only its gated `inner`
   reprice.

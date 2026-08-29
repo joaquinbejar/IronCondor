@@ -19,9 +19,13 @@
 //! hash to a different `run_id`. [`StrategySpec::canonical`] fixes one total
 //! order — `(expiration, strike, style, side, quantity, implied_volatility)` —
 //! and every hash of a spec (`run_id`, `batch_id`) and the manifest record
-//! itself go through it, so leg order is never observable. The expiration
-//! comparison is the crate's single rule, shared with [`crate::domain::ContractKey`]'s
-//! `Ord` (`Days` before `DateTime`, exact values within a variant).
+//! itself go through it. So does the **engine**: `LegSetStrategy` sorts the legs
+//! it opens by the same rule, because ids are minted in submission order — were
+//! the engine to run the caller's order instead, one `run_id` would name two
+//! different `fills`/`positions` byte-sets. Between them, leg order is not
+//! observable anywhere. The expiration comparison is the crate's single rule,
+//! shared with [`crate::domain::ContractKey`]'s `Ord` (`Days` before
+//! `DateTime`, exact values within a variant).
 //!
 //! # Placement (domain, not engine)
 //!
@@ -89,7 +93,9 @@ impl StrategySpec {
     /// fields in declaration order, so they are already canonical. For
     /// [`Self::Legs`] the legs are sorted by [`LegSpec::canonical_cmp`], so two
     /// identical positions written in a different leg order produce the same
-    /// bytes — and therefore the same `run_id`
+    /// bytes — and therefore the same `run_id`. The engine applies the same
+    /// ordering to the legs it opens (`LegSetStrategy`), so the run the id names
+    /// is the run that executes
     /// ([01 §10](../../../docs/01-domain-model.md#10-run-identity-and-manifest)).
     /// Idempotent: `s.canonical().canonical() == s.canonical()`.
     #[must_use = "the canonical spec must be used"]
