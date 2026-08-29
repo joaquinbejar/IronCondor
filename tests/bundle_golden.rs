@@ -95,8 +95,8 @@ use ironcondor::analytics::attribution::attribute;
 use ironcondor::analytics::metrics;
 use ironcondor::{
     BacktestConfig, BacktestEngine, BacktestRun, DataSourceSpec, ExecutionMode, FeeSchedule,
-    LiquidityProfile, NaiveFill, OptStratAdapter, ParquetFeed, ResourceLimits, SlippageModel,
-    StrategySpec, read_bundle, write_bundle,
+    LegSetStrategy, LiquidityProfile, NaiveFill, OptStratAdapter, ParquetFeed, ResourceLimits,
+    SlippageModel, StrategySpec, read_bundle, write_bundle,
 };
 use optionstratlib::simulation::ExitPolicy;
 use optionstratlib::strategies::{IronCondor, ShortStrangle};
@@ -122,6 +122,12 @@ const CANONICAL_DATA_IDENTITY: &str = "golden:iron_condor_naive:ironcondor.bundl
 
 /// The canonical tape identity hashed into the short-strangle `run_id`.
 const CANONICAL_STRANGLE_DATA_IDENTITY: &str = "golden:short_strangle_naive:ironcondor.bundle.v1";
+
+/// The canonical (documentary) multi-expiration leg-set data-source path.
+const CANONICAL_LEGS_DATA_PATH: &str = "legs_multi_expiry.parquet";
+
+/// The canonical tape identity hashed into the leg-set `run_id`.
+const CANONICAL_LEGS_DATA_IDENTITY: &str = "golden:legs_multi_expiry_naive:ironcondor.bundle.v1";
 
 /// The canonical `created_utc` written into a committed golden manifest (the
 /// comparison strips `created_utc`, so any fixed value works; a clean epoch
@@ -290,6 +296,44 @@ fn build_short_strangle_naive_run(
         &config,
         CANONICAL_STRANGLE_DATA_PATH,
         CANONICAL_STRANGLE_DATA_IDENTITY,
+    );
+    (config, spec, run)
+}
+
+/// Assemble and run the canonical **naive multi-expiration leg-set** bundle run
+/// (#117): the same pipeline as [`build_iron_condor_naive_run`], but over the
+/// four-leg / two-expiration [`common::legs_rows`] chain driven by
+/// [`LegSetStrategy`] — the strategy for a [`StrategySpec::Legs`] spec, which has
+/// no upstream object to wrap. This freezes the bundle shape for a position no
+/// named spec can describe, and its `run_id` is derived from the CANONICAL leg
+/// order ([`common::legs_spec`] deliberately lists its legs unsorted).
+fn build_legs_multi_expiry_naive_run(
+    chain_dir: &Path,
+    output_dir: &Path,
+) -> (BacktestConfig, StrategySpec, BacktestRun) {
+    let chain_path = chain_dir.join("legs_multi_expiry.parquet");
+    let rows = common::legs_rows(GOLDEN_STEPS);
+    if common::write_parquet_multi_expiry(&chain_path, &rows).is_err() {
+        panic!("the canonical multi-expiry golden chain must write");
+    }
+    let Ok(feed) = ParquetFeed::open(&chain_path, &ResourceLimits::default()) else {
+        panic!("the canonical multi-expiry golden chain must open");
+    };
+    let config = base_config(ExecutionMode::Naive, CANONICAL_LEGS_DATA_PATH, output_dir);
+    let spec = common::legs_spec();
+    let exit = ExitPolicy::TimeSteps(1_000_000);
+    let Ok(strategy) = LegSetStrategy::from_spec(&spec, exit) else {
+        panic!("the leg set strategy must build");
+    };
+    let execution = NaiveFill::new(config.slippage.clone(), config.fees);
+    let Ok(mut run) = BacktestEngine::run(&config, feed, execution, strategy, "legs") else {
+        panic!("the canonical multi-expiry golden run must succeed");
+    };
+    finalize_run(
+        &mut run,
+        &config,
+        CANONICAL_LEGS_DATA_PATH,
+        CANONICAL_LEGS_DATA_IDENTITY,
     );
     (config, spec, run)
 }
@@ -468,6 +512,75 @@ fn test_bundle_golden_short_strangle_naive_write_read_equal() {
 #[test]
 fn test_bundle_run_twice_short_strangle_is_byte_identical() {
     assert_run_twice(build_short_strangle_naive_run);
+}
+
+/// The `legs_multi_expiry_naive` golden write→read→equal (#117): a four-leg
+/// position across TWO expirations round-trips through `write_bundle` /
+/// `read_bundle` unchanged, under the same oracle and writer as the named kinds
+/// — so a `Legs` bundle is indistinguishable in shape from an `IronCondor` one.
+#[test]
+fn test_bundle_golden_legs_multi_expiry_naive_write_read_equal() {
+    let Ok(chain_dir) = tempfile::tempdir() else {
+        panic!("a tempdir for the generated chain must create");
+    };
+    let Ok(out_dir) = tempfile::tempdir() else {
+        panic!("a tempdir for the bundle output must create");
+    };
+    let (config, spec, run) = build_legs_multi_expiry_naive_run(chain_dir.path(), out_dir.path());
+    assert_bundle_golden("legs_multi_expiry_naive", &config, &spec, &run);
+}
+
+/// Same-environment run-twice for `legs_multi_expiry_naive` (#117):
+/// byte-identical four tables + manifest across two runs.
+#[test]
+fn test_bundle_run_twice_legs_multi_expiry_is_byte_identical() {
+    assert_run_twice(build_legs_multi_expiry_naive_run);
+}
+
+/// A permuted leg set writes the **same** bundle (#117): the same four legs in a
+/// different input order derive the same `run_id` — so the run lands in the same
+/// `<run_id>/` directory — and the manifest records the same canonical spec, so
+/// the bundle bytes agree with the directory name.
+#[test]
+fn test_bundle_legs_permuted_input_order_writes_the_same_bundle() {
+    let Ok(chain_dir) = tempfile::tempdir() else {
+        panic!("a tempdir for the generated chain must create");
+    };
+    let Ok(out_dir) = tempfile::tempdir() else {
+        panic!("a tempdir for the bundle output must create");
+    };
+    let (config, spec, run) = build_legs_multi_expiry_naive_run(chain_dir.path(), out_dir.path());
+    let Ok(canonical_dir) = write_bundle(&run, &config, &spec) else {
+        panic!("the canonical-order bundle must write");
+    };
+
+    // The SAME position, its legs written in the reverse input order.
+    let StrategySpec::Legs(mut permuted) = spec.clone() else {
+        panic!("the leg-set fixture is a leg set");
+    };
+    permuted.legs.reverse();
+    let permuted = StrategySpec::Legs(permuted);
+    assert_ne!(permuted, spec, "the fixture permutation changes the input");
+
+    let Ok(permuted_out) = tempfile::tempdir() else {
+        panic!("a tempdir for the permuted bundle output must create");
+    };
+    let mut permuted_config = config.clone();
+    permuted_config.output_dir = permuted_out.path().to_path_buf();
+    let Ok(permuted_dir) = write_bundle(&run, &permuted_config, &permuted) else {
+        panic!("the permuted-order bundle must write");
+    };
+
+    assert_eq!(
+        canonical_dir.file_name(),
+        permuted_dir.file_name(),
+        "a permuted leg set must derive the same run_id"
+    );
+    let canonical_manifest = oracle::read_manifest_json(&canonical_dir);
+    let permuted_manifest = oracle::read_manifest_json(&permuted_dir);
+    if let Err(diff) = oracle::compare_manifest_json(&canonical_manifest, &permuted_manifest) {
+        panic!("a permuted leg set must record the same canonical manifest: {diff}");
+    }
 }
 
 /// The oracle's near-boundary float cases ([docs/05 §12.5](../docs/05-analytics-and-reporting.md#125-equality-oracle-and-the-metrics-clause)):

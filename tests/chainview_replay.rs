@@ -104,12 +104,19 @@ fn read_fixture() -> ValidatedBundle {
 /// ([docs/05 §12.4](../docs/05-analytics-and-reporting.md#124-identifier-grammars-producer-defined-delimiter-safe)).
 /// `UNDERLYING` is colon-free by grammar, so the split has exactly five fields.
 fn parse_contract_id(contract_id: &str) -> Option<(u64, char)> {
+    let (_expiration_ns, strike_cents, style_char) = parse_contract_id_parts(contract_id)?;
+    Some((strike_cents, style_char))
+}
+
+/// The same parse, keeping the `expiration_ns` field too — what a renderer needs
+/// to group a multi-expiration position (a diagonal, a calendar) by expiry.
+fn parse_contract_id_parts(contract_id: &str) -> Option<(i64, u64, char)> {
     let mut parts = contract_id.split(':');
     if parts.next()? != "v1" {
         return None;
     }
     let _underlying = parts.next()?;
-    let _expiration_ns = parts.next()?;
+    let expiration_ns = parts.next()?.parse::<i64>().ok()?;
     let strike_cents = parts.next()?.parse::<u64>().ok()?;
     let style = parts.next()?;
     if parts.next().is_some() {
@@ -120,7 +127,7 @@ fn parse_contract_id(contract_id: &str) -> Option<(u64, char)> {
         "P" => 'P',
         _ => return None,
     };
-    Some((strike_cents, style_char))
+    Some((expiration_ns, strike_cents, style_char))
 }
 
 /// The lower-case style string a `C`/`P` id char maps to (`fills.style` grammar).
@@ -689,3 +696,219 @@ fn test_contract_id_parser_accepts_v1_and_rejects_malformed() {
 /// vocabulary is `{FillRow, PositionRow, EquityPoint, GreeksAttributionRow}`.
 #[allow(dead_code)]
 fn wire_types_only(_f: &FillRow, _p: &PositionRow, _e: &EquityPoint, _g: &GreeksAttributionRow) {}
+
+// ---------------------------------------------------------------------------
+// Surface 5 — the same surfaces over a MULTI-EXPIRATION leg-set bundle (#117).
+// ---------------------------------------------------------------------------
+
+/// The replay surfaces over a `StrategySpec::Legs` bundle: the position shape no
+/// named strategy spec can describe — four legs across **two** expirations.
+///
+/// The point of this module is that ChainView needs **nothing new** for it: the
+/// same [`read_bundle`] call, the same four tables, the same wire row types. The
+/// bundle read here is the committed `legs_multi_expiry_naive` golden, so the
+/// frozen bytes and the replay contract are proven against one artifact.
+mod legs {
+    use std::collections::BTreeMap;
+
+    use ironcondor::{PositionRow, ResourceLimits, ValidatedBundle, read_bundle};
+
+    use super::{DRAWDOWN_TOL, attribution_sum, parse_contract_id_parts, style_str};
+
+    /// The four legs of the golden leg set as `(strike_cents, style, side)` and
+    /// the expiry bucket (`0` = near, `1` = far) each sits in.
+    const EXPECTED_LEGS: [(u64, &str, &str, usize); 4] = [
+        (510_000, "call", "short", 0), // near-expiry body
+        (490_000, "put", "short", 0),  // near-expiry body
+        (520_000, "call", "long", 1),  // far-expiry wing
+        (480_000, "put", "long", 1),   // far-expiry wing
+    ];
+
+    /// Read the committed multi-expiration leg-set golden bundle — the same read
+    /// a ChainView renderer performs (no engine, no conversion).
+    fn read_legs_bundle() -> ValidatedBundle {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/golden/legs_multi_expiry_naive/expected");
+        let Ok(bundle) = read_bundle(dir, &ResourceLimits::default()) else {
+            panic!(
+                "the committed leg-set golden must read back through read_bundle \
+                 (regenerate with: BLESS=1 cargo test --test bundle_golden)"
+            );
+        };
+        bundle
+    }
+
+    #[test]
+    fn test_legs_bundle_equity_curve_is_plot_ready() {
+        let bundle = read_legs_bundle();
+        let curve = &bundle.equity_curve;
+        let Ok(len) = u64::try_from(curve.len()) else {
+            panic!("equity-curve length fits u64");
+        };
+        assert_eq!(len, bundle.manifest.row_counts.equity_curve);
+        assert!(!curve.is_empty(), "the leg-set golden has steps");
+
+        let mut prev_ts: Option<i64> = None;
+        for (i, point) in curve.iter().enumerate() {
+            let Ok(expected_step) = u32::try_from(i) else {
+                panic!("step index fits u32");
+            };
+            assert_eq!(point.step, expected_step, "contiguous 0..N by step");
+            if let Some(prev) = prev_ts {
+                assert!(point.ts_ns > prev, "ts_ns strictly increases");
+            }
+            prev_ts = Some(point.ts_ns);
+            let Some(equity) = point.cash_cents.checked_add(point.position_value_cents) else {
+                panic!(
+                    "cash + position_value must not overflow at step {}",
+                    point.step
+                );
+            };
+            assert_eq!(
+                point.equity_cents, equity,
+                "equity == cash + position value"
+            );
+            assert!(point.drawdown.is_finite(), "drawdown is finite");
+            assert!(point.drawdown <= DRAWDOWN_TOL, "drawdown is <= 0");
+        }
+    }
+
+    #[test]
+    fn test_legs_bundle_attribution_reconciles_per_row() {
+        let bundle = read_legs_bundle();
+        let curve = &bundle.equity_curve;
+        let greeks = &bundle.greeks_attribution;
+        assert_eq!(greeks.len(), curve.len(), "one attribution row per step");
+
+        let Ok(initial_capital) = i64::try_from(bundle.manifest.config.initial_capital) else {
+            panic!("initial_capital fits i64 cents");
+        };
+        for (i, row) in greeks.iter().enumerate() {
+            let Some(point) = curve.get(i) else {
+                panic!("every attribution row has its equity twin at index {i}");
+            };
+            assert_eq!(row.step, point.step, "attribution/equity steps align");
+            assert_eq!(row.ts_ns, point.ts_ns, "the two tables share ts_ns");
+            let prev_equity = if i == 0 {
+                initial_capital
+            } else {
+                let Some(prev) = curve.get(i - 1) else {
+                    panic!("a non-zero step has a predecessor at index {}", i - 1);
+                };
+                prev.equity_cents
+            };
+            let Some(step_pnl) = point.equity_cents.checked_sub(prev_equity) else {
+                panic!("step_pnl must not overflow at step {}", row.step);
+            };
+            let Some(decomposition) = attribution_sum(row) else {
+                panic!(
+                    "the attribution terms must not overflow at step {}",
+                    row.step
+                );
+            };
+            assert_eq!(
+                decomposition, step_pnl,
+                "attribution reconciles to the equity step delta at step {}",
+                row.step
+            );
+        }
+    }
+
+    #[test]
+    fn test_legs_bundle_joins_are_total() {
+        let bundle = read_legs_bundle();
+        let run_id = &bundle.manifest.run_id;
+        let mut leg_rows: BTreeMap<u64, Vec<&PositionRow>> = BTreeMap::new();
+        for p in &bundle.positions {
+            leg_rows.entry(p.position_id).or_default().push(p);
+        }
+        assert_eq!(leg_rows.len(), EXPECTED_LEGS.len(), "one group per leg");
+
+        for f in &bundle.fills {
+            assert_eq!(
+                f.strategy_run_id,
+                run_id.as_str(),
+                "every fill joins the manifest run_id"
+            );
+            assert!(
+                leg_rows.contains_key(&f.position_id),
+                "every fill's position exists in positions.parquet"
+            );
+        }
+    }
+
+    #[test]
+    fn test_legs_bundle_payoff_inputs_recover_four_legs_at_two_expirations() {
+        // The claim the variant exists for: a renderer recovers each leg's
+        // identity — INCLUDING its own expiration — from the bundle alone, and
+        // the recovered set spans two distinct expiries.
+        let bundle = read_legs_bundle();
+        let mut leg_rows: BTreeMap<u64, Vec<&PositionRow>> = BTreeMap::new();
+        for p in &bundle.positions {
+            leg_rows.entry(p.position_id).or_default().push(p);
+        }
+
+        let mut recovered: Vec<(i64, u64, String, String)> = Vec::new();
+        for (position_id, rows) in &leg_rows {
+            let Some(entry) = rows.first() else {
+                panic!("leg {position_id} has an entry row");
+            };
+            let Some((expiration_ns, strike_cents, style_char)) =
+                parse_contract_id_parts(&entry.contract_id)
+            else {
+                panic!("leg {position_id} contract_id parses to (expiry, strike, style)");
+            };
+            let Some(style) = style_str(style_char) else {
+                panic!("leg {position_id} style char is C|P");
+            };
+            assert!(
+                entry.avg_price_cents > 0,
+                "leg {position_id} has a positive entry premium"
+            );
+            recovered.push((
+                expiration_ns,
+                strike_cents,
+                style.to_string(),
+                entry.side.clone(),
+            ));
+        }
+
+        // Two distinct expiries, two legs each — the shape a single
+        // strategy-level `expiration` cannot describe.
+        let mut expiries: Vec<i64> = recovered.iter().map(|(e, _, _, _)| *e).collect();
+        expiries.sort_unstable();
+        expiries.dedup();
+        assert_eq!(
+            expiries.len(),
+            2,
+            "the leg set spans two distinct expirations"
+        );
+
+        for (strike, style, side, bucket) in EXPECTED_LEGS {
+            let Some(expected_expiry) = expiries.get(bucket) else {
+                panic!("expiry bucket {bucket} exists");
+            };
+            assert!(
+                recovered.iter().any(|(e, s, st, sd)| e == expected_expiry
+                    && *s == strike
+                    && st == style
+                    && sd == side),
+                "the {side} {style} at {strike} is recovered in expiry bucket {bucket}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_legs_bundle_manifest_declares_the_legs_kind() {
+        // A renderer that groups by strategy kind reads it from the manifest —
+        // the leg set is a first-class kind on the wire, not a special case.
+        let bundle = read_legs_bundle();
+        let Ok(json) = serde_json::to_value(&bundle.manifest.strategy) else {
+            panic!("the manifest strategy serialises");
+        };
+        let Some(obj) = json.as_object() else {
+            panic!("the strategy record is a JSON object");
+        };
+        assert!(obj.contains_key("Legs"), "the manifest carries a leg set");
+    }
+}
