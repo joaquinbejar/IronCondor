@@ -159,6 +159,11 @@ pub fn write_bundle(
     strategy: &StrategySpec,
 ) -> Result<PathBuf, BacktestError> {
     let lockfile_sha = to_hex(&Sha256::digest(CARGO_LOCK.as_bytes()));
+    // Canonicalise ONCE, here: the manifest records exactly the spec the
+    // `run_id` hashed, so an explicit leg set written in a different leg order
+    // lands in the same `<run_id>` directory with byte-identical manifest bytes
+    // (the named kinds clone unchanged — their frozen goldens are untouched).
+    let strategy = &strategy.canonical();
     let run_id = RunId::derive(
         config.seed,
         config,

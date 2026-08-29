@@ -141,7 +141,12 @@ impl Eq for ContractKey {}
 /// Exact expiration ordering, consistent with [`expiration_exact_eq`]:
 /// `Days` sorts before `DateTime`; within a variant the exact values
 /// compare — deliberately NOT the upstream day-count comparison.
-fn expiration_exact_cmp(a: &ExpirationDate, b: &ExpirationDate) -> std::cmp::Ordering {
+///
+/// `pub(crate)` because it is the crate's **single** expiration ordering rule:
+/// [`ContractKey`]'s `Ord` and the canonical leg order of
+/// [`crate::domain::LegSetSpec`] (hashed into the `run_id`) must agree, so both
+/// call this one function rather than re-deriving the same comparison.
+pub(crate) fn expiration_exact_cmp(a: &ExpirationDate, b: &ExpirationDate) -> std::cmp::Ordering {
     match (a, b) {
         (ExpirationDate::Days(da), ExpirationDate::Days(db)) => da.to_dec().cmp(&db.to_dec()),
         (ExpirationDate::DateTime(ta), ExpirationDate::DateTime(tb)) => ta.cmp(tb),

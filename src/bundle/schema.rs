@@ -194,6 +194,15 @@ impl RunId {
     /// so the same tuple yields a byte-identical preimage — and therefore the
     /// same `run_id` — across runs and environments.
     ///
+    /// **The strategy is hashed in CANONICAL form** ([`StrategySpec::canonical`]):
+    /// the two named kinds are fixed-field records and clone unchanged, while an
+    /// explicit leg set ([`StrategySpec::Legs`]) has its legs sorted by
+    /// `(expiration, strike, style, side, quantity, implied_volatility)` first.
+    /// Leg order is an artefact of how a caller wrote the position, not of the
+    /// position, so the same legs in a different input order derive the SAME
+    /// `run_id` — and [`crate::write_bundle`] records that same canonical spec in
+    /// the manifest, so the bundle bytes agree with the directory name.
+    ///
     /// **`overwrite` and the output path are EXCLUDED** — they are operational
     /// output controls, not run behaviour, so two configs differing only there
     /// hash identically (enabling `overwrite` authorises replacing the *same*
@@ -221,6 +230,13 @@ impl RunId {
         code_version: &str,
         lockfile_sha256: &str,
     ) -> Result<Self, BacktestError> {
+        // The spec is hashed in CANONICAL form: for an explicit leg set the leg
+        // order is an artefact of how the caller wrote the position, not of the
+        // position itself, so the same four legs in a different input order must
+        // hash to the same id (the leg order is sorted by
+        // `LegSpec::canonical_cmp`; the named kinds clone unchanged, so their
+        // frozen goldens are byte-untouched).
+        let strategy = &strategy.canonical();
         let preimage = RunIdPreimage {
             seed,
             semantic_config: SemanticConfig {
@@ -417,10 +433,11 @@ mod tests {
     use crate::config::{BacktestConfig, FeeSchedule, SlippageModel};
     use crate::data::DataSourceSpec;
     use crate::domain::{
-        ExecutionMode, IronCondorSpec, PriceCents, Quantity, StrategySpec, Underlying,
+        ExecutionMode, IronCondorSpec, LegSetSpec, LegSpec, PriceCents, Quantity, StrategySpec,
+        Underlying,
     };
-    use optionstratlib::ExpirationDate;
     use optionstratlib::backtesting::BacktestResult;
+    use optionstratlib::{ExpirationDate, OptionStyle, Side};
 
     const CODE_VERSION: &str = "0.3.0";
     const LOCKFILE_SHA: &str = "0000000000000000000000000000000000000000000000000000000000000000";
@@ -766,5 +783,117 @@ mod tests {
         assert_eq!(back.seed, 42);
         assert_eq!(back.config, base_config());
         assert_eq!(back.row_counts, RowCounts::new(4, 3, 4, 3));
+    }
+
+    /// The far expiry of the leg-set fixtures — the near one is `EXPIRY_NS`.
+    const EXPIRY_NS: i64 = 1_750_291_200_000_000_000;
+    const FAR_EXPIRY_NS: i64 = EXPIRY_NS + 7 * 86_400_000_000_000;
+
+    fn leg(strike: u64, style: OptionStyle, side: Side, expiration_ns: i64) -> LegSpec {
+        let Ok(quantity) = Quantity::new(1) else {
+            panic!("1 is valid");
+        };
+        LegSpec {
+            side,
+            style,
+            strike: PriceCents::new(strike),
+            expiration: ExpirationDate::DateTime(chrono::DateTime::from_timestamp_nanos(
+                expiration_ns,
+            )),
+            quantity,
+            implied_volatility: Decimal::new(20, 2),
+        }
+    }
+
+    /// A four-leg set across two expirations, in the given input order.
+    fn leg_set(legs: Vec<LegSpec>) -> StrategySpec {
+        let Ok(underlying) = Underlying::new("SPX") else {
+            panic!("SPX is valid");
+        };
+        StrategySpec::Legs(LegSetSpec {
+            underlying,
+            underlying_price: PriceCents::new(500_000),
+            legs,
+            risk_free_rate: Decimal::new(5, 2),
+            dividend_yield: Decimal::ZERO,
+        })
+    }
+
+    fn leg_set_legs() -> Vec<LegSpec> {
+        vec![
+            leg(510_000, OptionStyle::Call, Side::Short, EXPIRY_NS),
+            leg(490_000, OptionStyle::Put, Side::Short, EXPIRY_NS),
+            leg(520_000, OptionStyle::Call, Side::Long, FAR_EXPIRY_NS),
+            leg(480_000, OptionStyle::Put, Side::Long, FAR_EXPIRY_NS),
+        ]
+    }
+
+    fn derive_for(strategy: &StrategySpec) -> RunId {
+        let config = base_config();
+        match RunId::derive(
+            config.seed,
+            &config,
+            strategy,
+            TAPE_SHA,
+            CODE_VERSION,
+            LOCKFILE_SHA,
+        ) {
+            Ok(id) => id,
+            Err(error) => panic!("run_id derives: {error}"),
+        }
+    }
+
+    #[test]
+    fn test_run_id_is_leg_order_independent_for_a_leg_set() {
+        // Leg order is an artefact of how the caller wrote the position, not of
+        // the position: the SAME four legs in a different input order must
+        // target the same `<run_id>` directory (the derivation canonicalises).
+        let mut permuted = leg_set_legs();
+        permuted.reverse();
+        assert_eq!(
+            derive_for(&leg_set(leg_set_legs())),
+            derive_for(&leg_set(permuted)),
+            "a permuted leg set must derive the same run_id"
+        );
+    }
+
+    #[test]
+    fn test_run_id_changes_when_a_leg_changes() {
+        // Order is not observable, but every leg FIELD is: a different strike,
+        // expiration, side, quantity or IV is a different position.
+        let base = derive_for(&leg_set(leg_set_legs()));
+
+        let mut strike = leg_set_legs();
+        strike[0].strike = PriceCents::new(515_000);
+        assert_ne!(base, derive_for(&leg_set(strike)), "strike is hashed");
+
+        let mut expiry = leg_set_legs();
+        expiry[0].expiration =
+            ExpirationDate::DateTime(chrono::DateTime::from_timestamp_nanos(FAR_EXPIRY_NS));
+        assert_ne!(base, derive_for(&leg_set(expiry)), "expiration is hashed");
+
+        let mut side = leg_set_legs();
+        side[0].side = Side::Long;
+        assert_ne!(base, derive_for(&leg_set(side)), "side is hashed");
+
+        let mut quantity = leg_set_legs();
+        let Ok(two) = Quantity::new(2) else {
+            panic!("2 is valid");
+        };
+        quantity[0].quantity = two;
+        assert_ne!(base, derive_for(&leg_set(quantity)), "quantity is hashed");
+
+        let mut vol = leg_set_legs();
+        vol[0].implied_volatility = Decimal::new(25, 2);
+        assert_ne!(base, derive_for(&leg_set(vol)), "the leg IV is hashed");
+    }
+
+    #[test]
+    fn test_run_id_differs_between_a_leg_set_and_a_named_kind() {
+        assert_ne!(
+            derive_for(&strategy()),
+            derive_for(&leg_set(leg_set_legs())),
+            "two strategy kinds must never share a run_id"
+        );
     }
 }
