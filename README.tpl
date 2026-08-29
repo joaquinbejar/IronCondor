@@ -1,6 +1,7 @@
 [![Dual License](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
 [![Crates.io](https://img.shields.io/crates/v/ironcondor.svg)](https://crates.io/crates/ironcondor)
 [![Downloads](https://img.shields.io/crates/d/ironcondor.svg)](https://crates.io/crates/ironcondor)
+[![PyPI](https://img.shields.io/pypi/v/ironcondor.svg)](https://pypi.org/project/ironcondor/)
 [![Stars](https://img.shields.io/github/stars/joaquinbejar/IronCondor.svg)](https://github.com/joaquinbejar/IronCondor/stargazers)
 [![Issues](https://img.shields.io/github/issues/joaquinbejar/IronCondor.svg)](https://github.com/joaquinbejar/IronCondor/issues)
 [![PRs](https://img.shields.io/github/issues-pr/joaquinbejar/IronCondor.svg)](https://github.com/joaquinbejar/IronCondor/pulls)
