@@ -27,6 +27,13 @@
 //! shared with [`crate::domain::ContractKey`]'s `Ord` (`Days` before
 //! `DateTime`, exact values within a variant).
 //!
+//! **Known coupling.** The `style` and `side` positions of that key use
+//! `optionstratlib`'s derived `Ord` (`Call < Put`, `Long < Short`), so an
+//! upstream variant reorder would move every leg-set `run_id` and invalidate
+//! every frozen leg-set golden. The lockfile pin makes that a controlled break
+//! rather than a silent one — `lockfile_sha256` is part of the build identity
+//! hashed into the `run_id`, so such a bump already regenerates the goldens.
+//!
 //! # Placement (domain, not engine)
 //!
 //! The type lives in `domain` because the domain `Manifest`
@@ -246,8 +253,26 @@ pub struct ShortStrangleSpec {
 ///
 /// `underlying_price` and each leg's `strike` are integer cents; the two rates
 /// here and each leg's `implied_volatility` are `Decimal`, the documented
-/// analytic exception, and are validated non-negative at the construction seam
-/// (`LegSetStrategy::from_spec`) — never a panic.
+/// analytic exception. `dividend_yield` and each leg's `implied_volatility` are
+/// validated non-negative at the construction seam
+/// (`LegSetStrategy::from_spec`) — a typed error, never a panic.
+/// `risk_free_rate` is deliberately **unconstrained**: a negative risk-free rate
+/// is a real market state, and the named specs pass theirs through unvalidated
+/// for the same reason.
+///
+/// # Recorded and hashed, not read
+///
+/// The v0.1 engine reads only `underlying` and `legs`: entry prices come from
+/// the snapshot quotes, so `underlying_price`, the two rates and the per-leg
+/// `implied_volatility` never reach a fill. They are still recorded in the
+/// manifest **and hashed into the `run_id`**, and that is deliberate — dropping
+/// them from the hash would let two specs differing only in implied volatility
+/// share one `<run_id>/` directory and write two different manifests into it.
+/// The visible consequence is the benign one: two runs differing only in a
+/// descriptive field behave identically but land in different directories. They
+/// are also the handoff for a Greek-driven exit policy
+/// (`ExitPolicy::DeltaThreshold`), which will need exactly these values to
+/// price.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LegSetSpec {
     /// The canonical underlying ticker shared by every leg.
@@ -291,14 +316,22 @@ pub struct LegSpec {
 
 impl LegSpec {
     /// The canonical leg ordering: `(expiration, strike, style, side, quantity,
-    /// implied_volatility)`.
+    /// implied_volatility)`, with a final textual tiebreak.
     ///
-    /// **Total** over every field of the leg, so two *distinct* legs never tie
-    /// and the stable sort in [`StrategySpec::canonical`] can never leak input
-    /// order into the serialised bytes (two legs that tie on every field are
-    /// identical, so their order is unobservable). The expiration comparison is
-    /// the crate's single rule, shared with [`crate::domain::ContractKey`]'s
-    /// `Ord`: `Days` before `DateTime`, exact values within a variant.
+    /// **Total over the leg's serialised bytes**, which is the property that
+    /// matters: the stable sort in [`StrategySpec::canonical`] may only leave
+    /// two legs in input order when they serialise identically, so leg order
+    /// cannot reach the `run_id` or the manifest. Value equality alone is not
+    /// enough for that, because `Decimal` compares **scale-insensitively**:
+    /// `0.20` and `0.200` are equal numbers that serialise as different strings.
+    /// The last two tiebreaks compare the `Display` form of the analytic fields
+    /// — the same form serde writes — so a scale difference orders rather than
+    /// ties. They are reached only when every value field already matched, so
+    /// the two small allocations never occur on an ordinary sort.
+    ///
+    /// The expiration comparison is the crate's single rule, shared with
+    /// [`crate::domain::ContractKey`]'s `Ord`: `Days` before `DateTime`, exact
+    /// values within a variant.
     #[must_use]
     pub fn canonical_cmp(&self, other: &Self) -> Ordering {
         expiration_exact_cmp(&self.expiration, &other.expiration)
@@ -307,6 +340,27 @@ impl LegSpec {
             .then_with(|| self.side.cmp(&other.side))
             .then_with(|| self.quantity.cmp(&other.quantity))
             .then_with(|| self.implied_volatility.cmp(&other.implied_volatility))
+            // Value-equal but byte-different: `Decimal` ignores scale, and a
+            // `Days(n)` expiration carries one too. Order by the written form so
+            // a tie means "serialises identically", not merely "compares equal".
+            .then_with(|| {
+                self.implied_volatility
+                    .to_string()
+                    .cmp(&other.implied_volatility.to_string())
+            })
+            .then_with(|| {
+                expiration_text(&self.expiration).cmp(&expiration_text(&other.expiration))
+            })
+    }
+}
+
+/// The written form of an expiration — the scale-carrying text serde emits for a
+/// relative `Days(n)`, used as [`LegSpec::canonical_cmp`]'s last tiebreak so the
+/// comparator is total over bytes rather than over values.
+fn expiration_text(expiration: &ExpirationDate) -> String {
+    match expiration {
+        ExpirationDate::Days(days) => format!("d{}", days.to_dec()),
+        ExpirationDate::DateTime(instant) => format!("t{}", instant.to_rfc3339()),
     }
 }
 
@@ -501,6 +555,65 @@ mod tests {
                 (FAR_EXPIRY, 480_000),
                 (FAR_EXPIRY, 520_000),
             ]
+        );
+    }
+
+    #[test]
+    fn test_canonical_orders_scale_differing_decimals_rather_than_tying() {
+        // `Decimal` compares scale-insensitively, so `0.20` and `0.200` are equal
+        // NUMBERS that serialise as different strings. If the comparator tied on
+        // them, the stable sort would leave two byte-different legs in input
+        // order and the same position would hash to two `run_id`s.
+        let mut a = leg(510_000, OptionStyle::Call, Side::Short, NEAR_EXPIRY);
+        let mut b = a.clone();
+        a.implied_volatility = Decimal::new(20, 2);
+        b.implied_volatility = Decimal::new(200, 3);
+        assert_eq!(
+            a.implied_volatility, b.implied_volatility,
+            "equal as numbers"
+        );
+        assert_ne!(
+            a.implied_volatility.to_string(),
+            b.implied_volatility.to_string(),
+            "different as bytes"
+        );
+        assert_ne!(
+            a.canonical_cmp(&b),
+            std::cmp::Ordering::Equal,
+            "a byte difference must order, not tie"
+        );
+
+        // …so both input orders canonicalise to the same bytes.
+        let Ok(forward) = serde_json::to_string(&leg_set(vec![a.clone(), b.clone()]).canonical())
+        else {
+            panic!("the leg set serialises");
+        };
+        let Ok(reverse) = serde_json::to_string(&leg_set(vec![b, a]).canonical()) else {
+            panic!("the permuted leg set serialises");
+        };
+        assert_eq!(forward, reverse);
+    }
+
+    #[test]
+    fn test_canonical_orders_scale_differing_relative_expirations() {
+        // The same property for an unresolved `Days(n)`: `Days(30)` and
+        // `Days(30.0)` are equal values with different written forms.
+        let Ok(thirty) = optionstratlib::prelude::Positive::new_decimal(Decimal::new(30, 0)) else {
+            panic!("30 is a valid positive");
+        };
+        let Ok(thirty_scaled) =
+            optionstratlib::prelude::Positive::new_decimal(Decimal::new(300, 1))
+        else {
+            panic!("30.0 is a valid positive");
+        };
+        let mut a = leg(510_000, OptionStyle::Call, Side::Short, NEAR_EXPIRY);
+        let mut b = a.clone();
+        a.expiration = ExpirationDate::Days(thirty);
+        b.expiration = ExpirationDate::Days(thirty_scaled);
+        assert_ne!(
+            a.canonical_cmp(&b),
+            std::cmp::Ordering::Equal,
+            "a byte-different expiration must order, not tie"
         );
     }
 

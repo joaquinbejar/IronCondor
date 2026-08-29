@@ -187,6 +187,20 @@ pub(crate) fn run_spec_with_feed<F: DataFeed>(
 /// Determinism is unchanged from [`run_backtest`]: no wall clock and no RNG of
 /// its own; `(seed, config, data)` is byte-reproducible.
 ///
+/// # Bundle contract
+///
+/// This function takes `strategy_name` as free text, so it does **not** tie the
+/// run to a [`StrategySpec`]. [`crate::write_bundle`] does: it records the spec
+/// it is handed in `manifest.strategy` and hashes it into the `run_id`
+/// ([docs/05 §6](../../docs/05-analytics-and-reporting.md#6-manifestjson)). A run
+/// driven by a strategy that **no** `StrategySpec` describes therefore has no
+/// honest bundle to publish — writing one would produce a well-formed
+/// `ironcondor.bundle.v1` whose manifest describes a different position and
+/// whose `run_id` no longer identifies the run. Such a run is for the in-memory
+/// [`BacktestRun`] only. Whenever a spec **does** describe the run, pass
+/// `strategy_spec.kind()` as `strategy_name` so the two never disagree — which
+/// is exactly what the internal factory behind [`run_backtest`] does.
+///
 /// # Errors
 ///
 /// - [`BacktestError::Config`] if `config.mode` is [`ExecutionMode::Realistic`]

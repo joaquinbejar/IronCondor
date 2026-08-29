@@ -51,10 +51,13 @@
 //! #39 fills the working surface: [`config::PyBacktestConfig`] (Python
 //! `BacktestConfig`) with integer-cents builders, [`run::run`], and
 //! [`bundle::Bundle`] with lazy DataFrame accessors + [`bundle::load_bundle`].
-//! Only what [`crate::run_backtest`] genuinely wires end to end is reachable: a
-//! **Parquet** source and the **iron condor** strategy (a CSV source or a short
-//! strangle spec is a deferred composition-root dispatch, so no `data_csv` /
-//! `strategy_short_strangle` builder exists). Both execution modes work (#26).
+//! The exposed surface is a **Parquet** source and the **iron condor** strategy.
+//! A CSV source is still a deferred composition-root dispatch, so no `data_csv`
+//! builder exists. A short strangle and an explicit leg set are **not**: since
+//! #117 [`crate::run_backtest`] accepts every [`crate::StrategySpec`] kind, so
+//! the absence of `strategy_short_strangle` / `strategy_legs` is now a
+//! not-yet-wrapped **binding**, not a missing Rust capability. Both execution
+//! modes work (#26).
 
 use pyo3::prelude::*;
 

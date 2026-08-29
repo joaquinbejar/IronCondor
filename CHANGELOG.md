@@ -46,6 +46,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `run_backtest` and `run_scenario_batch` therefore accept **every** kind: the
   new leg set, and `ShortStrangle`, which was previously a typed error at those
   entry points despite running fine through the adapter.
+- **Every `StrategySpec` kind is now byte-comparable, not just value-comparable
+  (#117).** `LegSpec::canonical_cmp` gained a textual tiebreak on the analytic
+  fields, because `Decimal` compares scale-insensitively: `0.20` and `0.200` are
+  equal numbers that serialise differently, so without it a stable sort could
+  leave two byte-different legs in input order and one position could hash to two
+  `run_id`s. A tie now means "serialises identically".
 - **A frozen `legs_multi_expiry_naive` golden bundle (#117)** — a four-leg
   position across two expirations, held to the same write → read → equal oracle
   and run-twice byte-identity as the existing scenarios, and read back by
