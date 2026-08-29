@@ -345,10 +345,8 @@ default variant config::TouchSize::Flat
 default variant config::TouchSize::QuotedSize
 default variant data::DataSourceSpec::Csv
 default variant data::DataSourceSpec::Parquet
-default variant data::DataSourceSpec::Simulator
 default variant data::feed::FeedKind::Csv
 default variant data::feed::FeedKind::Parquet
-default variant data::feed::FeedKind::Simulator
 default variant domain::execution::ExecutionMode::Naive
 default variant domain::execution::ExecutionMode::Realistic
 default variant domain::execution::OrderCommand::Cancel
@@ -430,6 +428,8 @@ simulator use data::simulator::SessionResponse
 simulator use data::simulator::SessionState
 simulator use data::simulator::SimulatorFeed
 simulator use data::simulator::UpdateSessionRequest
+simulator variant data::DataSourceSpec::Simulator
+simulator variant data::feed::FeedKind::Simulator
 simulator variant data::simulator::SessionState::Completed
 simulator variant data::simulator::SessionState::Error
 simulator variant data::simulator::SessionState::InProgress
