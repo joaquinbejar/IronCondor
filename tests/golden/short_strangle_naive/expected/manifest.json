@@ -43,7 +43,7 @@
     "path": "short_strangle.parquet",
     "sha256": ""
   },
-  "lockfile_sha256": "7757b4ea1d081633037b2f1795252453baca654186b607bb8c85f14e0009740b",
+  "lockfile_sha256": "d765e17297f9e56c2f23919305379d1582e6d69948cd4915abbc0db236424bbe",
   "metrics": {
     "capital_utilization": {
       "avg_capital_used": "0",
@@ -153,7 +153,7 @@
     "greeks_attribution": 8,
     "positions": 16
   },
-  "run_id": "4621f376f114e92b690b7c3b7f27604bed910d6ad58fc3d1ce3a36d260788bac",
+  "run_id": "ff13914d93910193f146eb41ed665bb858ade9f3b3c98eb4f088934610048f2c",
   "schema": "ironcondor.bundle.v1",
   "seed": 42,
   "strategy": {
