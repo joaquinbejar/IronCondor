@@ -57,7 +57,7 @@ use optionstratlib::strategies::base::{Optimizable, Positionable};
 use optionstratlib::strategies::{IronCondor, ShortStrangle, Strategies};
 use optionstratlib::{ExpirationDate, OptionStyle, Side};
 
-use crate::data::convert::{positive_from_price, snapshot_to_option_chain};
+use crate::data::convert::{positive_from_price, resolve_expiration, snapshot_to_option_chain};
 use crate::domain::{
     ChainSnapshot, ContractKey, IronCondorSpec, LegSetSpec, LegSpec, OpenPosition, OrderCommand,
     OrderId, OrderIntent, PendingOrder, PositionAction, PriceCents, Quantity, QuoteView,
@@ -696,8 +696,14 @@ impl<S: PositionableStrategy> Strategy for OptStratAdapter<S> {
 ///
 /// Entry iterates the legs in **canonical** order — [`Self::new`] sorts them by
 /// [`LegSpec::canonical_cmp`], the same order [`StrategySpec::canonical`] gives
-/// the `run_id` hash and the manifest — and matches each leg by exact
-/// [`ContractKey`] identity. That is what makes one `run_id` name one byte-set:
+/// the `run_id` hash and the manifest — resolves any relative expiry against the
+/// tape anchor, and matches each leg by exact [`ContractKey`] identity.
+///
+/// The canonical order is taken over the spec **as written**, before resolution
+/// (`Days` sorts before `DateTime`), which keeps it a pure function of the spec
+/// — the thing the `run_id` hashed. A relative spec and the resolved spec naming
+/// the same position are therefore *different specs* with different `run_id`s,
+/// which is correct: the manifest records what it hashed. That is what makes one `run_id` name one byte-set:
 /// the engine mints `order_id` / `position_id` / `trade_id` in submission order,
 /// so running the caller's arbitrary leg order would put a permuted
 /// `fills`/`positions` table under an identical `run_id` and manifest. No wall
@@ -738,10 +744,10 @@ impl LegSetStrategy {
     ///
     /// Returns [`BacktestError::Strategy`] when the spec is not a
     /// [`StrategySpec::Legs`], when its leg set is empty (a position with no
-    /// legs is not a position), when the dividend yield or any leg's implied
+    /// legs is not a position), or when the dividend yield or any leg's implied
     /// volatility is negative (the analytic fields are validated here, at the
-    /// construction seam, exactly as the named specs' are), or when any leg
-    /// carries an unresolved relative `Days(n)` expiry (see [`Self::new`]).
+    /// construction seam, exactly as the named specs' are). A relative `Days(n)`
+    /// expiry is **accepted** and resolved at entry (#120).
     pub fn from_spec(spec: &StrategySpec, exit: ExitPolicy) -> Result<Self, BacktestError> {
         match spec {
             StrategySpec::Legs(inner) => Self::new(inner, exit),
@@ -760,9 +766,8 @@ impl LegSetStrategy {
     ///
     /// # Errors
     ///
-    /// Returns [`BacktestError::Strategy`] for an empty leg set, a negative
-    /// dividend yield or per-leg implied volatility, or a leg whose expiry is an
-    /// unresolved relative `Days(n)`.
+    /// Returns [`BacktestError::Strategy`] for an empty leg set or a negative
+    /// dividend yield / per-leg implied volatility.
     fn new(spec: &LegSetSpec, exit: ExitPolicy) -> Result<Self, BacktestError> {
         if spec.legs.is_empty() {
             return Err(BacktestError::Strategy(
@@ -775,28 +780,6 @@ impl LegSetStrategy {
         let _ = positive_rate(spec.dividend_yield, "leg set dividend yield")?;
         for leg in &spec.legs {
             let _ = positive_rate(leg.implied_volatility, "leg set implied volatility")?;
-            // A leg set REQUIRES a resolved expiry. Every snapshot contract key
-            // is a resolved `DateTime` — `data::convert::resolve_expiration`
-            // returns that variant for BOTH input forms, so a `Days` key cannot
-            // exist in a chain — and therefore a relative leg can never match
-            // one. It would only ever fall through to a looser strike+style
-            // match, where `n` is read and then ignored, or match nothing at all
-            // on a multi-expiry chain, the very shape this variant exists for.
-            // Rejecting it at construction is honest about that; resolving it
-            // against the tape anchor (`ts_0`, the rule in
-            // [01 §5.1](../../../docs/01-domain-model.md#51-expiration-resolves-to-one-absolute-instant),
-            // already implemented by that same `resolve_expiration`) is the
-            // principled version and is deferred to its own change.
-            if let ExpirationDate::Days(days) = leg.expiration {
-                return Err(BacktestError::Strategy(format!(
-                    "leg set leg strike {} style {:?} carries an unresolved relative \
-                     expiration Days({days}); a leg set requires a resolved DateTime \
-                     expiry, because it is matched against the chain's resolved \
-                     contract keys",
-                    leg.strike.value(),
-                    leg.style
-                )));
-            }
         }
         // Canonicalise HERE, at the one place every entry path funnels through
         // (`run_spec_with_feed`, and a caller building the strategy directly).
@@ -826,16 +809,19 @@ impl LegSetStrategy {
 
     /// Build the opening intents (one `Submit(Open)` per leg, in the canonical
     /// order [`Self::new`] stored), matched to `snapshot` quotes by the leg's
-    /// **full contract identity** (underlying, expiration, strike, style) —
-    /// see [`select_leg_set_quote`] for why a leg set demands the exact expiry
-    /// rather than the adapter's single-candidate fallback. Guarded by
-    /// `entered`, so it is a no-op after the first successful entry.
+    /// **full contract identity** (underlying, expiration, strike, style), with
+    /// a relative expiry resolved against the tape anchor first — see
+    /// [`select_leg_set_quote`] for both, and for why a leg set demands the
+    /// exact expiry rather than the adapter's single-candidate fallback. Guarded
+    /// by `entered`, so it is a no-op after the first successful entry.
     ///
     /// # Errors
     ///
     /// Returns [`BacktestError::Execution`] when the spec's underlying is not
     /// the snapshot's, or when a leg has no matching snapshot quote at its own
-    /// expiration.
+    /// (resolved) expiration, and
+    /// [`BacktestError::Conversion`] / [`BacktestError::ArithmeticOverflow`] if a
+    /// relative expiry cannot be resolved.
     fn open_entries(
         &mut self,
         snapshot: &ChainSnapshot,
@@ -893,12 +879,22 @@ impl Strategy for LegSetStrategy {
         evaluate_exits(&self.exit, ctx, out)
     }
 
+    /// Nothing. Entry is **`on_start` only** for a leg set, which is what makes
+    /// the anchor claim structural instead of a comment: the one snapshot a
+    /// relative expiry resolves against is the one the loop opens with. Were
+    /// entry retried here, a `Days(30)` leg reaching this at step k would
+    /// resolve to `ts_k + 30d` — usually a typed miss, but on a chain quoting
+    /// several tenors it lands on a REAL contract and silently opens a position
+    /// the spec never named. `on_start` either enters or propagates, so this is
+    /// not a behaviour change under [`crate::BacktestEngine::run`]; it removes
+    /// the reach of a driver that would call `on_snapshot` alone.
     fn on_snapshot(
         &mut self,
         ctx: &mut ChainContext,
         out: &mut Vec<OrderCommand>,
     ) -> Result<(), BacktestError> {
-        self.open_entries(ctx.snapshot, out)
+        let _ = (ctx, out);
+        Ok(())
     }
 
     fn on_end(
@@ -1125,30 +1121,46 @@ fn select_leg_quote(
 /// otherwise open silently against the wrong week and the bundle would record a
 /// contract the spec never asked for.
 ///
-/// Every leg reaching this point carries a resolved (`DateTime`) expiry —
-/// [`LegSetStrategy::new`] rejects an unresolved `Days(n)` at construction — so
-/// there is no second matching mode to reason about.
+/// A leg's expiry is **resolved first**, against the snapshot's own timestamp,
+/// through the crate's single implementation of that rule
+/// ([`resolve_expiration`], [01 §5.1](../../../docs/01-domain-model.md#51-expiration-resolves-to-one-absolute-instant)).
+/// A relative `Days(n)` therefore means what it says — `n` days past the tape
+/// anchor — instead of being ignored or unmatchable, and a leg already written
+/// as a `DateTime` passes through untouched. There is one matching mode either
+/// way: exact identity, or a typed error.
+///
+/// # The anchor
+///
+/// Correctness depends on entry being **one-shot at step 0**: `snapshot` here is
+/// the first snapshot, so its `ts` is the tape anchor `ts_0` that
+/// [`crate::data::convert`] resolves the chain's own quotes against. That holds
+/// because [`Strategy::on_start`] runs with the first snapshot and either enters
+/// or propagates, and `entered` makes every later call a no-op — but it is
+/// invisible at this call site, so it is stated here.
 ///
 /// # Errors
 ///
-/// Returns [`BacktestError::Execution`] when no snapshot quote carries the leg's
-/// exact identity.
+/// Returns [`BacktestError::Conversion`] / [`BacktestError::ArithmeticOverflow`]
+/// if the relative expiry cannot be resolved, and [`BacktestError::Execution`]
+/// when no snapshot quote carries the leg's resolved identity.
 fn select_leg_set_quote<'a>(
     snapshot: &'a ChainSnapshot,
     leg: &LegSpec,
 ) -> Result<&'a QuoteView, BacktestError> {
+    let expiration = resolve_expiration(&leg.expiration, snapshot.ts)?;
     let contract = ContractKey {
         underlying: snapshot.underlying.clone(),
-        expiration: leg.expiration,
+        expiration,
         strike: leg.strike,
         style: leg.style,
     };
     snapshot.quotes.get(&contract).ok_or_else(|| {
         BacktestError::Execution(format!(
             "no snapshot quote for leg set leg strike {} style {:?} at expiration \
-             {:?}; a leg set matches its own expiration exactly",
+             {:?} (resolved from {:?}); a leg set matches its own expiration exactly",
             leg.strike.value(),
             leg.style,
+            expiration,
             leg.expiration
         ))
     })
@@ -2699,7 +2711,11 @@ mod tests {
             panic!("valid instrument spec");
         };
         ChainSnapshot {
-            ts: SimTime::new(TS_NS),
+            // Step-DEPENDENT on purpose: a fixture that pins `ts` for every step
+            // cannot tell "resolved against this snapshot" apart from "resolved
+            // against the anchor", and it lets a one-shot-entry test pass on a
+            // timestamp coincidence rather than on the guard.
+            ts: SimTime::new(TS_NS + i64::from(step) * super::NANOS_PER_DAY as i64),
             step: StepIndex::new(step),
             underlying: und(),
             underlying_price: PriceCents::new(500_000),
@@ -2755,17 +2771,50 @@ mod tests {
     }
 
     #[test]
-    fn test_leg_set_entry_is_one_shot_across_steps() {
+    fn test_leg_set_never_enters_outside_on_start() {
+        // Entry is `on_start`-only, and that is what makes the anchor claim
+        // structural: the snapshot a relative expiry resolves against is the one
+        // the loop opens with, not whichever step happened to enter. A driver
+        // calling `on_snapshot` must not be able to enter at step k — where
+        // `Days(30)` would resolve to `ts_k + 30d` and, on a chain quoting
+        // several tenors, silently open a contract the spec never named.
         let mut rng = ChaCha8Rng::seed_from_u64(118);
-        let snap = multi_expiry_snapshot(0);
         let Ok(mut strategy) = LegSetStrategy::from_spec(&leg_set_spec(), ExitPolicy::Expiration)
         else {
             panic!("the leg set strategy must build from its spec");
         };
         let mut out = Vec::new();
+
+        // Never entered, and a LATER snapshot (its own ts, one day on): still
+        // nothing. Before the fix this opened the position against `ts_1`.
+        let later = multi_expiry_snapshot(1);
+        assert_ne!(
+            later.ts.value(),
+            multi_expiry_snapshot(0).ts.value(),
+            "the fixture must carry a step-dependent ts or this proves nothing"
+        );
         {
             let mut ctx = ChainContext {
-                snapshot: &snap,
+                snapshot: &later,
+                open: &[],
+                pending: &[],
+                marks: &NO_MARKS,
+                rng: &mut rng,
+                step: StepIndex::new(1),
+            };
+            assert!(matches!(strategy.on_snapshot(&mut ctx, &mut out), Ok(())));
+        }
+        assert!(
+            out.is_empty(),
+            "on_snapshot must never open a leg set, entered or not"
+        );
+        assert!(!strategy.has_entered(), "and must not mark it entered");
+
+        // `on_start` is the sole entry, and it is still one-shot.
+        let first = multi_expiry_snapshot(0);
+        {
+            let mut ctx = ChainContext {
+                snapshot: &first,
                 open: &[],
                 pending: &[],
                 marks: &NO_MARKS,
@@ -2774,8 +2823,10 @@ mod tests {
             };
             assert!(matches!(strategy.on_start(&mut ctx, &mut out), Ok(())));
         }
+        assert_eq!(out.len(), 4, "on_start opens every leg");
+        assert!(strategy.has_entered());
+
         out.clear();
-        let later = multi_expiry_snapshot(1);
         let mut ctx = ChainContext {
             snapshot: &later,
             open: &[],
@@ -2784,7 +2835,7 @@ mod tests {
             rng: &mut rng,
             step: StepIndex::new(1),
         };
-        assert!(matches!(strategy.on_snapshot(&mut ctx, &mut out), Ok(())));
+        assert!(matches!(strategy.on_start(&mut ctx, &mut out), Ok(())));
         assert!(out.is_empty(), "entry is guarded after the first snapshot");
     }
 
@@ -2993,17 +3044,111 @@ mod tests {
     }
 
     #[test]
-    fn test_leg_set_rejects_an_unresolved_relative_expiration() {
-        // A relative `Days(n)` cannot mean what it says in a leg set: entry
-        // matches resolved chain keys, so an unresolved leg either matches
-        // nothing (a multi-expiry chain — the shape this variant exists for) or
-        // matches whatever single contract shares its strike and style, with `n`
-        // read and then ignored. Both are wrong, so it is rejected up front.
-        let mut relative = leg(510_000, OptionStyle::Call, Side::Short, EXP_NS);
-        relative.expiration = ExpirationDate::Days(pos(dec!(30)));
+    fn test_leg_set_relative_expiry_resolves_to_the_same_contract_as_the_absolute_one() {
+        // The property the variant is for: `Days(n)` means n days past the tape
+        // anchor. The snapshot's ts IS `ts_0` at entry (one-shot at step 0), and
+        // EXP_NS is TS_NS + 30 days, so `Days(30)` must open exactly what the
+        // resolved spec opens.
+        let opened = |expiration: ExpirationDate, seed: u64| -> Vec<i64> {
+            let mut rng = ChaCha8Rng::seed_from_u64(seed);
+            let snap = multi_expiry_snapshot(0);
+            let mut ctx = ChainContext {
+                snapshot: &snap,
+                open: &[],
+                pending: &[],
+                marks: &NO_MARKS,
+                rng: &mut rng,
+                step: StepIndex::new(0),
+            };
+            let mut spec_leg = leg(510_000, OptionStyle::Call, Side::Short, EXP_NS);
+            spec_leg.expiration = expiration;
+            let Ok(mut strategy) = LegSetStrategy::from_spec(
+                &leg_set_spec_from(vec![spec_leg]),
+                ExitPolicy::Expiration,
+            ) else {
+                panic!("the leg set strategy must build from its spec");
+            };
+            let mut out = Vec::new();
+            assert!(matches!(strategy.on_start(&mut ctx, &mut out), Ok(())));
+            out.iter()
+                .map(|cmd| {
+                    let OrderCommand::Submit(intent) = cmd else {
+                        panic!("entry emits Submit intents");
+                    };
+                    let Ok(ns) = intent.contract.expiration_ns() else {
+                        panic!("the opened contract carries a resolved expiry");
+                    };
+                    ns
+                })
+                .collect()
+        };
+
+        let absolute = opened(
+            ExpirationDate::DateTime(DateTime::from_timestamp_nanos(EXP_NS)),
+            130,
+        );
+        let relative = opened(ExpirationDate::Days(pos(dec!(30))), 131);
+        assert_eq!(absolute, vec![EXP_NS], "the absolute spec opens EXP_NS");
+        assert_eq!(
+            relative, absolute,
+            "a relative Days(30) leg opens the same contract as the resolved spec"
+        );
+    }
+
+    #[test]
+    fn test_leg_set_relative_expiry_reads_n_rather_than_ignoring_it() {
+        // The property the removed fallback violated: two different tenors must
+        // resolve to two DIFFERENT contracts, not to whichever quote happens to
+        // share the strike and style. The fixture chain quotes EXP_NS (+30d) and
+        // FAR_EXP_NS (+37d), so Days(30) matches and Days(37) matches a
+        // different contract — while Days(90) matches nothing and is typed.
+        let attempt = |days: rust_decimal::Decimal, seed: u64| {
+            let mut rng = ChaCha8Rng::seed_from_u64(seed);
+            let snap = multi_expiry_snapshot(0);
+            let mut ctx = ChainContext {
+                snapshot: &snap,
+                open: &[],
+                pending: &[],
+                marks: &NO_MARKS,
+                rng: &mut rng,
+                step: StepIndex::new(0),
+            };
+            let mut spec_leg = leg(510_000, OptionStyle::Call, Side::Short, EXP_NS);
+            spec_leg.expiration = ExpirationDate::Days(pos(days));
+            let Ok(mut strategy) = LegSetStrategy::from_spec(
+                &leg_set_spec_from(vec![spec_leg]),
+                ExitPolicy::Expiration,
+            ) else {
+                panic!("the leg set strategy must build from its spec");
+            };
+            let mut out = Vec::new();
+            let result = strategy.on_start(&mut ctx, &mut out);
+            result.map(|()| {
+                out.iter()
+                    .map(|cmd| {
+                        let OrderCommand::Submit(intent) = cmd else {
+                            panic!("entry emits Submit intents");
+                        };
+                        intent.contract.expiration_ns().unwrap_or_default()
+                    })
+                    .collect::<Vec<i64>>()
+            })
+        };
+
+        let near = attempt(dec!(30), 132);
+        let far = attempt(dec!(37), 133);
+        assert_eq!(near.as_deref().ok(), Some(&[EXP_NS][..]));
+        assert_eq!(far.as_deref().ok(), Some(&[FAR_EXP_NS][..]));
+        assert_ne!(
+            near.ok(),
+            far.ok(),
+            "a different tenor is a different contract"
+        );
+
+        // An unquoted tenor is a typed error, never a silent fill on a neighbour.
         assert!(matches!(
-            LegSetStrategy::from_spec(&leg_set_spec_from(vec![relative]), ExitPolicy::Expiration),
-            Err(BacktestError::Strategy(_))
+            attempt(dec!(90), 134),
+            Err(BacktestError::Execution(_))
         ));
     }
 

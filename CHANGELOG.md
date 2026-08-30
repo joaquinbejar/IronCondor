@@ -8,25 +8,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
+### Changed
 
-- **The `audit` gate is green again: `chacha20` 0.10.1 → 0.10.2 (#119).**
-  `chacha20 0.10.1` was **yanked** upstream, and `cargo audit --deny warnings`
-  counts a yanked crate as a denied warning, so the gate turned red on every
-  branch — `main` included — without anything in this repo changing. It reaches
-  `Cargo.lock` only transitively (`rand 0.10.2` via `rand_distr`/`optionstratlib`,
-  and via `quinn-proto` → `reqwest`). The fix is a lockfile bump and **not** a
-  suppression: no entry was added to `.cargo/audit.toml` or `deny.toml`, and the
-  lockfile moves exactly two lines (version + checksum) with nothing else
-  resolving differently.
+- **A leg set now resolves a relative `Days(n)` expiry instead of rejecting it
+  (#120).** #117 shipped a rejection, which was the honest short-term call: the
+  fallback it replaced silently filled a leg at whatever contract shared its
+  strike and style, with `n` read and then discarded. But the resolution rule
+  already existed and was already implemented — `data::convert::resolve_expiration`,
+  the same function the chain's own quotes go through — so `LegSetStrategy` now
+  calls it at entry against the tape anchor `ts_0`. `Days(n)` means what it says,
+  and within a leg set there is one matching mode rather than two: resolve, then
+  match the exact `ContractKey`, or a typed error.
 
-  Because `lockfile_sha256` is part of the build identity hashed into every
-  `run_id`, the bump moves the identity of all five frozen bundles, which are
-  re-blessed in the same commit. The change is **behaviour-neutral**, and that
-  was verified rather than asserted: across the 20 committed Parquet tables the
-  only column whose bytes moved is `fills.strategy_run_id`, and the only manifest
-  keys that changed are `run_id` and `lockfile_sha256`. `equity_curve`,
-  `positions` and `greeks_attribution` are byte-identical everywhere.
+  **The rule is not yet crate-wide**, and that is worth stating rather than
+  implying otherwise: the named kinds still match through `select_leg_quote`,
+  which is agnostic to the expiry form, so a relative expiry on an
+  `IronCondorSpec` is still read-and-discarded on a single-expiry chain and
+  unmatchable on a multi-expiry one. `IronCondorSpec::expiration` now says so.
+  Unifying the two would change the adapter's matching path and is deliberately
+  not folded into this change.
+
+  Entry for a leg set is now **`on_start`-only**. That is what makes the anchor
+  claim structural rather than a comment: the snapshot a relative expiry resolves
+  against is the one the loop opens with. `on_snapshot` no longer opens a leg set
+  — under the shipped driver it never did, since `on_start` either enters or
+  propagates — which removes the reach of a caller driving the public `Strategy`
+  seam directly, where a retried entry at step k would resolve `Days(30)` to
+  `ts_k + 30d` and, on a chain quoting several tenors, silently open a contract
+  the spec never named.
+
+  Correctness depends on entry being one-shot at step 0, so the snapshot it
+  resolves against is the anchor; that is stated in the code because it is
+  invisible at the call site. A relative spec and the resolved spec naming the
+  same position remain **different specs** with different `run_id`s — the
+  manifest records what it hashed — which is also why the canonical leg order is
+  taken over the spec as written.
+
 
 ### Added
 
@@ -83,6 +100,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `iron_condor_naive`, `short_strangle_naive`, `iron_condor_realistic` goldens
   and the shared conformance fixture are byte-unchanged: the variant is purely
   additive to what already ships (`docs/SEMVER.md`).
+
+### Fixed
+
+- **The `audit` gate is green again: `chacha20` 0.10.1 → 0.10.2 (#119).**
+  `chacha20 0.10.1` was **yanked** upstream, and `cargo audit --deny warnings`
+  counts a yanked crate as a denied warning, so the gate turned red on every
+  branch — `main` included — without anything in this repo changing. It reaches
+  `Cargo.lock` only transitively (`rand 0.10.2` via `rand_distr`/`optionstratlib`,
+  and via `quinn-proto` → `reqwest`). The fix is a lockfile bump and **not** a
+  suppression: no entry was added to `.cargo/audit.toml` or `deny.toml`, and the
+  lockfile moves exactly two lines (version + checksum) with nothing else
+  resolving differently.
+
+  Because `lockfile_sha256` is part of the build identity hashed into every
+  `run_id`, the bump moves the identity of all five frozen bundles, which are
+  re-blessed in the same commit. The change is **behaviour-neutral**, and that
+  was verified rather than asserted: across the 20 committed Parquet tables the
+  only column whose bytes moved is `fills.strategy_run_id`, and the only manifest
+  keys that changed are `run_id` and `lockfile_sha256`. `equity_curve`,
+  `positions` and `greeks_attribution` are byte-identical everywhere.
 
 ### Security
 
