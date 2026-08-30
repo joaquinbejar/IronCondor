@@ -42,6 +42,10 @@ fn ok_entry(entry: &BatchRunEntry) -> (&str, &Path) {
             ..
         } => (run_id.as_str(), Path::new(bundle_path)),
         BatchRunOutcome::Error { error } => panic!("expected an ok run, got error: {error}"),
+        // `BatchRunOutcome` is `#[non_exhaustive]` (#121), so a consumer outside
+        // the crate must handle a kind it was not compiled against. A test that
+        // asserts a specific outcome treats an unknown one as the failure it is.
+        other => panic!("expected an ok run, got an unknown outcome: {other:?}"),
     }
 }
 
@@ -156,6 +160,7 @@ fn test_batch_over_parquet_fans_out_to_verifiable_bundles_and_indexes_each() {
                 run_ids.push(run_id.clone());
             }
             BatchRunOutcome::Error { error } => panic!("run {i} failed: {error}"),
+            other => panic!("run {i} recorded an unknown outcome: {other:?}"),
         }
     }
 
@@ -448,6 +453,7 @@ fn test_batch_tampered_sha256_is_recorded_typed_error() {
             BatchRunOutcome::Ok { .. } => {
                 panic!("a tampered sha must be a recorded error, not a silent run")
             }
+            other => panic!("unknown batch outcome: {other:?}"),
         }
     }
     // #110: the materialise failure is cached per path as an error DESCRIPTOR,
@@ -459,6 +465,7 @@ fn test_batch_tampered_sha256_is_recorded_typed_error() {
         .map(|entry| match &entry.outcome {
             BatchRunOutcome::Error { error } => error,
             BatchRunOutcome::Ok { .. } => panic!("all outcomes are errors here"),
+            other => panic!("unknown batch outcome: {other:?}"),
         })
         .collect();
     let (Some(first), Some(second)) = (descriptors.first(), descriptors.get(1)) else {

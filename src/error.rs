@@ -15,6 +15,7 @@
 /// error types land at their seams (engine migration, chain conversion,
 /// Parquet feed) but always into one of these kinds.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum BacktestError {
     // domain / config
     /// A quantity of zero (or otherwise structurally invalid) was supplied.

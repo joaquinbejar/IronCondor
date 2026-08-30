@@ -24,6 +24,7 @@ use crate::error::BacktestError;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum ExecutionMode {
     /// Mid/spread reference fills with configured slippage and fees — fast
     /// iteration, no order book.
@@ -100,6 +101,7 @@ impl TradeId {
 /// `Side` alone cannot say this — a *buy* opens a long leg but also
 /// *closes* a short leg — so the action is explicit, never inferred.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum PositionAction {
     /// Create a new leg; the engine mints a `position_id`.
     Open,
@@ -111,6 +113,7 @@ pub enum PositionAction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum TimeInForce {
     /// Immediate-or-cancel.
     Ioc = 0,
@@ -227,6 +230,7 @@ impl TryFrom<OrderIntentWire> for OrderIntent {
 /// The strategy's per-step output — one deterministic ordered channel for
 /// new intents and control of its own resting orders.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum OrderCommand {
     /// Submit a new order.
     Submit(OrderIntent),

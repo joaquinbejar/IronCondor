@@ -11,8 +11,11 @@
 //!   `pub use` leaf, and every `pub` item (`fn` / `struct` / `enum` / `trait` /
 //!   `type` / `const` / `static`) declared at module level in `lib.rs` **and in
 //!   each module transitively reachable through a `pub mod`** (resolved from
-//!   `src/X.rs` / `src/X/mod.rs`), each annotated with its effective cfg feature
-//!   (or `default`). Because a `pub mod` re-exports every `pub` item beneath it
+//!   `src/X.rs` / `src/X/mod.rs`), **plus every public enum's variants** — each
+//!   annotated with its effective cfg feature (or `default`), a variant's own
+//!   `#[cfg]` included. Variants are tracked because adding one is a breaking
+//!   change for a downstream exhaustive `match`, and recording only the enum's
+//!   name let exactly that change land invisibly (#117/#121). Because a `pub mod` re-exports every `pub` item beneath it
 //!   under `ironcondor::<path>`, those items are part of the contract even when
 //!   they are not re-exported at the crate root — so the snapshot tracks them
 //!   too (that is the #44 gap the earlier lib.rs-only extractor missed).
@@ -231,13 +234,143 @@ fn capture_inline_body(lines: &[&str], start: usize) -> (String, usize) {
     while i < lines.len() {
         if lines[i] == "}" {
             i += 1;
-            break;
+            return (body, i);
         }
         body.push_str(dedent_one(lines[i]));
         body.push('\n');
         i += 1;
     }
-    (body, i)
+    // Reaching EOF means the assumed shape did not hold, and this scan has just
+    // swallowed every item to the end of the file — the failure mode that
+    // silently SHRINKS the snapshot. Be loud: a quietly missing item is exactly
+    // what this gate exists to prevent.
+    panic!(
+        "unterminated body opened at line {}: no column-0 `}}` before EOF \
+         (the capture would silently drop every later item)",
+        start + 1
+    );
+}
+
+/// Capture the body of a `pub enum` whose declaration opens at `lines[start]`,
+/// returning the dedented body and the index just past its closing brace, or
+/// `None` when the enum has **no** variants to scan.
+///
+/// Two shapes make this more than [`capture_inline_body`]:
+///
+/// - **The brace need not be on the declaration line.** rustfmt moves it to its
+///   own line as soon as a generic parameter list or a `where` clause wraps
+///   (`pub enum Wrapped<T>\nwhere\n    T: Clone,\n{`). Requiring `{` on the
+///   `pub enum` line recorded **zero** variants for such an enum, silently — the
+///   enum's own name still appeared, so nothing looked broken.
+/// - **An empty enum closes on its own line** (`pub enum Never {}`). Scanning
+///   from the next line for a column-0 `}` would run past it and swallow every
+///   item up to the next one, silently deleting unrelated entries from the
+///   snapshot.
+///
+/// The brace search is bounded to the declaration's own continuation lines —
+/// generics, `where` clauses — and stops at anything that cannot be one, so a
+/// malformed input yields `None` rather than consuming the rest of the file.
+fn capture_enum_body(lines: &[&str], start: usize) -> Option<(String, usize)> {
+    // Find the line carrying the opening brace: the declaration line itself, or
+    // one of its continuations.
+    let mut brace = start;
+    while brace < lines.len() && !lines[brace].contains('{') {
+        let line = lines[brace].trim();
+        let continuation = brace == start
+            || line.starts_with("where")
+            || line.ends_with(',')
+            || line.ends_with('>')
+            || line.ends_with('+');
+        if !continuation {
+            return None;
+        }
+        brace += 1;
+    }
+    let opening = lines.get(brace)?;
+    // The body opens and closes on this line: `pub enum Never {}`, or an inline
+    // `pub enum Inline { A, B }` (which `#[rustfmt::skip]` reaches). Take what
+    // sits between the braces — treating it as empty would drop `A` and `B` as
+    // silently as the runaway capture drops later items.
+    if let Some(open_at) = opening.find('{')
+        && let Some(close_at) = opening.rfind('}')
+        && close_at > open_at
+    {
+        let inner = opening
+            .get(open_at + 1..close_at)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        // One variant per comma, each on its own line, so `enum_variants` sees
+        // the same column-0 shape it sees for a multi-line body.
+        let body = inner
+            .split(',')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Some((body, brace + 1));
+    }
+    Some(capture_inline_body(lines, brace))
+}
+
+/// The variants of an enum body captured by [`capture_enum_body`] (one dedent
+/// already applied, so a variant sits at column 0 and a struct-variant's own
+/// fields stay indented), each paired with its **effective feature**.
+///
+/// A variant is a column-0 line whose first character is an ASCII uppercase
+/// letter. Nothing else at column 0 can be — not an attribute (`#[…]`), a doc
+/// comment (`///`), a field, or a closing brace — but the converse does not
+/// hold: a raw identifier (`r#Type`) or a variant starting with a non-ASCII
+/// uppercase letter is **not** matched. Neither exists in this crate, and
+/// `test_every_public_enum_records_at_least_one_variant` fails loudly if one
+/// ever leaves an enum with no recorded variants. The name is then
+/// [`leading_ident`], which stops at the first character that is neither
+/// alphanumeric nor `_`, so tuple, struct-like and discriminant forms all yield
+/// the bare name.
+///
+/// A variant may carry its **own** `#[cfg(feature = "…")]` on top of the enum's
+/// — `DataSourceSpec::Simulator` and `FeedKind::Simulator` both do — so the same
+/// `pending_feature` rule [`extract_module`] applies to items applies here: a
+/// cfg attaches to the next variant and combines with `base`. Without it the
+/// snapshot would claim a gated variant exists by default and, in the direction
+/// that actually matters, moving an existing variant BEHIND a `#[cfg]` (breaking
+/// under default features) would not move the snapshot at all.
+fn enum_variants(body: &str, base: &str) -> Vec<(String, String)> {
+    let base_feature = feature_to_opt(base);
+    let mut pending: Option<String> = None;
+    let mut out = Vec::new();
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("#[cfg(feature") {
+            if let Some(feature) = feature_of(trimmed) {
+                pending = Some(feature);
+            }
+            continue;
+        }
+        // A struct-variant's fields are indented; blank, attribute and comment
+        // lines keep a pending cfg, which attaches to the next variant.
+        if line.starts_with(|c: char| c.is_whitespace())
+            || trimmed.is_empty()
+            || trimmed.starts_with('#')
+            || trimmed.starts_with("//")
+        {
+            continue;
+        }
+        if !line.starts_with(|c: char| c.is_ascii_uppercase()) {
+            // Punctuation (a closing brace) ends a pending cfg's reach.
+            pending = None;
+            continue;
+        }
+        let name = leading_ident(line);
+        if !name.is_empty() {
+            out.push((
+                combine_feature(base_feature.as_deref(), pending.as_deref()),
+                name,
+            ));
+        }
+        pending = None;
+    }
+    out
 }
 
 /// Extract the public surface declared **directly** in one module's text.
@@ -245,11 +378,13 @@ fn capture_inline_body(lines: &[&str], start: usize) -> (String, usize) {
 /// `prefix` is the module's path prefix (`""` for `lib.rs`, `"engine::"` for
 /// `src/engine/mod.rs`, …) and `base_feature` the cfg feature it inherits.
 /// Records every `pub mod`, `pub use` leaf, and tracked `pub` item, each tagged
-/// with its effective feature; inline `pub mod X { … }` bodies are extracted in
+/// with its effective feature, **plus every public enum's variants** (an added
+/// variant is a breaking change for a downstream exhaustive `match`, so it has
+/// to be visible in the diff). Inline `pub mod X { … }` bodies are extracted in
 /// place (recursively), while file-based `pub mod X;` declarations are returned
-/// as [`ChildMod`]s for the driver to read and recurse into. Only column-0
-/// (module-level) lines are items, so struct fields and `impl` methods — always
-/// indented in rustfmt'd code — are excluded. Returns the sorted
+/// as [`ChildMod`]s for the driver to read and recurse into. Apart from those
+/// variants, only column-0 (module-level) lines are items, so struct fields and
+/// `impl` methods — always indented in rustfmt'd code — are excluded. Returns the sorted
 /// `"<feature> <kind> <path>"` lines plus the file-based children.
 fn extract_module(
     text: &str,
@@ -330,6 +465,24 @@ fn extract_module(
         // Any other tracked `pub` item (fn / struct / enum / trait / type / …).
         if let Some((kind, name)) = item_kind_and_name(line) {
             out.insert(format!("{effective} {kind} {prefix}{name}"));
+            // An enum's VARIANTS are part of the surface too: adding one is a
+            // breaking change for a downstream exhaustive `match`, and tracking
+            // only the enum's name made exactly that change invisible to this
+            // gate (#117 added `StrategySpec::Legs` without moving the snapshot
+            // by one line). Variants are indented, so the module-level scan
+            // above skips them; capture the body and record them explicitly.
+            if kind == "enum"
+                && let Some((body, next)) = capture_enum_body(&lines, i)
+            {
+                for (variant_feature, variant) in enum_variants(&body, &effective) {
+                    out.insert(format!(
+                        "{variant_feature} variant {prefix}{name}::{variant}"
+                    ));
+                }
+                pending_feature = None;
+                i = next;
+                continue;
+            }
             pending_feature = None;
             i += 1;
             continue;
@@ -608,6 +761,183 @@ pub use execution::RealisticFill;
     }
 
     #[test]
+    fn test_extract_module_records_every_variant_form() {
+        // The gate exists because an added variant is breaking for a downstream
+        // exhaustive `match` and was previously invisible here (#117 added
+        // `StrategySpec::Legs` without moving this snapshot by one line). Every
+        // variant shape must be recorded: unit, tuple, struct-like, and one
+        // carrying an explicit discriminant.
+        let src = "\
+pub enum Shape {
+    /// A unit variant.
+    Unit,
+    Tuple(u8, String),
+    #[serde(rename = \"renamed\")]
+    Struct {
+        field: u8,
+        other: u8,
+    },
+    Discriminant = 7,
+}
+";
+        let (out, _children) = extract_module(src, "domain::", None);
+        for variant in ["Unit", "Tuple", "Struct", "Discriminant"] {
+            assert!(
+                out.contains(&format!("default variant domain::Shape::{variant}")),
+                "{variant} must be recorded: {out:?}"
+            );
+        }
+        // A struct-like variant's own FIELDS are one level deeper, so they are
+        // not variants and must not leak in.
+        assert!(
+            !out.iter()
+                .any(|l| l.contains("field") || l.contains("other")),
+            "variant fields are not surface items: {out:?}"
+        );
+        // The enum itself is still recorded alongside its variants.
+        assert!(out.contains("default enum domain::Shape"));
+    }
+
+    #[test]
+    fn test_extract_module_variants_inherit_the_enum_feature() {
+        // A cfg-gated enum's variants carry the same feature tag, so a
+        // feature-gated surface change is as visible as a default one.
+        let src = "\
+#[cfg(feature = \"simulator\")]
+pub enum Gated {
+    One,
+    Two,
+}
+";
+        let (out, _children) = extract_module(src, "data::", None);
+        assert!(
+            out.contains("simulator variant data::Gated::One"),
+            "{out:?}"
+        );
+        assert!(
+            out.contains("simulator variant data::Gated::Two"),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn test_every_public_enum_records_at_least_one_variant() {
+        // The backstop for the whole silent-miss class. Every failure found in
+        // review — a wrapped brace, a single-line body, a runaway capture —
+        // showed up the same way: the enum's own name was recorded and its
+        // variants were not, so the snapshot looked healthy while a breaking
+        // change slipped past. An enum with zero variants is either uninhabited
+        // or a parse failure, and this repo has none of the former, so demand
+        // one either way and the next member of the class fails CI loudly.
+        let surface = extract_tree(&crate_root().join("src"));
+        let mut missing = Vec::new();
+        for line in &surface {
+            let Some((feature, rest)) = line.split_once(' ') else {
+                continue;
+            };
+            let Some(path) = rest.strip_prefix("enum ") else {
+                continue;
+            };
+            let variant_prefix = format!("{feature} variant {path}::");
+            if !surface.iter().any(|l| l.starts_with(&variant_prefix)) {
+                missing.push(line.clone());
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "these enums recorded no variants — either they are uninhabited (add \
+             them to this test as a documented exception) or the extractor failed \
+             to parse them, which would silently hide a breaking change: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn test_extract_module_variant_carries_its_own_cfg() {
+        // A variant may be gated INDEPENDENTLY of its enum — `DataSourceSpec::Simulator`
+        // and `FeedKind::Simulator` both are. Recording it as `default` would
+        // claim it exists in the default surface; worse, the inverse (moving an
+        // existing variant BEHIND a cfg, which is breaking under default
+        // features) would not move the snapshot at all.
+        let src = "\
+pub enum Kind {
+    Always,
+    #[cfg(feature = \"simulator\")]
+    Gated,
+    AlsoAlways,
+}
+";
+        let (out, _children) = extract_module(src, "data::", None);
+        assert!(
+            out.contains("default variant data::Kind::Always"),
+            "{out:?}"
+        );
+        assert!(
+            out.contains("simulator variant data::Kind::Gated"),
+            "{out:?}"
+        );
+        assert!(
+            !out.contains("default variant data::Kind::Gated"),
+            "a gated variant must not be recorded as default: {out:?}"
+        );
+        // The cfg attaches to the NEXT variant only.
+        assert!(
+            out.contains("default variant data::Kind::AlsoAlways"),
+            "a cfg must not leak onto the following variant: {out:?}"
+        );
+    }
+
+    #[test]
+    fn test_extract_module_records_variants_when_the_brace_wraps() {
+        // rustfmt moves the brace to its own line as soon as generics or a
+        // `where` clause wrap. Requiring `{` on the `pub enum` line recorded
+        // ZERO variants for such an enum, silently — the enum's own name still
+        // appeared, so nothing looked broken.
+        let src = "\
+pub enum Wrapped<T>
+where
+    T: Clone,
+{
+    Alpha(T),
+    Beta,
+}
+pub fn after() {}
+";
+        let (out, _children) = extract_module(src, "engine::", None);
+        assert!(
+            out.contains("default variant engine::Wrapped::Alpha"),
+            "{out:?}"
+        );
+        assert!(
+            out.contains("default variant engine::Wrapped::Beta"),
+            "{out:?}"
+        );
+        assert!(out.contains("default fn engine::after"), "{out:?}");
+    }
+
+    #[test]
+    fn test_extract_module_empty_enum_does_not_swallow_later_items() {
+        // `pub enum Never {}` closes on its own line. Scanning from the next
+        // line for a column-0 `}` would run past it and swallow every item up to
+        // the next one, silently DELETING unrelated entries from the snapshot.
+        let src = "\
+pub enum Never {}
+pub struct Survivor {
+    field: u8,
+}
+pub fn also_survives() {}
+";
+        let (out, _children) = extract_module(src, "domain::", None);
+        assert!(out.contains("default enum domain::Never"), "{out:?}");
+        assert!(
+            !out.iter()
+                .any(|l| l.starts_with("default variant domain::Never")),
+            "an empty enum has no variants: {out:?}"
+        );
+        assert!(out.contains("default struct domain::Survivor"), "{out:?}");
+        assert!(out.contains("default fn domain::also_survives"), "{out:?}");
+    }
+
+    #[test]
     fn test_extract_module_captures_pub_items_with_prefix() {
         let src = "\
 pub struct Foo {
@@ -638,6 +968,8 @@ pub type Alias = u8;
         );
         // Struct fields are indented, so they never appear.
         assert!(!out.iter().any(|l| l.contains("field")));
+        // An enum's variants ARE recorded (#121).
+        assert!(out.contains("default variant engine::Bar::A"), "{out:?}");
     }
 
     #[test]

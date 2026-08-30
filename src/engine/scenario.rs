@@ -27,6 +27,7 @@ use crate::error::BacktestError;
 /// Migrated verbatim from OptionStratBacktest's `ScenarioType`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum ScenarioType {
     /// Standard Monte Carlo sweep over independently seeded runs.
     MonteCarlo = 0,
@@ -191,6 +192,7 @@ pub fn child_data_seed(base_seed: u64, index: u32) -> u64 {
 /// Parameters are `Decimal` (the repo numeric type); [`Self::to_method_json`]
 /// converts each to the wire's `f64` at the single conversion point.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum WalkPreset {
     /// Standard Brownian motion.
     Brownian {

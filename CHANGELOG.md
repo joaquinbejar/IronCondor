@@ -43,6 +43,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   same position remain **different specs** with different `run_id`s — the
   manifest records what it hashed — which is also why the canonical leg order is
   taken over the spec as written.
+- **Every public enum is `#[non_exhaustive]`, and the surface gate now sees
+  variants (#121).** Adding a variant to a public enum is formally breaking for a
+  downstream exhaustive `match`, and **no gate caught it**: the surface snapshot
+  recorded item *names*, so `StrategySpec` appeared as a bare enum and #117's
+  `StrategySpec::Legs` — precisely the breaking part — never showed up in its
+  surface diff. The `CHANGELOG` entry was its only record.
+
+  Both ends are closed. All 15 public enums (`StrategySpec`, `DataSourceSpec`,
+  `ScenarioType`, `WalkPreset`, `BatchRunOutcome`, `SlippageModel`, `TouchSize`,
+  `FeedKind`, `ExecutionMode`, `OrderCommand`, `PositionAction`, `TimeInForce`,
+  `Event`, `BacktestError`, and `SessionState` under `simulator`) are
+  `#[non_exhaustive]`, so a future variant is no longer breaking downstream; and
+  the extractor in `tests/surface.rs` records each enum's variants as
+  `<feature> variant <path>::<Enum>::<Variant>`, adding 61 lines to the committed
+  snapshot, so the next added variant fails CI until the snapshot moves with it.
+  Unit tests pin every variant shape — unit, tuple, struct-like, explicit
+  discriminant — that a variant carries its **own** `#[cfg]` when it has one
+  (`DataSourceSpec::Simulator` and `FeedKind::Simulator` do), that an enum whose
+  brace wraps onto its own line after generics or a `where` clause still records
+  its variants, and that an empty enum does not swallow the items after it. Each
+  of those was a **silent** miss: the enum's own name still appeared, so nothing
+  in the snapshot looked broken while a breaking change slipped past. A
+  single-line body (`pub enum Inline { A, B }`, reachable through
+  `#[rustfmt::skip]`) is parsed rather than treated as empty, for the same
+  reason. Two backstops turn the whole class into a loud CI failure instead of a
+  quietly shrinking snapshot: the capture **panics** if it reaches EOF without a
+  closing brace — the shape that swallows later items — and a test asserts every
+  recorded enum has at least one recorded variant.
+
+  `#[non_exhaustive]` is itself breaking for a downstream exhaustive `match`,
+  which the pre-`v1.0.0` window admits in a minor bump — and is exactly why it is
+  cheap now and expensive after the 1.0 freeze. Inside this repo the whole
+  fallout was four `match`es on `BatchRunOutcome` in `tests/scenario_batch.rs`,
+  which is an external crate to the library and now handles the unknown case.
 
 
 ### Added

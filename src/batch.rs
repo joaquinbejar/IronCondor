@@ -182,6 +182,7 @@ pub struct BatchRunEntry {
 /// it records it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum BatchRunOutcome {
     /// The run completed and its bundle was written.
     Ok {

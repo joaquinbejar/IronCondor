@@ -70,6 +70,7 @@ use crate::domain::{PriceCents, Quantity, Underlying};
 /// through the **unchanged** generic `OptStratAdapter`; [`StrategySpec::Legs`]
 /// adds an explicit leg set, the shape no named upstream constructor covers.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum StrategySpec {
     /// A four-leg iron condor — the strategy the crate is named for.
     IronCondor(IronCondorSpec),

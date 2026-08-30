@@ -43,6 +43,7 @@ pub struct FeeSchedule {
 /// entirely: its slippage is an emergent property of the order book.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "model", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum SlippageModel {
     /// No slippage — fills at the reference price.
     None,
@@ -73,6 +74,7 @@ pub enum SlippageModel {
 /// features (reproducibility).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum TouchSize {
     /// Touch size = the quote's own size for that side: `bid_size` for the bid
     /// touch, `ask_size` for the ask touch. The default — it tracks the actual
