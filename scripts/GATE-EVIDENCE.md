@@ -15,7 +15,8 @@ The gates and their scripts:
 | H3 conversion | `scripts/linearity_gate.sh` | H3+H4 linearity gate | per-contract cost ratio (16× sweep) | **≤ 4.0×** |
 | H4 bundle writer | `scripts/linearity_gate.sh` | H3+H4 linearity gate | per-row cost ratio (128× sweep) | **≤ 2.0×** |
 | H5 PyO3 boundary | `scripts/pyo3_gate.sh` | H5 marshal-ratio gate | full/single marshal ratio p50 | **[8×, 32×]** |
-| PB-1 zero-alloc | `cargo test --test zero_alloc` | PB-1 reaffirmation | per-step alloc-event delta warmup→last | **must be 0** (canonical gate = `zero-alloc` job) |
+| PB-1 zero-alloc | `cargo test --test zero_alloc` | PB-1 reaffirmation | naive per-step alloc-event delta warmup→last | **must be 0** (canonical gate = `zero-alloc` job) |
+| PB-3 realistic allocation | `cargo test --features orderbook --test zero_alloc` | — (canonical gate = `zero-alloc` job) | realistic per-warm-step alloc-event count, and its growth across the tail | **ceiling 705 events/warm step** + **one-sided linearity ≤ 2 %** |
 
 **Every gate is baseline-relative — no absolute-number threshold** except the one
 documented `#29` coarse naive ceiling (a catastrophic-only backstop, ~45× the M4
@@ -180,8 +181,38 @@ Override control: a forced ratio of `99` FAILs (ceiling), `3` FAILs (floor),
 ## PB-1 — zero-alloc replay-loop gate (reaffirmation)
 
 Not re-implemented here. The canonical hard gate is the separate `zero-alloc` CI
-job (`cargo test --test zero_alloc`, 4/4 including the negative test that a single
-injected `Vec` allocation in the step body yields a non-zero tail delta — BENCH.md
-§H1/PB-1). The `bench-gate` job **reaffirms** it by re-running the same test in
-the perf-gate stage, so the zero-steady-state-allocation invariant fails the build
-alongside the percentile/linearity gates. Baseline: 4 passed.
+job (`cargo test --test zero_alloc`, **4/4 with default features**; **8/8 under
+`--features orderbook`**, which adds the realistic-mode section below — including
+the two negative probes). The "must be 0" quantity is **naive mode only**: it is
+the negative test that a single injected `Vec` allocation in the step body yields
+a non-zero tail delta (BENCH.md §H1/PB-1). The `bench-gate` job **reaffirms** the
+naive invocation by re-running the same test in the perf-gate stage, so the
+zero-steady-state-allocation invariant fails the build alongside the
+percentile/linearity gates. Baseline: 4 passed (default), 8 passed (`orderbook`).
+
+---
+
+## PB-3 — realistic-mode per-step allocation gate (#127)
+
+Not re-implemented here either: it lives in the same `tests/zero_alloc.rs`, behind
+`#[cfg(feature = "orderbook")]`, and the canonical gate is the `zero-alloc` CI
+job's second invocation, `cargo test --features orderbook --test zero_alloc`.
+
+Realistic fills route every order through the upstream matching engine, so the
+warm step allocates **by construction** and **cannot** be gated at zero. It is
+gated at a **measured ceiling** instead — 705 allocation events per warm step, the
+measured ≈ 564 plus 25 % headroom — together with a **one-sided linearity** check
+that the second half of the warm window exceeds the first by at most 2 %. The
+check is one-sided because a shrinking second window is never a leak; see
+BENCH.md §H2/PB-3 "Per-step allocation" for the measurement and the derivation.
+
+**Fail-closed evidence — two negative probes, one per assertion:**
+
+| Probe | Injected per step | Observed | Assertion it breaks |
+|-------|-------------------|----------|---------------------|
+| `BadStepMany` | constant 400 allocations (≈ 2.8× the headroom) | tail delta far above the 38 775 ceiling | the ceiling |
+| `BadStepGrowing` | `8 × step_index` allocations (a leak's shape) | second window 5635–5645 above the first vs a 399–400 tolerance, ~14× | the one-sided linearity check |
+
+Baseline: **8 passed** (`cargo test --features orderbook --test zero_alloc`) —
+the 4 naive tests plus the realistic ceiling, the realistic linearity check, and
+the two negative probes above.

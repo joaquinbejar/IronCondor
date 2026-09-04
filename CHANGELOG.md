@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Realistic-mode per-step allocation is now gated.** `tests/zero_alloc.rs`
+- **Realistic-mode per-step allocation is now gated (#127).** `tests/zero_alloc.rs`
   gained an `orderbook`-gated `realistic` module that drives the same harness
   with `RealisticFill` instead of `NaiveFill`. Realistic fills route through the
   upstream matching engine, so their warm step cannot be zero-allocation; it is
@@ -20,7 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   2 %, so a per-step leak fails the build even though the absolute count is
   non-zero. The check is one-sided because the measured second window sits
   2.5 % *below* the first from the book's warm-up decay; bounding that direction
-  too would both mask a leak and false-fire on slower hardware. Two negative
+  too would both mask a leak and false-fire wherever that decay runs longer. Two negative
   tests prove the gate bites: a constant 400 allocations per step breaks the
   ceiling, and an allocation count growing with the step index breaks the
   linearity check. The `zero-alloc` CI job now runs the file twice, with and
