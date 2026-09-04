@@ -1,6 +1,6 @@
 [package]
 name = "ironcondor"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 authors = ["Joaquin Bejar <jb@taunais.com>"]
 description = "High-performance backtesting engine for options trading strategies with order-book-level fill simulation. Built on OptionStratLib."
@@ -10,7 +10,11 @@ repository = "https://github.com/joaquinbejar/IronCondor"
 homepage = "https://github.com/joaquinbejar/IronCondor"
 keywords = ["finance", "options", "trading", "backtesting", "quant"]
 categories = ["finance", "simulation"]
-include = ["src/**/*", "Cargo.toml", "README.md", "LICENSE"]
+# Anchored (leading `/`): an unanchored "README.md" matched every README at any
+# depth — the gitignored docs/ and milestones/ ones and python/.pytest_cache —
+# and packaged 12 of them into the crate (and tripped cargo's dirty check on
+# files git does not even track). Only the crate root README belongs here.
+include = ["src/**/*", "Cargo.toml", "/README.md", "/LICENSE"]
 
 [lib]
 name = "ironcondor"
