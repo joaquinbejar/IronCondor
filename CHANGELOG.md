@@ -8,6 +8,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Every byte-affecting Parquet writer setting is now pinned explicitly.**
+  `writer_properties()` pinned only the compression codec and `created_by`,
+  so the rest of the bundle's byte layout rode on the `parquet` crate's
+  defaults: a minor upgrade that changed the non-dictionary encoding, a page
+  limit or the statistics level would have moved the bundle bytes with no diff
+  in this repository, which is not what "pinned writer settings" promises in
+  the determinism contract. The writer now names every setting that affects
+  the byte layout, each set to **the value the goldens were blessed with** —
+  writer version `PARQUET_1_0`, dictionary on with an explicit `PLAIN`
+  non-dictionary encoding, the dictionary and data page size limits, the data
+  page row-count limit, the parquet write batch size, the row-group limits,
+  page-level statistics with the 64-byte truncation lengths, page-header
+  statistics and bloom filters off, the offset index on, Arrow type coercion
+  off, `path_in_schema` written, and content-defined chunking off. For all but
+  two of those the blessed value is also the current crate default, so pinning
+  them is byte-neutral; the codec (`SNAPPY` against a default of
+  `UNCOMPRESSED`) and `created_by` (a fixed string against a default of the
+  `parquet` version string) are **intentional non-defaults** and were already
+  pinned before this change. The bloom-filter position and the Data Page v2
+  compression-ratio threshold are deliberately not pinned: neither is
+  reachable with bloom filters off and writer version 1.0.
+
+  Two further inputs are now pinned that are not `WriterProperties` at all.
+  The writer moved from `ArrowWriter::try_new` to `try_new_with_options` to
+  reach them: whether the `ARROW:schema` footer entry is written, and the
+  Parquet schema root name (`arrow_schema`). Both are pinned at the current
+  `parquet` defaults, so the move is byte-neutral. One residue remains and is
+  now named rather than unnoticed: the *value* of `ARROW:schema` is the base64
+  Arrow IPC schema produced by the `arrow` crate, so it moves with an `arrow`
+  bump and is held by the lockfile alone. The crate-owned 8192-row Arrow batch
+  size belongs to the same set and is documented as byte-affecting, since the
+  page-size limits are re-checked once per 1024-row mini-batch within each
+  call.
+
+  **No bundle byte moved**: all five golden suites pass unchanged without
+  `BLESS=1`, which is the proof the pins equal the blessed values. Two new
+  unit tests guard the pin. One reads every pinned property back off the built
+  properties, so a renamed setter breaks the build and a changed default fails
+  the test. The other writes a two-column fixture — a `Utf8` column whose
+  dictionary deliberately overflows the 1 MiB limit at 1.68 MiB, and a
+  `Boolean` column that never dictionary-encodes — and asserts `PLAIN` in both
+  of its roles (fallback and primary encoder), the presence of the
+  `ARROW:schema` entry and the pinned schema root, and a frozen SHA-256 of the
+  file held to the same regime as the committed goldens. Documented in
+  `docs/02-engine-architecture.md` §7, `docs/05-analytics-and-reporting.md`
+  §11, and a new `docs/SEMVER.md` clause covering "Parquet byte layout moved,
+  schema unchanged". (#131)
 ### Added
 
 - **`release.yml` can rebuild and publish an existing tag by manual dispatch.**
