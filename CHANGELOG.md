@@ -10,74 +10,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **A leg set now resolves a relative `Days(n)` expiry instead of rejecting it
-  (#120).** #117 shipped a rejection, which was the honest short-term call: the
-  fallback it replaced silently filled a leg at whatever contract shared its
-  strike and style, with `n` read and then discarded. But the resolution rule
-  already existed and was already implemented — `data::convert::resolve_expiration`,
-  the same function the chain's own quotes go through — so `LegSetStrategy` now
-  calls it at entry against the tape anchor `ts_0`. `Days(n)` means what it says,
-  and within a leg set there is one matching mode rather than two: resolve, then
-  match the exact `ContractKey`, or a typed error.
+- **Every direct dependency at its latest stable, `optionstratlib` 0.18 → 0.21
+  (2026-09-04).** The refresh moves seven direct requirements across a
+  semver-incompatible boundary — `optionstratlib` 0.18 → 0.21, `rand_chacha`
+  0.3 → 0.10, `sha2` 0.10 → 0.11, `reqwest` 0.12 → 0.13,
+  `option-chain-orderbook` 0.9 → 0.10, and the dev-only `positive` 0.5 → 0.6
+  and `criterion` 0.5 → 0.8 — plus 191 lockfile entries within their existing
+  ranges (`arrow`/`parquet` 59.1 → 59.3 among them). Each bump carries a dated
+  audit note in `Cargo.toml` (what, why, licence, gates), and each claim below
+  was measured rather than assumed:
 
-  **The rule is not yet crate-wide**, and that is worth stating rather than
-  implying otherwise: the named kinds still match through `select_leg_quote`,
-  which is agnostic to the expiry form, so a relative expiry on an
-  `IronCondorSpec` is still read-and-discarded on a single-expiry chain and
-  unmatchable on a multi-expiry one. `IronCondorSpec::expiration` now says so.
-  Unifying the two would change the adapter's matching path and is deliberately
-  not folded into this change.
-
-  Entry for a leg set is now **`on_start`-only**. That is what makes the anchor
-  claim structural rather than a comment: the snapshot a relative expiry resolves
-  against is the one the loop opens with. `on_snapshot` no longer opens a leg set
-  — under the shipped driver it never did, since `on_start` either enters or
-  propagates — which removes the reach of a caller driving the public `Strategy`
-  seam directly, where a retried entry at step k would resolve `Days(30)` to
-  `ts_k + 30d` and, on a chain quoting several tenors, silently open a contract
-  the spec never named.
-
-  Correctness depends on entry being one-shot at step 0, so the snapshot it
-  resolves against is the anchor; that is stated in the code because it is
-  invisible at the call site. A relative spec and the resolved spec naming the
-  same position remain **different specs** with different `run_id`s — the
-  manifest records what it hashed — which is also why the canonical leg order is
-  taken over the spec as written.
-- **Every public enum is `#[non_exhaustive]`, and the surface gate now sees
-  variants (#121).** Adding a variant to a public enum is formally breaking for a
-  downstream exhaustive `match`, and **no gate caught it**: the surface snapshot
-  recorded item *names*, so `StrategySpec` appeared as a bare enum and #117's
-  `StrategySpec::Legs` — precisely the breaking part — never showed up in its
-  surface diff. The `CHANGELOG` entry was its only record.
-
-  Both ends are closed. All 15 public enums (`StrategySpec`, `DataSourceSpec`,
-  `ScenarioType`, `WalkPreset`, `BatchRunOutcome`, `SlippageModel`, `TouchSize`,
-  `FeedKind`, `ExecutionMode`, `OrderCommand`, `PositionAction`, `TimeInForce`,
-  `Event`, `BacktestError`, and `SessionState` under `simulator`) are
-  `#[non_exhaustive]`, so a future variant is no longer breaking downstream; and
-  the extractor in `tests/surface.rs` records each enum's variants as
-  `<feature> variant <path>::<Enum>::<Variant>`, adding 61 lines to the committed
-  snapshot, so the next added variant fails CI until the snapshot moves with it.
-  Unit tests pin every variant shape — unit, tuple, struct-like, explicit
-  discriminant — that a variant carries its **own** `#[cfg]` when it has one
-  (`DataSourceSpec::Simulator` and `FeedKind::Simulator` do), that an enum whose
-  brace wraps onto its own line after generics or a `where` clause still records
-  its variants, and that an empty enum does not swallow the items after it. Each
-  of those was a **silent** miss: the enum's own name still appeared, so nothing
-  in the snapshot looked broken while a breaking change slipped past. A
-  single-line body (`pub enum Inline { A, B }`, reachable through
-  `#[rustfmt::skip]`) is parsed rather than treated as empty, for the same
-  reason. Two backstops turn the whole class into a loud CI failure instead of a
-  quietly shrinking snapshot: the capture **panics** if it reaches EOF without a
-  closing brace — the shape that swallows later items — and a test asserts every
-  recorded enum has at least one recorded variant.
-
-  `#[non_exhaustive]` is itself breaking for a downstream exhaustive `match`,
-  which the pre-`v1.0.0` window admits in a minor bump — and is exactly why it is
-  cheap now and expensive after the 1.0 freeze. Inside this repo the whole
-  fallout was four `match`es on `BatchRunOutcome` in `tests/scenario_batch.rs`,
-  which is an external crate to the library and now handles the unknown case.
-
+  - **No table value moved.** All 20 committed Parquet tables were decoded and
+    compared column by column before and after the re-bless: the only column
+    whose bytes changed is `fills.strategy_run_id`; `equity_curve`, `positions`
+    and `greeks_attribution` are byte-identical in every scenario and in the
+    shared conformance fixture. The lockfile bump moves `lockfile_sha256` and
+    therefore every `run_id`, which is why the five frozen bundles are
+    re-blessed — the sanctioned identity-only event.
+  - **`manifest.metrics` changed wire TYPE, not value.** `optionstratlib` 0.21
+    serialises some `backtesting` fields as strings where 0.18 wrote JSON
+    numbers (drawdown durations, holding periods, and the `volatility` /
+    `downside_deviation` ratios). Across the five manifests that is 50 leaf
+    fields: 40 integers now written as the same integer in a string, 10 floats
+    now written as the same value in `Decimal` form (equal to 1e-15). `metrics`
+    is versioned-opaque to consumers by contract ([05 §12.5](docs/05-analytics-and-reporting.md#125-equality-oracle-and-the-metrics-clause)),
+    and ChainView holds it as an opaque `serde_json::Value` excluded from its
+    equality oracle, so no consumer parses those fields; the change is
+    announced here so it is a known fact, not a surprise.
+  - **The seeded RNG stream is identical.** `rand_chacha` 0.10's
+    `seed_from_u64` + `next_u64` produce the same stream as 0.3 (probed: the
+    same four `u64`s for seed 42), so no seeded output moves; `rand_core` 0.10
+    renamed `RngCore` → `Rng`, a two-import change.
+  - **Every `optionstratlib` symbol this crate uses exists unchanged**, with
+    `IronCondor::new` / `ShortStrangle::new` arities identical; `ExpirationDate`
+    0.3's serde form is unchanged (its only diff is a `Positive` API call); and
+    `option-chain-orderbook` 0.10.0's `book.rs` is byte-identical to 0.9.1.
+  - **The `orderbook` shim stays, moved 0.17 → 0.18.** `option-chain-orderbook`
+    0.10.0 still pins `optionstratlib ^0.18`, so the resolver keeps two copies
+    (and two of `positive`, `expiration_date`, `option_type`, `rand_chacha`
+    beneath them); the 30 `duplicate` warnings `cargo deny` prints are that tree.
+    Retiring it needs `option-chain-orderbook` to republish on 0.21.
+  - **`reqwest` 0.13 renamed the feature `rustls-tls` → `rustls`.**
 
 ### Added
 
@@ -156,6 +129,83 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `positions` and `greeks_attribution` are byte-identical everywhere.
 
 ### Security
+
+- **Zero ignored advisories.** Both long-standing `cargo audit` / `cargo deny`
+  ignores are retired because the crates they excused left the resolved graph
+  with this refresh: `paste` (RUSTSEC-2024-0436, unmaintained) and `rkyv 0.7`
+  (RUSTSEC-2026-0235, only ever reachable through `rust_decimal`'s optional
+  feature). `cargo tree -i <crate> --all-features --target all` prints nothing
+  for either. Both gates are green with `ignore = []`, so a genuinely new
+  advisory in any dependency now fails CI without exception.
+
+
+- **A leg set now resolves a relative `Days(n)` expiry instead of rejecting it
+  (#120).** #117 shipped a rejection, which was the honest short-term call: the
+  fallback it replaced silently filled a leg at whatever contract shared its
+  strike and style, with `n` read and then discarded. But the resolution rule
+  already existed and was already implemented — `data::convert::resolve_expiration`,
+  the same function the chain's own quotes go through — so `LegSetStrategy` now
+  calls it at entry against the tape anchor `ts_0`. `Days(n)` means what it says,
+  and within a leg set there is one matching mode rather than two: resolve, then
+  match the exact `ContractKey`, or a typed error.
+
+  **The rule is not yet crate-wide**, and that is worth stating rather than
+  implying otherwise: the named kinds still match through `select_leg_quote`,
+  which is agnostic to the expiry form, so a relative expiry on an
+  `IronCondorSpec` is still read-and-discarded on a single-expiry chain and
+  unmatchable on a multi-expiry one. `IronCondorSpec::expiration` now says so.
+  Unifying the two would change the adapter's matching path and is deliberately
+  not folded into this change.
+
+  Entry for a leg set is now **`on_start`-only**. That is what makes the anchor
+  claim structural rather than a comment: the snapshot a relative expiry resolves
+  against is the one the loop opens with. `on_snapshot` no longer opens a leg set
+  — under the shipped driver it never did, since `on_start` either enters or
+  propagates — which removes the reach of a caller driving the public `Strategy`
+  seam directly, where a retried entry at step k would resolve `Days(30)` to
+  `ts_k + 30d` and, on a chain quoting several tenors, silently open a contract
+  the spec never named.
+
+  Correctness depends on entry being one-shot at step 0, so the snapshot it
+  resolves against is the anchor; that is stated in the code because it is
+  invisible at the call site. A relative spec and the resolved spec naming the
+  same position remain **different specs** with different `run_id`s — the
+  manifest records what it hashed — which is also why the canonical leg order is
+  taken over the spec as written.
+- **Every public enum is `#[non_exhaustive]`, and the surface gate now sees
+  variants (#121).** Adding a variant to a public enum is formally breaking for a
+  downstream exhaustive `match`, and **no gate caught it**: the surface snapshot
+  recorded item *names*, so `StrategySpec` appeared as a bare enum and #117's
+  `StrategySpec::Legs` — precisely the breaking part — never showed up in its
+  surface diff. The `CHANGELOG` entry was its only record.
+
+  Both ends are closed. All 15 public enums (`StrategySpec`, `DataSourceSpec`,
+  `ScenarioType`, `WalkPreset`, `BatchRunOutcome`, `SlippageModel`, `TouchSize`,
+  `FeedKind`, `ExecutionMode`, `OrderCommand`, `PositionAction`, `TimeInForce`,
+  `Event`, `BacktestError`, and `SessionState` under `simulator`) are
+  `#[non_exhaustive]`, so a future variant is no longer breaking downstream; and
+  the extractor in `tests/surface.rs` records each enum's variants as
+  `<feature> variant <path>::<Enum>::<Variant>`, adding 61 lines to the committed
+  snapshot, so the next added variant fails CI until the snapshot moves with it.
+  Unit tests pin every variant shape — unit, tuple, struct-like, explicit
+  discriminant — that a variant carries its **own** `#[cfg]` when it has one
+  (`DataSourceSpec::Simulator` and `FeedKind::Simulator` do), that an enum whose
+  brace wraps onto its own line after generics or a `where` clause still records
+  its variants, and that an empty enum does not swallow the items after it. Each
+  of those was a **silent** miss: the enum's own name still appeared, so nothing
+  in the snapshot looked broken while a breaking change slipped past. A
+  single-line body (`pub enum Inline { A, B }`, reachable through
+  `#[rustfmt::skip]`) is parsed rather than treated as empty, for the same
+  reason. Two backstops turn the whole class into a loud CI failure instead of a
+  quietly shrinking snapshot: the capture **panics** if it reaches EOF without a
+  closing brace — the shape that swallows later items — and a test asserts every
+  recorded enum has at least one recorded variant.
+
+  `#[non_exhaustive]` is itself breaking for a downstream exhaustive `match`,
+  which the pre-`v1.0.0` window admits in a minor bump — and is exactly why it is
+  cheap now and expensive after the 1.0 freeze. Inside this repo the whole
+  fallout was four `match`es on `BatchRunOutcome` in `tests/scenario_batch.rs`,
+  which is an external crate to the library and now handles the unknown case.
 
 - **`RUSTSEC-2026-0235` (`rkyv` 0.7.46) suppressed with a documented note.**
   The advisory (insufficient archive validation causing out-of-bounds reads,

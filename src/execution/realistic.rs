@@ -70,12 +70,12 @@
 //!
 //! `OptionOrderBook::new(symbol, OptionStyle)` takes an
 //! `optionstratlib::OptionStyle` **by value**, and the published crate (0.9.1)
-//! pins optionstratlib `^0.17` while `ironcondor` is on 0.18. The resolver
-//! keeps two optionstratlib copies; this module names the 0.17 `OptionStyle`
+//! pins optionstratlib `^0.18` while `ironcondor` is on 0.21. The resolver
+//! keeps two optionstratlib copies; this module names the 0.18 `OptionStyle`
 //! (aliased [`ObOptionStyle`]) **only** to construct leaf books, converting from
-//! the crate's 0.18 [`OptionStyle`] with a trivial `Call`/`Put` match. Remove
+//! the crate's 0.21 [`OptionStyle`] with a trivial `Call`/`Put` match. Remove
 //! the `optionstratlib_ob` shim once the matching crate republishes on
-//! optionstratlib 0.18 (or re-exports `OptionStyle`).
+//! optionstratlib 0.21 (or re-exports `OptionStyle`).
 
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
@@ -356,7 +356,7 @@ impl RealisticFill {
     /// Get (or lazily construct) the leaf [`OptionOrderBook`] for `contract`.
     ///
     /// The book is keyed by the contract's identity and constructed with its
-    /// canonical `contract_id` symbol and 0.18→0.17 [`OptionStyle`] conversion.
+    /// canonical `contract_id` symbol and 0.21→0.18 [`OptionStyle`] conversion.
     ///
     /// # Errors
     ///
@@ -1037,7 +1037,7 @@ impl ExecutionModel for RealisticFill {
 /// the same time).
 ///
 /// The book is keyed by the contract's identity and constructed with its
-/// canonical `contract_id` symbol and 0.18→0.17 [`OptionStyle`] conversion.
+/// canonical `contract_id` symbol and 0.21→0.18 [`OptionStyle`] conversion.
 ///
 /// # Errors
 ///
@@ -1085,7 +1085,7 @@ const fn ob_side(side: Side) -> ObSide {
     }
 }
 
-/// Convert the crate's 0.18 [`OptionStyle`] to the 0.17 [`ObOptionStyle`] the
+/// Convert the crate's 0.21 [`OptionStyle`] to the 0.18 [`ObOptionStyle`] the
 /// leaf-book constructor takes (the version shim; see the module docs).
 #[must_use]
 fn ob_option_style(style: OptionStyle) -> ObOptionStyle {

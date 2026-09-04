@@ -7,26 +7,15 @@
 # docs/TESTING.md §12.4).
 
 [advisories]
-# The two ignored advisories (mirrored in deny.toml [advisories].ignore).
-# RUSTSEC-2024-0436: `paste 1.0.15` is unmaintained (author archived the repo) —
-# an UNMAINTAINED notice, NOT a vulnerability. It is transitive through
-# optionstratlib's numeric stack (optionstratlib -> statrs -> nalgebra -> simba
-# -> paste) and via parquet; it cannot be dropped without dropping
-# optionstratlib. `paste` is a stable, widely-used compile-time proc-macro in
-# maintenance-only mode with no known security impact. Revisit when
-# optionstratlib migrates off it.
+# NO advisory is ignored. The two former ignores were retired on 2026-09-04 by
+# the dependency refresh that moved optionstratlib 0.18 -> 0.21 (and its
+# numeric stack with it): `paste` (RUSTSEC-2024-0436, unmaintained) and
+# `rkyv 0.7` (RUSTSEC-2026-0235, via rust_decimal's optional feature) both left
+# the resolved graph — `cargo tree -i <crate> --all-features --target all`
+# prints nothing for either — so there is nothing to ignore and a genuinely new
+# advisory in ANY dependency fails the gate.
 #
-# RUSTSEC-2026-0235: `rkyv 0.7.46` — insufficient archive validation can cause
-# out-of-bounds reads in archives containing `Rc`/`Arc`; fixed in rkyv >= 0.8.17.
-# It reaches `Cargo.lock` ONLY as an OPTIONAL dependency of `rust_decimal`
-# 1.42.1 (that crate's `rkyv` feature), which NO ironcondor feature combination
-# enables: `cargo tree -i rkyv --all-features --target all` prints nothing, so
-# rkyv is never compiled into the crate, the wheel, or the test binaries.
-# cargo-audit scans the LOCKFILE, not the compiled graph, hence the hit. There
-# is no upgrade path today: `rust_decimal` 1.42.1 is the latest release and
-# still declares rkyv 0.7. DROP this ignore as soon as `rust_decimal` ships a
-# release whose optional rkyv is >= 0.8.17.
-#
-# No other advisory is ignored, so a genuinely new vulnerability in compiled
-# code still fails the gate.
-ignore = ["RUSTSEC-2024-0436", "RUSTSEC-2026-0235"]
+# To add an ignore: cite the RUSTSEC id, prove the affected code is not
+# compiled into the crate / wheel / tests (the `cargo tree -i` line), name the
+# upstream condition that retires it, and mirror the entry in deny.toml.
+ignore = []

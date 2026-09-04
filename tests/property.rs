@@ -22,7 +22,7 @@ use ironcondor::{
     UnitGreeks,
 };
 use ironcondor::{EquityPoint, FillRow, GreeksAttributionRow, PositionRow, RowCounts, RunId};
-use rand_chacha::rand_core::RngCore;
+use rand_chacha::rand_core::Rng;
 
 /// Pre-minted engine order ids for driving an execution model directly in
 /// tests: ample for any test's Submit/Replace count; arbitrary identities.
