@@ -633,8 +633,10 @@ mod realistic {
     /// Per-warm-step allocation-event ceiling for realistic mode.
     ///
     /// Derived from a measurement on 2026-09-04 (macOS 26.6.2 arm64, rustc
-    /// 1.97.0; lockfile identity `option-chain-orderbook` 0.10.0 / `orderbook-rs`
-    /// 0.12.1 / `pricelevel` 0.9.1; 4-leg condor, seed 42): the steady-state tail
+    /// 1.97.0; lockfile identity `option-chain-orderbook` 0.10.0 — since #128
+    /// 0.11.0, whose published `src/` tree is byte-identical, over the same
+    /// `orderbook-rs` 0.12.1 / `pricelevel` 0.9.1, so the measurement carries
+    /// over; 4-leg condor, seed 42): the steady-state tail
     /// delta over the 55 warm steps `K..LAST` was **30 969–31 019 events observed
     /// over 24 runs**, i.e. **≈ 564 events per warm step**. The budget is that
     /// measured count plus 25 % headroom, rounded up — the same

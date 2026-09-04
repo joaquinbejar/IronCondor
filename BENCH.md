@@ -242,8 +242,13 @@ below). The **realistic warm step allocates by construction** — this is an
 honest, measured cost, not an oversight — so since #127 it is gated at a
 **measured ceiling** rather than at zero:
 
-- **Measured (2026-09-04, re-measured on the current lockfile:
-  `option-chain-orderbook` 0.10.0 / `orderbook-rs` 0.12.1 / `pricelevel` 0.9.1).**
+- **Measured (2026-09-04, re-measured on the then-current lockfile:
+  `option-chain-orderbook` 0.10.0 / `orderbook-rs` 0.12.1 / `pricelevel` 0.9.1;
+  the #128 bump to `option-chain-orderbook` 0.11.0 republished a byte-identical
+  `src/` tree and moved neither `orderbook-rs` nor `pricelevel`, so the count
+  carries over unchanged — re-measured four runs on each side, **30 976–30 992
+  events after the bump** against **30 982–30 985 before** it, both inside the
+  interval recorded below).**
   On the 4-leg condor at seed 42, realistic mode allocates **≈ 564 allocation
   events per warm step**: the steady-state tail delta over the 55 warm steps
   `K = 8 .. LAST = 63` was **30 969–31 019 events observed over 24 runs**
