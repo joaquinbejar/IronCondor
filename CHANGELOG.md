@@ -52,8 +52,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `optionstratlib ^0.21`, the same line this crate is on, with no API change
   (its published `src/` tree is byte-identical to 0.10.0; only the manifest
   moved, also tightening `orderbook-rs` from `^0.12` to `^0.12.1`, resolved
-  version unchanged, and raising `async-nats` to `^0.50`).
-  The renamed `optionstratlib` 0.18 dependency that existed solely to hand
+  version unchanged, and raising `async-nats` to `^0.50`). The renamed
+  `optionstratlib` 0.18 dependency that existed solely to hand
   `OptionOrderBook::new` an `OptionStyle` of the version it pinned is therefore
   **deleted**, along with the `Call`/`Put` bridge in
   `src/execution/realistic.rs`, which now passes the crate's own
@@ -71,8 +71,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ob_option_style` matched a type onto itself. Nor did the matching engine
   move — 0.11.0's published source is byte-identical to 0.10.0, only its
   manifest changed, and `orderbook-rs` 0.12.1 / `pricelevel` 0.9.1 are the
-  same crates as before. No behaviour change: the lockfile edit moves
-  `lockfile_sha256`, so the five
+  same crates as before. `option-chain-orderbook` is nevertheless a **public
+  dependency** under the `orderbook` feature — `src/error.rs` carries
+  `impl From<option_chain_orderbook::Error> for BacktestError` — so a
+  downstream that co-pins `option-chain-orderbook` 0.10 with that feature
+  enabled must move to 0.11 in the same update, and since `docs/SEMVER.md` now
+  lists public dependencies as a surface this lands in a minor, never a patch.
+  No behaviour change: the lockfile edit moves `lockfile_sha256`, so the five
   frozen bundles were re-blessed and the re-bless was proven **identity-only**
   column by column with pyarrow — across 20 Parquet tables and 225 columns the
   only column that moved is `fills.strategy_run_id`, and across 5 manifests and
