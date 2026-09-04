@@ -62,18 +62,28 @@ python = ["dep:pyo3"]
 #     same value (40 integers, 10 floats equal to 1e-15). No table value moved.
 #   rand_chacha 0.3 -> 0.10 (MIT/Apache-2.0). `seed_from_u64` + `next_u64`
 #     produce the IDENTICAL stream (probed: same four u64s for seed 42), so no
-#     seeded output moves. rand_core 0.10 renamed `RngCore` -> `Rng` (2 imports).
+#     seeded output moves; production constructs the RNG and never draws from
+#     it today, so the frozen bundles do not depend on the stream at all. The
+#     first `next_u32` values for seed 42 are pinned by a known-answer test in
+#     src/engine/backtest.rs. rand_core 0.10 renamed `RngCore` -> `Rng`.
 #   sha2 0.10 -> 0.11 (MIT/Apache-2.0): same `Digest` API; SHA-256 is SHA-256.
 #   reqwest 0.12 -> 0.13 (MIT/Apache-2.0): NOT a rename — provider ring ->
 #     aws-lc-rs (C, cmake) and trust store bundled-Mozilla -> OS store; see the
 #     reqwest entry below for the owner decision and its consequences.
 #   option-chain-orderbook 0.9 -> 0.10 (MIT): `book.rs` byte-identical; still
 #     pins optionstratlib ^0.18, so the shim below moves 0.17 -> 0.18.
-#   positive 0.5 -> 0.6, criterion 0.5 -> 0.8 (dev-only).
-#   Lockfile: 46 entries added, 21 removed (the TLS stack swap above accounts
-#     for most additions: aws-lc-rs, aws-lc-sys, cmake, rustls-platform-verifier,
-#     rustls-native-certs, security-framework, schannel, openssl-probe, jni …;
-#     `webpki-roots` and `ring` left).
+#   positive 0.5 -> 0.6 (MIT), criterion 0.5 -> 0.8 (Apache-2.0 OR MIT); dev-only.
+#   Lockfile: 27 crates entered and 17 left, counted by name (167 entered and
+#     142 left counted by name+version, where a version bump reads as one of
+#     each). The TLS stack swap above accounts for most arrivals: aws-lc-rs,
+#     aws-lc-sys, cmake, rustls-platform-verifier, rustls-native-certs,
+#     security-framework, schannel, openssl-probe, jni, webpki-root-certs …;
+#     `webpki-roots` left. `ring` 0.17 is no longer compiled but stays a
+#     lockfile entry, as do `rand_chacha` 0.3.1 and `rand` 0.8.8 (no reverse
+#     dependency on any target; a full `cargo update` would prune them, at the
+#     cost of a lockfile_sha256 move). `cargo audit` scans the lockfile, so an
+#     advisory against one of these orphans still fails the gate — expected,
+#     and the fix is the prune, not an ignore.
 #   Gates: cargo audit + cargo deny green with an EMPTY ignore list — `paste`
 #   and `rkyv 0.7` both left the graph, so their two long-standing ignores are
 #   retired. The lockfile bump moves `lockfile_sha256` -> every `run_id`, so the
@@ -126,10 +136,12 @@ rand_chacha = { version = "0.10", default-features = false }
 # (b) verifies server certificates through `rustls-platform-verifier`, i.e. the
 # OPERATING SYSTEM TRUST STORE at runtime, not a compiled-in Mozilla root
 # bundle (reqwest 0.13 offers no bundled-roots feature at all). A host with no
-# CA store fails TLS where 0.12 succeeded. Licences: aws-lc-rs ISC AND
-# (Apache-2.0 OR ISC); aws-lc-sys ISC AND (Apache-2.0 OR ISC) AND Apache-2.0 AND
-# MIT AND BSD-3-Clause AND OpenSSL; rustls-platform-verifier and cmake MIT OR
-# Apache-2.0 — all on the deny.toml allow-list, `cargo deny` green. The former
+# CA store fails TLS where 0.12 succeeded. Licences (declared in each crate's
+# manifest): aws-lc-rs `ISC AND (Apache-2.0 OR ISC)`; aws-lc-sys `ISC AND
+# (Apache-2.0 OR ISC) AND Apache-2.0 AND MIT AND BSD-3-Clause AND (Apache-2.0
+# OR ISC OR MIT) AND (Apache-2.0 OR ISC OR MIT-0)`; rustls-platform-verifier
+# and cmake `MIT OR Apache-2.0`; webpki-root-certs `CDLA-Permissive-2.0` — every
+# term satisfiable from the deny.toml allow-list, `cargo deny` green. The former
 # "pure-Rust TLS, no system OpenSSL" posture is therefore RETIRED for the
 # simulator feature; the default build still links no TLS at all.
 reqwest = { version = "0.13", default-features = false, features = [
@@ -165,9 +177,11 @@ option-chain-orderbook = { version = "0.10", default-features = false, optional 
 # version bridge: published `option-chain-orderbook` (0.10.0) pins optionstratlib
 # `^0.18`, while this crate is on optionstratlib 0.21, so the resolver keeps two
 # semver-incompatible optionstratlib copies (and, beneath them, two of
-# `positive`, `expiration_date`, `option_type` and `rand_chacha` — the 30
-# `duplicate` warnings cargo-deny reports are exactly this tree, and are
-# warnings, not errors). `OptionOrderBook::new(symbol, OptionStyle)` takes an
+# `positive`, `expiration_date`, `option_type` and their transitive stacks —
+# most of the `duplicate` warnings cargo-deny reports, 30 at 2026-09-04, trace
+# to this tree; `base64` (0.22 via reqwest / hdrhistogram vs 0.23 via arrow /
+# parquet) and `rand_chacha` (0.9 via proptest vs 0.10 direct) do not. They
+# are warnings, not errors). `OptionOrderBook::new(symbol, OptionStyle)` takes an
 # `optionstratlib::OptionStyle` **by value** and the crate does not re-export
 # it, so the leaf constructor must be handed the 0.18 type. This renamed dep
 # names that one enum (a trivial `Call`/`Put`) at the seam in

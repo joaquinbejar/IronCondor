@@ -95,8 +95,26 @@ is no long-term-support branch before 1.0.
 place and verified fresh: untrusted-input hardening with fuzz targets over the
 CSV / Parquet / bundle parsers (no panic, hang, or OOM on malformed bytes);
 secrets non-leakage (the captured-log credential test above); and the
-supply-chain / host-integrity controls — `cargo audit` and
-`cargo deny --all-features check` both green with an **empty** ignore list in `.cargo/audit.toml` and `deny.toml` — the two advisories the gates once had to excuse, `RUSTSEC-2024-0436` (`paste`, unmaintained) and `RUSTSEC-2026-0235` (`rkyv 0.7`, reachable only through `rust_decimal`'s optional feature), both left the resolved graph with the 2026-09-04 dependency refresh, so a genuinely new advisory anywhere now fails CI without exception.
+supply-chain / host-integrity controls — `#![forbid(unsafe_code)]` intact
+in the crate (PyO3 macro glue the only tolerated exception), the
+no-panic-across-FFI control asserted by the Python test suite, and
+`cargo audit` + `cargo deny --all-features check` both green with an
+**empty** ignore list in `.cargo/audit.toml` and `deny.toml`. The two
+advisories the gates once had to excuse, `RUSTSEC-2024-0436` (`paste`,
+unmaintained) and `RUSTSEC-2026-0235` (`rkyv 0.7`, reachable only through
+`rust_decimal`'s optional feature), both left the resolved graph with the
+2026-09-04 dependency refresh, so a genuinely new advisory anywhere now
+fails CI without exception.
+
+**Native-code surface (2026-09-04).** The same refresh grew the compiled
+non-Rust surface behind the **optional** `simulator` feature: `reqwest`
+0.13's TLS provider is `aws-lc-sys` (C + assembly, built through `cmake`)
+in place of `ring` (also C + assembly), and server certificates are
+verified against the operating-system trust store instead of a compiled-in
+Mozilla root bundle. `forbid(unsafe_code)` is a crate-level lint that never
+covered dependencies, so that guarantee is unchanged; the default build
+links no TLS at all. Decision and consequences: the `reqwest` audit note in
+`Cargo.toml` and the `0.6.0` CHANGELOG entry.
 
 The full threat model, untrusted-input hardening table, and secrets-handling
 rules live in

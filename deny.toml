@@ -43,14 +43,17 @@ allow = [
     # attribution requirement), so it is strictly more permissive.
     "Apache-2.0 WITH LLVM-exception",
     # The rustls TLS stack behind the `simulator` feature's reqwest client —
-    # `ring` (`Apache-2.0 AND ISC`), `untrusted`, `rustls-webpki` — carries ISC,
-    # an OSI-approved permissive licence functionally equivalent to MIT. These
+    # `aws-lc-rs` / `aws-lc-sys` (`ISC AND …`, the crypto provider since reqwest
+    # 0.13), `untrusted`, `rustls-webpki`, and the lockfile-only `ring`
+    # (`Apache-2.0 AND ISC`) — carries ISC, an OSI-approved permissive licence
+    # functionally equivalent to MIT. These
     # were previously unchecked because the deny gate resolved default features
     # only (fixed at #38: CI now runs `cargo deny --all-features check`).
     "ISC",
-    # `webpki-roots` (the Mozilla CA-root bundle the simulator's rustls client
-    # trusts) ships as data under CDLA-Permissive-2.0 — a permissive data
-    # licence (attribution-only, no copyleft).
+    # `webpki-root-certs` (the Mozilla CA-root data `rustls-platform-verifier`
+    # carries as its fallback since reqwest 0.13; the simulator client trusts
+    # the OS store at runtime) ships as data under CDLA-Permissive-2.0 — a
+    # permissive data licence (attribution-only, no copyleft).
     "CDLA-Permissive-2.0",
     "BSD-2-Clause",
     "BSD-3-Clause",
