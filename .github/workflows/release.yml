@@ -127,6 +127,13 @@ jobs:
           command: build
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
+          # reqwest 0.13's `rustls` feature pulls `aws-lc-sys` (C + assembly built
+          # through cmake) into the `simulator` feature this wheel ships. The
+          # manylinux container has no cmake, and its distro cmake would be too
+          # old for aws-lc-sys anyway, so install a current one from PyPI inside
+          # the container (a no-op for the macOS targets, which run natively on
+          # runners that already carry cmake). Decision: CHANGELOG 2026-09-04.
+          before-script-linux: pip install cmake
           working-directory: python
           # Comma-separated, unquoted: maturin-action splits `args` on
           # whitespace WITHOUT shell quoting, so a quoted space-separated

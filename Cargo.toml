@@ -59,10 +59,16 @@ python = ["dep:pyo3"]
 #     produce the IDENTICAL stream (probed: same four u64s for seed 42), so no
 #     seeded output moves. rand_core 0.10 renamed `RngCore` -> `Rng` (2 imports).
 #   sha2 0.10 -> 0.11 (MIT/Apache-2.0): same `Digest` API; SHA-256 is SHA-256.
-#   reqwest 0.12 -> 0.13 (MIT/Apache-2.0): feature `rustls-tls` -> `rustls`.
+#   reqwest 0.12 -> 0.13 (MIT/Apache-2.0): NOT a rename — provider ring ->
+#     aws-lc-rs (C, cmake) and trust store bundled-Mozilla -> OS store; see the
+#     reqwest entry below for the owner decision and its consequences.
 #   option-chain-orderbook 0.9 -> 0.10 (MIT): `book.rs` byte-identical; still
 #     pins optionstratlib ^0.18, so the shim below moves 0.17 -> 0.18.
 #   positive 0.5 -> 0.6, criterion 0.5 -> 0.8 (dev-only).
+#   Lockfile: 46 entries added, 21 removed (the TLS stack swap above accounts
+#     for most additions: aws-lc-rs, aws-lc-sys, cmake, rustls-platform-verifier,
+#     rustls-native-certs, security-framework, schannel, openssl-probe, jni …;
+#     `webpki-roots` and `ring` left).
 #   Gates: cargo audit + cargo deny green with an EMPTY ignore list — `paste`
 #   and `rkyv 0.7` both left the graph, so their two long-standing ignores are
 #   retired. The lockfile bump moves `lockfile_sha256` -> every `run_id`, so the
@@ -106,7 +112,21 @@ tracing = "0.1"
 # only surface used; no `rand` facade is pulled. Licence: MIT OR Apache-2.0.
 rand_chacha = { version = "0.10", default-features = false }
 # simulator feed transport — feature-gated, absent from the default build.
-# reqwest: pure-Rust rustls TLS (no system OpenSSL, reproducible CI) + json.
+# reqwest 0.13 + rustls + json. OWNER DECISION 2026-09-04 (dependency refresh):
+# reqwest 0.13's `rustls` feature is NOT the 0.12 `rustls-tls` under a new
+# name. It (a) selects `aws-lc-rs` as the crypto provider — `aws-lc-sys` is C +
+# assembly built through `cmake`, so a HOST C TOOLCHAIN AND cmake ARE BUILD
+# REQUIREMENTS for the `simulator` feature (the manylinux wheel job installs
+# cmake in its container; GitHub's ubuntu/macOS runners already have it) — and
+# (b) verifies server certificates through `rustls-platform-verifier`, i.e. the
+# OPERATING SYSTEM TRUST STORE at runtime, not a compiled-in Mozilla root
+# bundle (reqwest 0.13 offers no bundled-roots feature at all). A host with no
+# CA store fails TLS where 0.12 succeeded. Licences: aws-lc-rs ISC AND
+# (Apache-2.0 OR ISC); aws-lc-sys ISC AND (Apache-2.0 OR ISC) AND Apache-2.0 AND
+# MIT AND BSD-3-Clause AND OpenSSL; rustls-platform-verifier and cmake MIT OR
+# Apache-2.0 — all on the deny.toml allow-list, `cargo deny` green. The former
+# "pure-Rust TLS, no system OpenSSL" posture is therefore RETIRED for the
+# simulator feature; the default build still links no TLS at all.
 reqwest = { version = "0.13", default-features = false, features = [
     "json",
     "rustls",

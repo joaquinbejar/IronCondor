@@ -498,8 +498,9 @@ fn decode_table<T>(
     // derives the schema from the Parquet schema itself — which `validate_schema`
     // below already checks column-for-column, so the accepted set is unchanged.
     // The call is ALSO run under the #52 catch_unwind backstop
-    // (`guard_bundle_parquet`): parquet 59.1.0 (the latest published) still has a
-    // known metadata-panic class on malformed input (arrow-rs #9840, #9868,
+    // (`guard_bundle_parquet`): parquet 59.3.0 (the pinned version; the class was
+    // first seen on 59.1.0 and `byte_range` is unchanged) still has a known
+    // metadata-panic class on malformed input (arrow-rs #9840, #9868,
     // #5382) that unwinds instead of returning `Err`, so any such panic is
     // contained and mapped to a typed `BacktestError::Bundle`.
     let builder = guard_bundle_parquet(table, "metadata read", || {
