@@ -64,8 +64,9 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use hdrhistogram::Histogram;
+use std::hint::black_box;
 
 use ironcondor::{
     AttributionSubstrate, BacktestConfig, BacktestRun, Cents, ContractKey, DataSourceSpec,
