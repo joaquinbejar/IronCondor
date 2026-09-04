@@ -108,6 +108,12 @@ jobs:
       # with step count. A non-zero warmup(K)->last delta fails the build.
       # Distinct from the throughput bench (#18) and the golden job (#17).
       - run: cargo test --test zero_alloc
+      # Realistic mode (#127): the same harness with `RealisticFill` instead of
+      # `NaiveFill`. Realistic fills route through the upstream matching engine,
+      # so the warm step allocates by construction and is gated at a MEASURED
+      # CEILING (measured per-step count + 25% headroom) plus a linearity
+      # assertion, not at zero. See BENCH.md.
+      - run: cargo test --features orderbook --test zero_alloc
 
   bench-gate:
     name: bench-gate
@@ -170,7 +176,8 @@ jobs:
       # the SAME `tests/zero_alloc.rs` invariant inside the perf-gate stage so the
       # zero-steady-state-allocation guarantee is reaffirmed alongside the
       # percentile/linearity gates (#51 acceptance criterion). A non-zero per-step
-      # allocation delta fails here too.
+      # allocation delta fails here too. Default features only; the realistic
+      # ceiling gate runs only in the `zero-alloc` job.
       - name: "PB-1 — zero-alloc replay-loop gate (reaffirmation)"
         run: cargo test --test zero_alloc
 

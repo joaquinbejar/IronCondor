@@ -145,7 +145,8 @@ pub struct RealisticFill {
     /// per-order [`OptionOrderBook::add_limit_order_full`] still returns an owned
     /// `TradeResult` whose `symbol` `String` allocates per call upstream — the one
     /// residual per-step allocation on this path, profiled and addressed in #029;
-    /// the realistic path is not covered by the naive zero-alloc gate.) Only the
+    /// the realistic path is covered not by the naive zero gate but by the
+    /// realistic ceiling gate in `tests/zero_alloc.rs` (#127).) Only the
     /// **auto-reseed** path records here; hand-seeded depth
     /// ([`Self::seed_maker_limit`]) is untracked and never auto-cancelled.
     resting_seed_ids: BTreeMap<ContractKey, Vec<u64>>,
