@@ -6,10 +6,31 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # WHY THIS WORKFLOW CANNOT PUBLISH BY ACCIDENT — the layered guards
 # ─────────────────────────────────────────────────────────────────────────────
-#   1. TAG-ONLY TRIGGER. It runs solely on `push: tags: ['v*']`. A branch push,
-#      a pull_request, or a manual dispatch never reach the publish job. The
-#      publish job additionally re-asserts the tag ref in its `if:` (defence in
-#      depth).
+#   1. TAG-BOUND TRIGGER. It runs on `push: tags: ['v*']`, or on a MANUAL
+#      DISPATCH that names an EXISTING tag (`workflow_dispatch` input `tag`,
+#      added 2026-09-04 for RELEASE-PROCESS §7.1 recovery: the `v0.6.0` tag
+#      run stranded its wheels on a retired runner label, and a tag-triggered
+#      run reads this file AT THE TAG, so the only way to rebuild an already
+#      published version with a fixed workflow is to run `main`'s definition
+#      against the tag's sources). A branch push or a pull_request never
+#      reach the publish job. The dispatch path is bound to the tag five ways
+#      before any wheel is built (job `resolve-tag`): the input must be
+#      `vX.Y.Z`; the tag must exist (checkout fails otherwise); the tag's
+#      `Cargo.toml` version must equal it; the tag commit must be on `main`;
+#      and every build job checks out THAT COMMIT (the sha `resolve-tag`
+#      pinned), so the wheels carry the tag's sources and version, never
+#      `main`'s and never a tag moved mid-run. The publish job re-asserts the
+#      tag (push ref OR validated input) in its `if:` (defence in depth), and
+#      guards 2–3 below apply unchanged on both paths.
+#      LIMIT OF THE IN-FILE GUARDS ON THE DISPATCH PATH: a dispatch runs the
+#      workflow file AT THE DISPATCHING REF, so a write-access user could
+#      dispatch an edited copy from a branch. On that path the authoritative
+#      gates are the ones GitHub enforces OUTSIDE this file: the `pypi`
+#      environment's deployment policy (owner action: restrict it to `main`
+#      and `v*` so no other ref can enter the environment or mint the OIDC
+#      token) plus its required reviewers, and PyPI's trusted-publisher
+#      registration (repo + workflow file name + environment). The checks in
+#      this file are defence in depth there, not the perimeter.
 #   2. ENVIRONMENT APPROVAL + REPO-VARIABLE KILL-SWITCH. `publish-pypi` runs in
 #      the GitHub `pypi` environment AND its `if:` additionally requires the
 #      repository variable `PYPI_PUBLISH_ENABLED == 'true'`. IMPORTANT: the
@@ -28,20 +49,17 @@
 #      workflow + environment (a one-time user-side step). Until then the upload
 #      fails LOUDLY with a "no trusted publisher configured" error — it cannot
 #      silently succeed, and there is no long-lived secret in CI to leak.
-#   4. (RETIRED at 0.5.0) "Private :: Do Not Upload" classifier — removed on
-#      carries this classifier; PyPI/Warehouse REJECTS any upload that declares
-#      it (HTTP 400). Removing it is part of the owner's FIRST-RELEASE commit,
-#      AFTER the name is registered — see the USER-ACTION list in the PR body.
-#      So even a tag + an approved environment + a configured publisher still
-#      cannot upload while the classifier is present.
-#   5. UNREGISTERED NAME. `ironcondor` is not yet a PyPI project. There is
-#      nothing to publish INTO until the owner registers it (or a pending
-#      trusted publisher). Registration precedes the first publish
-#      (docs/ROADMAP.md dependency notes).
+#   4. (RETIRED at 0.5.0) "Private :: Do Not Upload" classifier. Until the
+#      first release the package carried this classifier, which PyPI rejects
+#      on upload (HTTP 400), so nothing could publish by accident; the 0.5.0
+#      release commit removed it once the name was registered.
+#   5. (DISCHARGED at 0.5.0) UNREGISTERED NAME. `ironcondor` was not a PyPI
+#      project before the owner registered it; since 0.5.0 (sdist + arm64
+#      wheel on PyPI) it exists, so guards 1–3 are the live ones.
 #
-# This issue (#41) WIRES the pipeline; it does NOT ship a public release. The
-# first real publish is a deliberate, owner-approved event (CLAUDE.md, docs/06
-# §8). Never run `maturin publish` / twine against a live index from here.
+# Wired at #41; every publish is a deliberate, owner-approved event (CLAUDE.md,
+# docs/06 §8). Never run `maturin publish` / twine against a live index from
+# here.
 #
 # crates.io ↔ PyPI SEQUENCING (docs/RELEASE-PROCESS.md §6 → §7): a release
 # publishes crates.io FIRST, then these PyPI wheels, both at the same X.Y.Z from
@@ -59,6 +77,15 @@ on:
   push:
     tags:
       - "v*"
+  # Recovery path (RELEASE-PROCESS §7.1): rebuild + publish an EXISTING tag
+  # with the workflow definition on the dispatching ref (normally `main`).
+  # Run as: gh workflow run release.yml --ref main -f tag=vX.Y.Z
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to build and publish (vX.Y.Z)"
+        required: true
+        type: string
 
 # Least privilege at the top; the publish job re-grants `id-token: write` locally.
 permissions:
@@ -67,13 +94,68 @@ permissions:
 concurrency:
   # A release is a DEPLOY: never cancel an in-flight build/publish for a tag
   # (unlike the non-deploy CI jobs, which set cancel-in-progress: true).
-  group: release-${{ github.ref }}
+  group: release-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
+  # The ONE tag this run builds and publishes: the dispatch input, or the
+  # pushed tag. Every job checks out this ref and every version assertion
+  # compares against it; nothing below reads `github.ref_name` directly.
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
+  # ───────────────────────────────────────────────────────────────────────────
+  # (0) Bind the run to one existing, version-matching tag on `main`. On the
+  #     dispatch path it is the gate that turns a free-text input into a
+  #     release identity; on the tag-push path it ADDS one constraint the push
+  #     never guaranteed: the tag commit must already be on `main`, so a tag
+  #     pushed before its release PR merges fails here instead of building
+  #     (RELEASE-PROCESS §4–§5: merge first, tag the merge commit, then push
+  #     the tag). Every other job `needs:` it.
+  resolve-tag:
+    name: resolve-tag (${{ inputs.tag || github.ref_name }})
+    runs-on: ubuntu-24.04
+    outputs:
+      # The tag's commit, resolved ONCE here. The build jobs check out this
+      # sha, not the tag name, so a tag moved between jobs, or a branch that
+      # happens to share the tag's name, cannot change what gets built.
+      sha: ${{ steps.pin.outputs.sha }}
+    steps:
+      - name: Assert the tag is well-formed
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "release tag = ${RELEASE_TAG}"
+          [[ "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "'${RELEASE_TAG}' is not a vX.Y.Z release tag"; exit 1; }
+      # A nonexistent tag fails HERE, loudly, before any build starts. The
+      # ref is FULLY QUALIFIED (`refs/tags/…`): an unqualified name would let
+      # a branch called `vX.Y.Z` shadow the tag. `fetch-depth: 0` brings every
+      # branch and tag with full history, so `origin/main` is complete for the
+      # ancestry check below (a second, shallow fetch would break that check
+      # for a tag more than a few hundred commits behind main's tip).
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+      - name: Assert the tag names the crate version and sits on main
+        id: pin
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG_SHA="$(git rev-parse HEAD)"
+          echo "tag ${RELEASE_TAG} = ${TAG_SHA}"
+          CRATE_VERSION="$(grep -m1 '^version' Cargo.toml | sed -E 's/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')"
+          echo "crate version at ${RELEASE_TAG} = ${CRATE_VERSION}"
+          test "${RELEASE_TAG}" = "v${CRATE_VERSION}" || {
+            echo "tag ${RELEASE_TAG} != v${CRATE_VERSION} (Cargo.toml at the tag)"; exit 1; }
+          # A release tag points at a merge commit on main (RELEASE-PROCESS
+          # §4–§5); a dispatch naming a tag on a stray branch must not publish.
+          git merge-base --is-ancestor "${TAG_SHA}" origin/main || {
+            echo "tag ${RELEASE_TAG} (${TAG_SHA}) is not an ancestor of origin/main"; exit 1; }
+          echo "sha=${TAG_SHA}" >> "${GITHUB_OUTPUT}"
+
   # ───────────────────────────────────────────────────────────────────────────
   # (a) Build release-grade abi3 wheels, one per platform target.
   #
@@ -92,6 +174,7 @@ jobs:
   # is NO per-minor build (docs/06 §7, ADR-0005 alt. 5).
   build-wheels:
     name: build-wheels (${{ matrix.target }} on ${{ matrix.runner }})
+    needs: resolve-tag
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -115,7 +198,21 @@ jobs:
             target: aarch64
             manylinux: ""
     steps:
+      # The TAG's sources, on both trigger paths: the commit `resolve-tag`
+      # pinned, never the tag name (see the `sha` output above). An empty
+      # output would make checkout fall back to the default branch — a
+      # fail-OPEN mode — so assert a full sha before checking out.
+      - name: Assert the pinned commit
+        shell: bash
+        env:
+          PINNED_SHA: ${{ needs.resolve-tag.outputs.sha }}
+        run: |
+          set -euo pipefail
+          [[ "${PINNED_SHA}" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "resolve-tag produced no commit sha ('${PINNED_SHA}')"; exit 1; }
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-tag.outputs.sha }}
       # abi3-py310 floor: build against 3.10 so the produced wheel is cp310-abi3.
       - uses: actions/setup-python@v5
         with:
@@ -157,12 +254,13 @@ jobs:
           set -euo pipefail
           CRATE_VERSION="$(grep -m1 '^version' Cargo.toml | sed -E 's/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')"
           echo "crate version = ${CRATE_VERSION}"
-          # One tag drives one X.Y.Z (RELEASE-PROCESS §2/§4): the pushed tag
-          # must equal v<crate version>, else a mis-tag (e.g. v9.9.9 over a
-          # 0.0.1 Cargo.toml) would ship wheels whose version contradicts the
-          # tag. Fails the build long before any publish.
-          test "${GITHUB_REF_NAME}" = "v${CRATE_VERSION}" || {
-            echo "tag ${GITHUB_REF_NAME} != v${CRATE_VERSION} (Cargo.toml)"; exit 1; }
+          # One tag drives one X.Y.Z (RELEASE-PROCESS §2/§4): the release tag
+          # (pushed, or the validated dispatch input) must equal v<crate
+          # version>, else a mis-tag (e.g. v9.9.9 over a 0.0.1 Cargo.toml)
+          # would ship wheels whose version contradicts the tag. Fails the
+          # build long before any publish.
+          test "${RELEASE_TAG}" = "v${CRATE_VERSION}" || {
+            echo "tag ${RELEASE_TAG} != v${CRATE_VERSION} (Cargo.toml)"; exit 1; }
           shopt -s nullglob
           found=0
           for whl in python/dist/*.whl; do
@@ -186,9 +284,20 @@ jobs:
   # (a′) Build the source distribution (sdist) — one, platform-independent.
   build-sdist:
     name: build-sdist
+    needs: resolve-tag
     runs-on: ubuntu-24.04
     steps:
+      - name: Assert the pinned commit
+        shell: bash
+        env:
+          PINNED_SHA: ${{ needs.resolve-tag.outputs.sha }}
+        run: |
+          set -euo pipefail
+          [[ "${PINNED_SHA}" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "resolve-tag produced no commit sha ('${PINNED_SHA}')"; exit 1; }
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-tag.outputs.sha }}
       - name: Build the sdist
         uses: PyO3/maturin-action@v1.49.3
         with:
@@ -204,23 +313,27 @@ jobs:
 
   # ───────────────────────────────────────────────────────────────────────────
   # (b) Publish to PyPI via trusted publishing (OIDC). GATED five ways:
-  #     tag-only trigger + `if` guard (tag ref AND the `PYPI_PUBLISH_ENABLED`
-  #     repo-variable kill-switch) + `environment: pypi` required reviewers
-  #     + OIDC-no-token (needs the owner's trusted-publisher registration).
+  #     tag-bound trigger (pushed tag, or a dispatch input validated by
+  #     `resolve-tag`) + `if` guard (tag ref OR validated input, AND the
+  #     `PYPI_PUBLISH_ENABLED` repo-variable kill-switch) + `environment: pypi`
+  #     required reviewers + OIDC-no-token (needs the owner's trusted-publisher
+  #     registration).
   #     (The former "Private :: Do Not Upload" classifier guard was retired at 0.5.0.)
   publish-pypi:
     name: publish-pypi
     needs: [build-wheels, build-sdist]
     runs-on: ubuntu-24.04
-    # Fail-closed gate: the tag ref (belt-and-suspenders over the tag-only
-    # trigger) AND the repo-variable kill-switch. `environment: pypi` is NOT a
+    # Fail-closed gate: a release tag (the pushed ref, or the dispatch input
+    # that `resolve-tag` already bound to an existing, version-matching tag on
+    # main — `needs:` above makes that job's success a precondition) AND the
+    # repo-variable kill-switch. `environment: pypi` is NOT a
     # sufficient approval gate on its own — a referenced-but-unconfigured
     # environment is auto-created with no protection rules — so the publish path
     # additionally requires `vars.PYPI_PUBLISH_ENABLED == 'true'`, a repository
     # variable only a repo admin can set (unset by default). It COMPLEMENTS, it
     # does NOT replace, the required-reviewers user action described below.
     if: >-
-      startsWith(github.ref, 'refs/tags/v')
+      (startsWith(github.ref, 'refs/tags/v') || startsWith(inputs.tag, 'v'))
       && vars.PYPI_PUBLISH_ENABLED == 'true'
     # The USER-SIDE approval gate: this environment enforces a human pause ONLY
     # once the owner configures it with REQUIRED REVIEWERS (Settings →
