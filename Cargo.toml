@@ -101,7 +101,8 @@ python = ["dep:pyo3"]
 #     the pin now MATCHES this crate's own optionstratlib, the renamed
 #     optionstratlib 0.18 boundary-shim dependency is DELETED: the `orderbook`
 #     build resolves ONE `optionstratlib` (0.21.1) and one each of `positive`,
-#     `expiration_date`, `option_type` and `financial_types`, and
+#     `expiration_date` and `option_type` (`financial_types` 0.2.2 was already
+#     single, shared by both optionstratlib copies), and
 #     `src/execution/realistic.rs` hands the leaf constructor the crate's own
 #     `optionstratlib::OptionStyle` directly. cargo-deny `duplicate` warnings
 #     fall from 30 to 11 with the two optionstratlib stacks gone; what remains

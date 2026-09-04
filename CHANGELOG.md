@@ -58,12 +58,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `src/execution/realistic.rs`, which now passes the crate's own
   `optionstratlib::OptionStyle` straight through. The `orderbook` feature no
   longer names a second optionstratlib, and the `orderbook` build resolves a
-  single `optionstratlib`, `positive`, `expiration_date`, `option_type` and
-  `financial_types`: cargo-deny `duplicate` warnings fall from 30 to 11, with
-  only unrelated splits left (the `rand` 0.9/0.10 stack, `base64`, `thiserror`,
+  single `optionstratlib`, `positive`, `expiration_date` and `option_type`
+  (`financial_types` 0.2.2 was already single, shared by both optionstratlib
+  copies): cargo-deny `duplicate` warnings fall from 30 to 11, with only
+  unrelated splits left (the `rand` 0.9/0.10 stack, `base64`, `thiserror`,
   `syn`, `hashbrown`, `unicode-width`). `cargo audit --deny warnings` and
-  `cargo deny --all-features check` stay green with an empty ignore list. No
-  behaviour change: the lockfile edit moves `lockfile_sha256`, so the five
+  `cargo deny --all-features check` stay green with an empty ignore list.
+  That the deleted bridge was a **type-level no-op** is a compile-time fact,
+  not an empirical one: both optionstratlib lines re-export `OptionStyle` from
+  `financial_types`, which already resolved to a single 0.2.2, so
+  `ob_option_style` matched a type onto itself. Nor did the matching engine
+  move — 0.11.0's published source is byte-identical to 0.10.0, only its
+  manifest changed, and `orderbook-rs` 0.12.1 / `pricelevel` 0.9.1 are the
+  same crates as before. No behaviour change: the lockfile edit moves
+  `lockfile_sha256`, so the five
   frozen bundles were re-blessed and the re-bless was proven **identity-only**
   column by column with pyarrow — across 20 Parquet tables and 225 columns the
   only column that moved is `fills.strategy_run_id`, and across 5 manifests and
