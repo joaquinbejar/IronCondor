@@ -95,15 +95,23 @@ jobs:
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
+      # RUNNER LABELS (2026-09-04): GitHub retired the `macos-13` image on
+      # 2025-12-04 and lists `macos-14` as deprecated (it keeps only the two
+      # newest macOS versions). The `v0.6.0` tag run queued its x86_64 wheel on
+      # `macos-13` indefinitely — no runner exists for that label any more — so
+      # no wheel reached PyPI (#125). Intel wheels now build on `macos-15-intel`
+      # and arm64 wheels on `macos-15`, both GA. When GitHub deprecates a label
+      # here, the matrix is the ONLY place to move it: the tag-triggered run
+      # reads the workflow file at the tag, so a stale label strands a release.
       matrix:
         include:
           - runner: ubuntu-24.04
             target: x86_64
             manylinux: auto
-          - runner: macos-13
+          - runner: macos-15-intel
             target: x86_64
             manylinux: ""
-          - runner: macos-14
+          - runner: macos-15
             target: aarch64
             manylinux: ""
     steps:

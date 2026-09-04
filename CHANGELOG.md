@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **macOS wheel builds target live GitHub runners.** The `release` workflow
+  built the x86_64 macOS wheel on `macos-13`, an image GitHub retired on
+  2025-12-04, so the `v0.6.0` tag run queued that job indefinitely and no
+  wheel reached PyPI (the `v0.5.0` tag run never reached a `macos-13` runner
+  either). Intel wheels now build on `macos-15-intel` and arm64 wheels on
+  `macos-15`; `macos-14` is deprecated and was moved in the same edit. The
+  tag-triggered workflow reads its file at the tag, so the fix applies to
+  the next tag only; the `0.6.0` wheel recovery is tracked in #125.
+
 ## [0.6.0] - 2026-09-04
 
 ### Changed
