@@ -28,9 +28,10 @@ crate-type = ["rlib", "cdylib"]
 default = []
 # orderbook — realistic execution via option-chain-orderbook (landed in this
 # crate's v0.2 milestone, #22; the crate pin itself is in `[dependencies]`).
-# Pulls the matching engine + the optionstratlib 0.18 boundary shim (see the
+# Pulls the matching engine only: since option-chain-orderbook 0.11 it shares
+# this crate's optionstratlib 0.21, so no boundary shim is needed (see the
 # `[dependencies]` audit notes). Absent from the default build.
-orderbook = ["dep:option-chain-orderbook", "dep:optionstratlib_ob"]
+orderbook = ["dep:option-chain-orderbook"]
 # simulator — synthetic chain sessions via OptionChain-Simulator over HTTP.
 # Pulls the async transport (reqwest) + a minimal tokio runtime; NONE of these
 # compile in the default build. (serde_json is now a core dependency — the
@@ -71,7 +72,8 @@ python = ["dep:pyo3"]
 #     aws-lc-rs (C, cmake) and trust store bundled-Mozilla -> OS store; see the
 #     reqwest entry below for the owner decision and its consequences.
 #   option-chain-orderbook 0.9 -> 0.10 (MIT): `book.rs` byte-identical; still
-#     pins optionstratlib ^0.18, so the shim below moves 0.17 -> 0.18.
+#     pinned optionstratlib ^0.18 at the time, so the then-current boundary
+#     shim moved 0.17 -> 0.18 (retired at 0.11; see the next block).
 #   positive 0.5 -> 0.6 (MIT), criterion 0.5 -> 0.8 (Apache-2.0 OR MIT); dev-only.
 #   Lockfile: 27 crates entered and 17 left, counted by name (167 entered and
 #     142 left counted by name+version, where a version bump reads as one of
@@ -88,6 +90,32 @@ python = ["dep:pyo3"]
 #   and `rkyv 0.7` both left the graph, so their two long-standing ignores are
 #   retired. The lockfile bump moves `lockfile_sha256` -> every `run_id`, so the
 #   five frozen bundles are re-blessed (identity-only, proven column by column).
+
+# SHIM RETIREMENT 2026-09-04 (#128). Audit note per CLAUDE.md: what / why /
+# licence / gates.
+#   option-chain-orderbook 0.10 -> 0.11 (MIT). What: the option-chain matching
+#     leaf the realistic fill routes through. Why: upstream republished on
+#     `optionstratlib ^0.21` (alongside orderbook-rs ^0.12.1, async-nats ^0.50)
+#     with NO API change — `OptionOrderBook::new(symbol, OptionStyle)` is
+#     unchanged and the crate still does not re-export `OptionStyle`. Because
+#     the pin now MATCHES this crate's own optionstratlib, the renamed
+#     optionstratlib 0.18 boundary-shim dependency is DELETED: the `orderbook`
+#     build resolves ONE `optionstratlib` (0.21.1) and one each of `positive`,
+#     `expiration_date`, `option_type` and `financial_types`, and
+#     `src/execution/realistic.rs` hands the leaf constructor the crate's own
+#     `optionstratlib::OptionStyle` directly. cargo-deny `duplicate` warnings
+#     fall from 30 to 11 with the two optionstratlib stacks gone; what remains
+#     is unrelated to this seam: the `rand` 0.9-vs-0.10 split (rand, rand_core,
+#     rand_chacha, getrandom, r-efi — proptest/dev vs the direct 0.10 line),
+#     `base64` (0.22 via reqwest / hdrhistogram vs 0.23 via arrow / parquet),
+#     `thiserror` + `thiserror-impl` (1.0 via a transitive vs this crate's
+#     2.0), `syn` (2 vs 3), `hashbrown` (0.14 vs 0.17) and `unicode-width`
+#     (0.1 vs 0.2). All warnings, not errors. Licence: MIT.
+#   Gates: cargo audit --deny warnings + cargo deny --all-features check green,
+#     ignore list still EMPTY. The lockfile edit moves `lockfile_sha256` ->
+#     every `run_id`, so the five frozen bundles are re-blessed (identity-only,
+#     proven column by column: only `fills.strategy_run_id` and the manifest
+#     `run_id` / `lockfile_sha256` move).
 chrono = "0.4"
 optionstratlib = { version = "0.21", default-features = false }
 rust_decimal = { version = "1", features = ["serde"] }
@@ -167,29 +195,15 @@ serde_json = "1"
 # default build (#22, ADR-0002). `default-features = false` disables its `nats`
 # (async-nats/tokio) and `sequencer` (tokio/journal) optional stacks, so nothing
 # async is pulled and the book is driven in-process/synchronously. Transitive:
-# orderbook-rs ~0.11 (special_orders), pricelevel ~0.8, dashmap 6, uuid,
-# crossbeam-skiplist — all MIT/Apache-2.0. Audit note: what — the option-chain
-# matching leaf the realistic fill routes through; why — order-book-level fills
-# are the crate differentiator; licence — MIT. `cargo audit` / `cargo deny`
-# stay green (allow-list extended for any new transitive licence).
-option-chain-orderbook = { version = "0.10", default-features = false, optional = true }
-# optionstratlib 0.18 boundary shim — feature `orderbook` only. UNAVOIDABLE
-# version bridge: published `option-chain-orderbook` (0.10.0) pins optionstratlib
-# `^0.18`, while this crate is on optionstratlib 0.21, so the resolver keeps two
-# semver-incompatible optionstratlib copies (and, beneath them, two of
-# `positive`, `expiration_date`, `option_type` and their transitive stacks —
-# most of the `duplicate` warnings cargo-deny reports, 30 at 2026-09-04, trace
-# to this tree; `base64` (0.22 via reqwest / hdrhistogram vs 0.23 via arrow /
-# parquet) and `rand_chacha` (0.9 via proptest vs 0.10 direct) do not. They
-# are warnings, not errors). `OptionOrderBook::new(symbol, OptionStyle)` takes an
-# `optionstratlib::OptionStyle` **by value** and the crate does not re-export
-# it, so the leaf constructor must be handed the 0.18 type. This renamed dep
-# names that one enum (a trivial `Call`/`Put`) at the seam in
-# `src/execution/realistic.rs` and nowhere else; the whole crate otherwise uses
-# optionstratlib 0.21. Licence: MIT. DEVIATION for architect review — remove
-# this shim once `option-chain-orderbook` republishes on optionstratlib 0.21 (or
-# re-exports `OptionStyle`); see the module docs in `realistic.rs`.
-optionstratlib_ob = { package = "optionstratlib", version = "0.18", default-features = false, optional = true }
+# orderbook-rs ~0.12.1 (special_orders), pricelevel ~0.9, dashmap 6, uuid,
+# crossbeam-skiplist — all MIT/Apache-2.0. Since 0.11 it pins
+# `optionstratlib ^0.21`, the same range this crate itself uses, so the seam
+# needs no version bridge (see the SHIM RETIREMENT note above). Audit note:
+# what — the option-chain matching leaf the realistic fill routes through;
+# why — order-book-level fills are the crate differentiator; licence — MIT.
+# `cargo audit` / `cargo deny` stay green (allow-list extended for any new
+# transitive licence).
+option-chain-orderbook = { version = "0.11", default-features = false, optional = true }
 # PyO3 — the Rust↔Python FFI layer, feature `python` only (#38, ADR-0005),
 # absent from the default / crates.io build. `abi3-py310` targets the stable
 # ABI from Python 3.10, so ONE `cp310-abi3` wheel serves 3.10+ instead of one

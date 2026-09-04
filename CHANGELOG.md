@@ -47,6 +47,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The `optionstratlib` boundary shim is retired; `option-chain-orderbook`
+  moves 0.10 -> 0.11 (#128).** Upstream republished the matching leaf on
+  `optionstratlib ^0.21`, the same line this crate is on, with no API change
+  (its published `src/` tree is byte-identical to 0.10.0; only the manifest
+  moved, also raising `orderbook-rs` to `^0.12.1` and `async-nats` to `^0.50`).
+  The renamed `optionstratlib` 0.18 dependency that existed solely to hand
+  `OptionOrderBook::new` an `OptionStyle` of the version it pinned is therefore
+  **deleted**, along with the `Call`/`Put` bridge in
+  `src/execution/realistic.rs`, which now passes the crate's own
+  `optionstratlib::OptionStyle` straight through. The `orderbook` feature no
+  longer names a second optionstratlib, and the `orderbook` build resolves a
+  single `optionstratlib`, `positive`, `expiration_date`, `option_type` and
+  `financial_types`: cargo-deny `duplicate` warnings fall from 30 to 11, with
+  only unrelated splits left (the `rand` 0.9/0.10 stack, `base64`, `thiserror`,
+  `syn`, `hashbrown`, `unicode-width`). `cargo audit --deny warnings` and
+  `cargo deny --all-features check` stay green with an empty ignore list. No
+  behaviour change: the lockfile edit moves `lockfile_sha256`, so the five
+  frozen bundles were re-blessed and the re-bless was proven **identity-only**
+  column by column with pyarrow — across 20 Parquet tables and 225 columns the
+  only column that moved is `fills.strategy_run_id`, and across 5 manifests and
+  691 leaf fields the only fields that moved are `run_id` and
+  `lockfile_sha256` (`code_version` stays `0.6.0`).
+
 - **Every byte-affecting Parquet writer setting is now pinned explicitly.**
   `writer_properties()` pinned only the compression codec and `created_by`,
   so the rest of the bundle's byte layout rode on the `parquet` crate's

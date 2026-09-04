@@ -66,24 +66,12 @@
 //!    remainder, and returns `Ok` with every fill in the call's own
 //!    [`TradeResult`]; the adapter then discards the resting remainder with
 //!    `cancel_order` when the intent is IOC. Deterministic, and no fill is lost.
-//!
-//! # optionstratlib version shim (for architect review)
-//!
-//! `OptionOrderBook::new(symbol, OptionStyle)` takes an
-//! `optionstratlib::OptionStyle` **by value**, and the published crate (0.10.0)
-//! pins optionstratlib `^0.18` while `ironcondor` is on 0.21. The resolver
-//! keeps two optionstratlib copies; this module names the 0.18 `OptionStyle`
-//! (aliased [`ObOptionStyle`]) **only** to construct leaf books, converting from
-//! the crate's 0.21 [`OptionStyle`] with a trivial `Call`/`Put` match. Remove
-//! the `optionstratlib_ob` shim once the matching crate republishes on
-//! optionstratlib 0.21 (or re-exports `OptionStyle`).
 
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
 
 use option_chain_orderbook::{OptionOrderBook, OrderId as ObOrderId, Side as ObSide, TradeResult};
-use optionstratlib::{OptionStyle, Side};
-use optionstratlib_ob::OptionStyle as ObOptionStyle;
+use optionstratlib::Side;
 
 use crate::config::{FeeSchedule, LiquidityProfile};
 use crate::domain::{
@@ -358,7 +346,8 @@ impl RealisticFill {
     /// Get (or lazily construct) the leaf [`OptionOrderBook`] for `contract`.
     ///
     /// The book is keyed by the contract's identity and constructed with its
-    /// canonical `contract_id` symbol and 0.21→0.18 [`OptionStyle`] conversion.
+    /// canonical `contract_id` symbol and its
+    /// [`OptionStyle`](optionstratlib::OptionStyle).
     ///
     /// # Errors
     ///
@@ -1039,7 +1028,8 @@ impl ExecutionModel for RealisticFill {
 /// the same time).
 ///
 /// The book is keyed by the contract's identity and constructed with its
-/// canonical `contract_id` symbol and 0.21→0.18 [`OptionStyle`] conversion.
+/// canonical `contract_id` symbol and its
+/// [`OptionStyle`](optionstratlib::OptionStyle).
 ///
 /// # Errors
 ///
@@ -1053,7 +1043,7 @@ fn leaf_book_in<'a>(
         Entry::Occupied(e) => Ok(&*e.into_mut()),
         Entry::Vacant(e) => {
             let symbol = contract.to_contract_id()?;
-            let book = OptionOrderBook::new(symbol, ob_option_style(contract.style));
+            let book = OptionOrderBook::new(symbol, contract.style);
             Ok(&*e.insert(book))
         }
     }
@@ -1084,16 +1074,6 @@ const fn ob_side(side: Side) -> ObSide {
     match side {
         Side::Long => ObSide::Buy,
         Side::Short => ObSide::Sell,
-    }
-}
-
-/// Convert the crate's 0.21 [`OptionStyle`] to the 0.18 [`ObOptionStyle`] the
-/// leaf-book constructor takes (the version shim; see the module docs).
-#[must_use]
-fn ob_option_style(style: OptionStyle) -> ObOptionStyle {
-    match style {
-        OptionStyle::Call => ObOptionStyle::Call,
-        OptionStyle::Put => ObOptionStyle::Put,
     }
 }
 
