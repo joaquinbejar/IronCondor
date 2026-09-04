@@ -1623,7 +1623,8 @@ mod tests {
 
     use chrono::DateTime;
     use optionstratlib::{ExpirationDate, OptionStyle, Side};
-    use rand_chacha::rand_core::Rng;
+    use rand_chacha::ChaCha8Rng;
+    use rand_chacha::rand_core::{Rng, SeedableRng};
     use rust_decimal_macros::dec;
 
     use super::{BacktestEngine, BacktestRun, vwap_cents};
@@ -2184,6 +2185,35 @@ mod tests {
         assert_eq!(a.equity_curve, b.equity_curve);
         assert_eq!(a.open_at_end, b.open_at_end);
         assert_eq!(a.result.final_capital, b.result.final_capital);
+    }
+
+    /// Known-answer test for the seeded RNG: the first draws of
+    /// `ChaCha8Rng::seed_from_u64` are pinned to literal values so a
+    /// `rand_chacha` / `rand_core` bump that silently changes the seed
+    /// expander or the stream fails here, instead of only in a strategy that
+    /// draws from `ctx.rng` (the same-seed tests above compare a run against
+    /// itself and cannot see a stream change). Values captured on
+    /// rand_chacha 0.10.0, which the 2026-09-04 refresh probed identical to
+    /// 0.3.1 for `seed_from_u64` + `next_u32`.
+    #[test]
+    fn test_chacha8_seeded_stream_is_pinned() {
+        let draws = |seed: u64| -> [u32; 4] {
+            let mut rng = ChaCha8Rng::seed_from_u64(seed);
+            [
+                rng.next_u32(),
+                rng.next_u32(),
+                rng.next_u32(),
+                rng.next_u32(),
+            ]
+        };
+        assert_eq!(
+            draws(42),
+            [962_419_617, 2_928_721_845, 628_724_104, 4_081_401_798]
+        );
+        assert_eq!(
+            draws(0),
+            [2_811_902_828, 3_045_455_719, 3_134_767_159, 2_001_118_559]
+        );
     }
 
     #[test]

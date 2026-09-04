@@ -17,7 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   semver-incompatible boundary — `optionstratlib` 0.18 → 0.21, `rand_chacha`
   0.3 → 0.10, `sha2` 0.10 → 0.11, `reqwest` 0.12 → 0.13,
   `option-chain-orderbook` 0.9 → 0.10, and the dev-only `positive` 0.5 → 0.6
-  and `criterion` 0.5 → 0.8 — and the lockfile gains 46 entries and loses 21
+  and `criterion` 0.5 → 0.8 — and 27 crates enter the lockfile while 17 leave
   (`arrow`/`parquet` 59.1 → 59.3 among the in-range moves; the TLS stack swap
   below accounts for most of the additions). Each bump carries a dated
   audit note in `Cargo.toml` (what, why, licence, gates), and each claim below
@@ -50,8 +50,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `option-chain-orderbook` 0.10.0's `book.rs` is byte-identical to 0.9.1.
   - **The `orderbook` shim stays, moved 0.17 → 0.18.** `option-chain-orderbook`
     0.10.0 still pins `optionstratlib ^0.18`, so the resolver keeps two copies
-    (and two of `positive`, `expiration_date`, `option_type`, `rand_chacha`
-    beneath them); the 30 `duplicate` warnings `cargo deny` prints are that tree.
+    (and two of `positive`, `expiration_date`, `option_type` beneath them);
+    most of the 30 `duplicate` warnings `cargo deny` prints are that tree
+    (`base64` and `rand_chacha` duplicate for unrelated reasons).
     Retiring it needs `option-chain-orderbook` to republish on 0.21.
   - **`reqwest` 0.13 changes the simulator client's TLS stack — an owner
     decision, not a rename.** 0.13's `rustls` feature selects `aws-lc-rs` as the
