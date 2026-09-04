@@ -314,6 +314,47 @@ never approaches it.
 
 ---
 
+### Re-measurement 2026-09-04 — the dependency refresh (#125) is performance-neutral
+
+The refresh that moved `optionstratlib` 0.18 -> 0.21 (with `rand` 0.10,
+`positive` 0.6, `rust_decimal` 1.43, `arrow`/`parquet` 59.3, and `reqwest` 0.13
+beneath it) touches crates that sit on the per-step path — `Positive` and
+`Decimal` arithmetic in the exit seam and the ledger — so it carries the
+measurement the hot-path rule demands. Two things were measured, in this order,
+on the same machine within one quiet session (no concurrent builds), using
+`scripts/bench_gate.sh` (sample-size 10, measurement-time 5 s):
+
+| Run (back to back) | naive p50 | realistic / naive p50 |
+|---|---|---|
+| `main` @ `cc6b73a` (pre-bump) | 3088 ns/step | 29.97x |
+| branch @ `92442a8` (post-bump) | 3178 ns/step | 29.08x |
+| `main` again (order control) | 3140 ns/step | 28.92x |
+
+- **Branch vs `main`: +2.9 % / -1.7 % on naive per-step, -3 % on the ratio** —
+  inside `main`'s own run-to-run scatter (3088 vs 3140 ns, +1.7 %). The bump
+  does not move the hot path.
+- **The absolute naive figure today (~3.1 us/step) is ~40 % above the
+  2026-07-16 baseline (2186-2354 ns) — on `main` too**, i.e. before the bump.
+  That is the machine on the day (host state; the baseline was taken on rustc
+  1.97.0 / macOS 26.5.2 on 2026-07-16), not the code, and it is exactly the
+  case the gate's **dimensionless** overhead band exists for: the ratio
+  (~29x, band [18x, 72x]) is unaffected by a uniform clock factor, and the
+  absolute naive figure is held only by the coarse 100 000 ns backstop.
+- A first `release_check.sh` pass measured **53.07x** with other `cargo`
+  builds running concurrently. That number is contention, not a regression —
+  the three quiet runs above are the evidence — and it is recorded here so a
+  future reader who sees it in a log does not mistake it for a baseline.
+- H3 / H4 / H5 on the branch, same session: conversion per-contract ratio
+  **1.135x** (ceiling 4x), writer per-row ratio **0.262x** (ceiling 2x), PyO3
+  marshal ratio **15.82x** (band [8x, 32x]). All within band; all gates PASS.
+
+The committed baselines above are **not** re-blessed by this note: they remain
+the reference numbers, and the July hardware/OS state they were taken on is
+part of their provenance. What this note pins is that the refresh is neutral
+against that reference under an A/B on identical conditions.
+
+---
+
 ## H3 / PB-4 — Conversion-boundary scaling (v1.0 baseline, #51)
 
 - **Bench:** `benches/conversion.rs` (`cargo bench --bench conversion`)
