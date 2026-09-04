@@ -46,8 +46,8 @@
 //!
 //! # DEVIATIONS from the v0.7.0-era spec (for architect review)
 //!
-//! The pinned [`docs/specs/option-chain-orderbook.md`] describes v0.7.0; the
-//! resolved crate is **0.10.0** (its `book.rs`, the whole seam this module
+//! The pinned [`docs/specs/option-chain-orderbook.md`] describes 0.10.0, the
+//! resolved crate (its `book.rs`, the whole seam this module
 //! touches, is byte-identical to 0.9.1). Two deliberate deviations:
 //!
 //! 1. **Capture via `add_limit_order_full`, not
