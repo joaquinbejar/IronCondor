@@ -8,6 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`release.yml` can rebuild and publish an existing tag by manual dispatch.**
+  `gh workflow run release.yml --ref main -f tag=vX.Y.Z` runs `main`'s workflow
+  definition against the tag's sources: a new `resolve-tag` job binds the run
+  to the input (well-formed `vX.Y.Z`, the tag exists, its `Cargo.toml` version
+  equals it, its commit is on `main`), every job checks out that ref, and the
+  publish job accepts the validated input alongside a pushed tag while the
+  `PYPI_PUBLISH_ENABLED` variable, the `pypi` environment and OIDC gates stay
+  unchanged. This is the RELEASE-PROCESS §7.1 recovery for a release whose
+  wheels failed for a **workflow** reason (the `0.6.0` case: a retired runner
+  label baked into the tag's workflow file), so the tag and the crates.io
+  version stay untouched.
+
 ### Fixed
 
 - **macOS wheel builds target live GitHub runners.** The `release` workflow
