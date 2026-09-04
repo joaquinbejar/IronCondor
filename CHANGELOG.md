@@ -8,6 +8,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Realistic-mode per-step allocation is now gated.** `tests/zero_alloc.rs`
+  gained an `orderbook`-gated `realistic` module that drives the same harness
+  with `RealisticFill` instead of `NaiveFill`. Realistic fills route through the
+  upstream matching engine, so their warm step cannot be zero-allocation; it is
+  gated at a **measured ceiling** of 705 allocation events per warm step (the
+  measured ≈ 564 plus 25 % headroom) together with a **linearity** assertion that
+  the second half of the warm window matches the first within 5 %, so a per-step
+  leak fails the build even though the absolute count is non-zero. A negative
+  test injecting 400 allocations per step proves the ceiling bites. The
+  `zero-alloc` CI job now runs the file twice, with and without the `orderbook`
+  feature. `BENCH.md` records the 2026-09-04 re-measurement on the current
+  lockfile, including the ~0.08 % run-to-run jitter in the upstream allocation
+  count that motivates a ceiling rather than an equality. Test-only; no
+  production code changed.
+
 ### Fixed
 
 - **macOS wheel builds target live GitHub runners.** The `release` workflow

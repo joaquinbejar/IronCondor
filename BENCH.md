@@ -235,17 +235,31 @@ taken at p50 and p99, where both histograms are solid.
 - **Scale.** 2048 steps × 4 legs; single core (Monte-Carlo parallelism is across
   runs, not within one).
 
-### Per-step allocation — realistic mode is NOT under the zero-alloc gate
+### Per-step allocation — realistic mode is gated at a measured budget
 
-The naive warm step allocates **0 events/step** and IS gated (PB-1 below). The
-**realistic warm step is intentionally NOT gated**, and this is an honest,
-measured cost, not an oversight:
+The naive warm step allocates **0 events/step** and IS gated at zero (PB-1
+below). The **realistic warm step allocates by construction** — this is an
+honest, measured cost, not an oversight — so since #127 it is gated at a
+**measured ceiling** rather than at zero:
 
-- **Measured:** on the 4-leg condor, realistic mode allocates **≈ 564 allocation
-  events per warm step** (headline derivation: steady-state tail delta 31 005
-  events over 55 warm steps ⇒ 31 005 / 55 ≈ 564/step — measured with the same
-  counting-`GlobalAlloc` technique as `tests/zero_alloc.rs`, driving
-  `RealisticFill` instead of `NaiveFill`).
+- **Measured (2026-09-04, re-measured on the current lockfile:
+  `option-chain-orderbook` 0.10.0 / `orderbook-rs` 0.12.1 / `pricelevel` 0.9.1).**
+  On the 4-leg condor at seed 42, realistic mode allocates **≈ 564 allocation
+  events per warm step**: the steady-state tail delta over the 55 warm steps
+  `K = 8 .. LAST = 63` was **30 970–30 996 events** across eight processes
+  (30 996 / 55 ≈ 563.6/step) — measured with the same counting-`GlobalAlloc`
+  harness as `tests/zero_alloc.rs`, driving `RealisticFill` instead of
+  `NaiveFill`. The earlier figure recorded here (31 005 events, 2026-07) is
+  reproduced within 0.1 %.
+- **Not byte-identical across processes.** Unlike the naive gate's exact zero,
+  the realistic allocation *count* jitters run to run: every warm step differs by
+  roughly ±10 events out of ≈ 560 (≈ 2 % per step), which averages out to a
+  0.08 % spread on the 55-step tail. The jitter comes from the upstream lock-free
+  structures (`crossbeam-skiplist` node heights, `crossbeam-epoch` deferred
+  reclamation), whose allocation *pattern* is timing-dependent. **The run's
+  results are unaffected** — the `iron_condor_realistic` golden bundle is
+  byte-frozen and passes — only the allocation-event count moves. This is why the
+  gate is a ceiling with headroom and never an equality.
 - **Why.** The per-step book refresh (#25) calls
   `OptionOrderBook::add_limit_order_full` for every reseed level, and each call
   returns an **owned `TradeResult` whose `symbol` `String` heap-allocates upstream
@@ -257,13 +271,27 @@ measured cost, not an oversight:
   for the ≈ 564 events. `ironcondor`'s own tracking state (`resting_seed_ids` /
   `seed_plan`) is cleared **in place** and does not contribute steady-state
   allocation; the residual is entirely upstream capture-API cost.
-- **Consequence.** Adding realistic mode to the PB-1 zero-alloc gate would make
-  the gate a **lie** (it would fail, or force a false invariant), so the gate
-  stays naive-only. The overhead ratio above **already reflects** this allocation
-  cost — it is priced into the 36× number. The residual is a candidate for a
-  future **upstream symbol-borrowing optimisation** (a capture API that borrows
-  the book's symbol rather than cloning it into each `TradeResult`); when that
-  lands, the ratio here is the before-number to measure against.
+- **The gate (`tests/zero_alloc.rs`, module `realistic`).** Budget
+  **705 events/warm step** = the measured 564 + 25 % headroom, rounded up — the
+  same factor-with-headroom discipline as `scripts/bench_gate.sh`. The
+  measurement sits at ~80 % of the ceiling. A second assertion pins **linearity**:
+  the delta over the first 27 warm steps must match the delta over the last 27
+  within 5 %. Measured, the second window runs **2.47 %–2.77 % below** the first
+  (a warm-up decay from ≈ 660 events/step early to a ≈ 555 plateau) and each
+  window varies ≤ 0.25 % between processes, so 5 % carries ~1.8× margin while
+  still catching a leak — a leak makes the second window grow without bound. A
+  negative test injecting 400 allocations per step (≈ 2.8× the headroom) confirms
+  the ceiling bites.
+- **Consequence.** Realistic mode is **gated as a ceiling, not as zero**: gating
+  it at zero would make the gate a lie (it would fail, or force a false
+  invariant), and leaving it ungated let an upstream regression pass unseen. The
+  headroom absorbs upstream patch-level churn, never a leak — if the gate fails,
+  find the new allocation rather than raise the budget. The overhead ratio above
+  **already reflects** this allocation cost: it is priced into the 36× number.
+  The residual is a candidate for a future **upstream symbol-borrowing
+  optimisation** (a capture API that borrows the book's symbol rather than
+  cloning it into each `TradeResult`); when that lands, the ratio here is the
+  before-number to measure against.
 
 ### Downstream — the naive-throughput / overhead regression gate (this issue)
 
@@ -481,7 +509,8 @@ a correctness test, not a benchmark: a regression **fails the build**
 
 - **Gate:** `tests/zero_alloc.rs` (`cargo test --test zero_alloc`); CI job
   `zero-alloc`, separate from the `naive_throughput` bench (PB-2 above) and the
-  `golden` job (#17).
+  `golden` job (#17). The same job also runs the file under `--features
+  orderbook`, which adds the realistic-mode ceiling gate (#127, PB-3 above).
 - **What it measures.** Allocation **events** (each `alloc` / `alloc_zeroed` /
   `realloc`) inside the engine's **per-step body** must **not grow with step
   count**. A test-only counting `GlobalAlloc` (per-thread counter, immune to
@@ -529,12 +558,14 @@ a correctness test, not a benchmark: a regression **fails the build**
 - **The gate bites.** Injecting one `Vec` allocation into the step body yields a
   non-zero tail delta (55 = one event per tail step) — the negative test proves
   a real regression fails the gate.
-- **Naive-mode only, by design.** This gate covers the **naive** warm step (0
-  events/step). The **realistic** warm step is intentionally **out of scope**: it
-  allocates ≈ 564 events/step from the upstream `add_limit_order_full` capture API
-  (the #25 P2-01 finding), so gating it to zero would be a lie. That cost is
-  measured, documented, and priced into the overhead ratio in **PB-3 above** —
-  see its "Per-step allocation" block.
+- **The zero applies to the naive warm step only.** This gate asserts **0
+  events/step** for the **naive** step body. The **realistic** warm step cannot be
+  zero — it allocates ≈ 564 events/step through the upstream
+  `add_limit_order_full` capture API (the #25 P2-01 finding) — so since #127 it is
+  gated in the **same file** at a **measured ceiling plus a linearity assertion**
+  rather than at zero (`cargo test --features orderbook --test zero_alloc`, run by
+  the same `zero-alloc` CI job). Numbers, the jitter caveat and the budget
+  derivation live in **PB-3 above** — see its "Per-step allocation" block.
 
 ### Run conditions
 
