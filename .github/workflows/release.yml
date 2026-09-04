@@ -81,8 +81,8 @@ jobs:
   #   - Linux x86_64  : manylinux (portable across glibc distros) via
   #                     maturin-action's `manylinux: auto` (builds in the
   #                     official manylinux container).
-  #   - macOS x86_64  : native build on the Intel macos-13 runner.
-  #   - macOS arm64   : native build on the Apple-silicon macos-14 runner.
+  #   - macOS x86_64  : native build on the Intel macos-15-intel runner.
+  #   - macOS arm64   : native build on the Apple-silicon macos-15 runner.
   # Two NATIVE per-arch macOS wheels (not a single fat `universal2`) because:
   #   * pip selects the right wheel per architecture — no wasted bytes for users;
   #   * each wheel is ~half the size of a universal2 fat binary;

@@ -327,7 +327,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-14]
+        # macos-14 is deprecated by GitHub (only the two newest macOS images
+        # stay); macos-15 is GA. Keep this label in step with release.yml's
+        # arm64 wheel runner so PR CI exercises the image the tag run uses.
+        os: [ubuntu-24.04, macos-15]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
