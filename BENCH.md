@@ -257,14 +257,17 @@ honest, measured cost, not an oversight — so since #127 it is gated at a
   `NaiveFill`. The earlier figure recorded here (31 005 events, 2026-07) falls
   inside that interval.
 - **Measurement platform.** macOS 26.6.2, Apple silicon (arm64), rustc 1.97.0
-  (2d8144b78 2026-07-07), `test` profile. CI runs the gate on `ubuntu-24.04`,
-  which has **not** been measured separately: allocation-event counts are
-  determined by the code path rather than by clock speed, and the 25 % headroom
-  is expected to cover any platform difference, but that expectation is an
-  argument, not a measurement. **This is the open gap in this entry**: the
-  `ubuntu-24.04` count should be recorded here once observed. The gate prints
-  nothing on success, so obtaining it needs a one-off run on that image with a
-  temporary print (or a deliberately failing assert) rather than a green CI run.
+  (2d8144b78 2026-07-07), `test` profile. **CI runner observed (2026-09-04,
+  `ubuntu-24.04`, linux x86_64, rustc 1.97.0):** tail delta **30 159** events
+  over the 55 warm steps (≈ 548/step), reported by the `zero-alloc` job's own
+  log (`ZERO_ALLOC_REPORT=1` + `--nocapture`, which the job now sets for the
+  `--features orderbook` run, so every CI run keeps the count on the record).
+  That is 2.6 % **below** the macOS range, at 78 % of the 705/step ceiling, and
+  the one-sided linearity check passed there too. Allocation-event counts are
+  determined by the code path rather than by clock speed; the residual
+  platform difference sits inside the run-to-run jitter's mechanism (the
+  upstream lock-free structures' deferred reclamation), and the 25 % headroom
+  covers it with margin. One observation so far; the job log carries the rest.
 - **Not reproducible run to run.** Unlike the naive gate's exact zero, the
   realistic allocation *count* moves between runs, at both scales, and the two
   scales were recorded separately. **Per step:** the full 63-step sample series
