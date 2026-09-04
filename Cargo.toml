@@ -52,7 +52,8 @@ simulator = ["dep:reqwest", "dep:tokio"]
 python = ["dep:pyo3"]
 
 [dependencies]
-# DEPENDENCY REFRESH 2026-09-04 (every direct dep at its latest stable). Audit
+# DEPENDENCY REFRESH 2026-09-04 (v0.6.0) — every direct dep at its latest
+# stable. Audit
 # note per CLAUDE.md: what / why / licence / gates.
 #   optionstratlib 0.18 -> 0.21 (MIT). Every symbol this crate uses exists
 #     unchanged (IronCondor::new / ShortStrangle::new arities identical); it
@@ -73,7 +74,8 @@ python = ["dep:pyo3"]
 #     reqwest entry below for the owner decision and its consequences.
 #   option-chain-orderbook 0.9 -> 0.10 (MIT): `book.rs` byte-identical; still
 #     pinned optionstratlib ^0.18 at the time, so the then-current boundary
-#     shim moved 0.17 -> 0.18 (retired at 0.11; see the next block).
+#     shim moved 0.17 -> 0.18 (retired at 0.11 by the SHIM RETIREMENT block
+#     below).
 #   positive 0.5 -> 0.6 (MIT), criterion 0.5 -> 0.8 (Apache-2.0 OR MIT); dev-only.
 #   Lockfile: 27 crates entered and 17 left, counted by name (167 entered and
 #     142 left counted by name+version, where a version bump reads as one of
@@ -112,6 +114,14 @@ python = ["dep:pyo3"]
 #     `thiserror` + `thiserror-impl` (1.0 via a transitive vs this crate's
 #     2.0), `syn` (2 vs 3), `hashbrown` (0.14 vs 0.17) and `unicode-width`
 #     (0.1 vs 0.2). All warnings, not errors. Licence: MIT.
+#   Lockfile: 418 -> 393 entries. 26 name+version entries left and 1 entered
+#     (`option-chain-orderbook` 0.11.0, which reads as one of each); the 25
+#     others are pure departures — the 0.18 optionstratlib stack
+#     (`optionstratlib` 0.18.1, `positive` 0.5.1, `expiration_date` 0.2.1,
+#     `option_type` 0.1.2) and everything only it reached. SIX crate names
+#     leave the graph entirely: `arbitrary`, `crc`, `crc-catalog`,
+#     `derive_arbitrary`, `generic-array`, `zeroize_derive`. Nothing new
+#     arrives, so there is no new licence or advisory surface to vet.
 #   Gates: cargo audit --deny warnings + cargo deny --all-features check green,
 #     ignore list still EMPTY. The lockfile edit moves `lockfile_sha256` ->
 #     every `run_id`, so the five frozen bundles are re-blessed (identity-only,

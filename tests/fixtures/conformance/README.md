@@ -38,20 +38,29 @@ Both regenerate identically with:
 BLESS=1 cargo test --features orderbook --test conformance
 ```
 
-## Copy-loadable into ChainView (consumer side — user action)
+## Vendored into ChainView (consumer side — a resync is owed)
 
-ChainView already ships a bundle **reader** (`src/replay/{mod,tables,validate}.rs`)
-that parses `ironcondor.bundle.v1`, but has **no committed copy of this fixture
-yet** (its replay integration/goldens milestone is where the identical bytes
-land). This directory is **copy-loadable unchanged** into ChainView's documented
-fixture path:
+ChainView ships a bundle **reader** (`src/replay/{mod,tables,validate}.rs`) that
+parses `ironcondor.bundle.v1`, and it **does** carry a committed copy of this
+fixture — the same five files, byte-identical, at:
 
 ```
-ChainView/tests/fixtures/bundle/valid/
+ChainView/tests/fixtures/bundle/ironcondor_conformance/
 ```
 
-Copy these five files there verbatim (no conversion). ChainView's replay tests
-should then assert, against the identical bytes:
+That copy is vendored at the **0.5.0 generation** (`run_id` `c4cd155f…`,
+`code_version` `0.5.0`), so it was already one generation behind `main`
+(`c84acfc0…`, `0.6.0`) and #128's lockfile edit puts it two behind
+(`6e836a5c…`). **ChainView's suite stays green regardless:**
+`tests/replay_bundle_fixtures.rs` pins `IC_RUN_ID` to the `run_id` of *its own*
+vendored bytes and treats it as an **opaque key** (asserting only
+`fills.strategy_run_id == manifest.run_id`), so it never compares against this
+repository's current bytes. A **resync is owed** the next time ChainView
+refreshes the fixture: copy these five files over verbatim (no conversion) and
+re-pin `IC_RUN_ID` plus the `code_version` assertion. There is **no schema
+change** here — the schema tag, table shapes and row counts are untouched; only
+the run-identity fields moved. Against the identical bytes, ChainView's replay
+tests assert:
 
 1. `BundleReader::open` accepts the `schema` tag `ironcondor.bundle.v1`.
 2. `row_counts` cross-checks the decoded table lengths

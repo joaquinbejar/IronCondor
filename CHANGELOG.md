@@ -51,7 +51,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   moves 0.10 -> 0.11 (#128).** Upstream republished the matching leaf on
   `optionstratlib ^0.21`, the same line this crate is on, with no API change
   (its published `src/` tree is byte-identical to 0.10.0; only the manifest
-  moved, also raising `orderbook-rs` to `^0.12.1` and `async-nats` to `^0.50`).
+  moved, also tightening `orderbook-rs` from `^0.12` to `^0.12.1`, resolved
+  version unchanged, and raising `async-nats` to `^0.50`).
   The renamed `optionstratlib` 0.18 dependency that existed solely to hand
   `OptionOrderBook::new` an `OptionStyle` of the version it pinned is therefore
   **deleted**, along with the `Call`/`Put` bridge in
