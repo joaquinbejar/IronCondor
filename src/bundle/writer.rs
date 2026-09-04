@@ -166,6 +166,15 @@ const PARQUET_CREATED_BY: &str = "ironcondor result bundle v1";
 // filters are pinned off) and the Data Page v2 compression-ratio threshold
 // (the writer version is pinned to 1.0, which has no v2 pages).
 //
+// `sorting_columns` stays UNSET, deliberately. Every table IS written in a
+// pinned sort order (`FILLS_SORT_COLUMNS` and friends, applied through the
+// `*_sort_key` helpers), but that order is a documented **table property**,
+// enforced end to end by the writer's sort and the reader's re-sort plus
+// uniqueness / contiguity validation — not by footer metadata. Recording the
+// keys in the Thrift footer would add bytes to every row group and move every
+// bundle's digest, so adopting it is a separate, golden-moving change rather
+// than a free annotation.
+//
 // One byte-affecting input is NOT pinnable by a setting: the `ARROW:schema`
 // key-value entry that `ArrowWriter` injects into its own copy of the
 // properties (`with_skip_arrow_metadata(false)`, the pinned default). Its
@@ -1383,6 +1392,10 @@ mod tests {
         // `test_non_dictionary_encoding_is_plain_and_bytes_are_frozen`; its base64 value
         // comes from the `arrow` crate and is pinned by the lockfile alone.
         assert!(props.key_value_metadata().is_none());
+        // Unset by decision, not by omission: the pinned per-table sort order
+        // is carried by the writer's sort and the reader's validation, and
+        // recording it in the footer would move every bundle's bytes (see the
+        // constants block above).
         assert!(props.sorting_columns().is_none());
     }
 
