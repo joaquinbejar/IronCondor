@@ -246,26 +246,46 @@ honest, measured cost, not an oversight — so since #127 it is gated at a
   `option-chain-orderbook` 0.10.0 / `orderbook-rs` 0.12.1 / `pricelevel` 0.9.1).**
   On the 4-leg condor at seed 42, realistic mode allocates **≈ 564 allocation
   events per warm step**: the steady-state tail delta over the 55 warm steps
-  `K = 8 .. LAST = 63` was **30 970–30 996 events** across eight processes
-  (30 996 / 55 ≈ 563.6/step) — measured with the same counting-`GlobalAlloc`
+  `K = 8 .. LAST = 63` was **30 969–31 019 events observed over 24 runs**
+  (31 019 / 55 ≈ 564.0/step) — measured with the same counting-`GlobalAlloc`
   harness as `tests/zero_alloc.rs`, driving `RealisticFill` instead of
-  `NaiveFill`. The earlier figure recorded here (31 005 events, 2026-07) is
-  reproduced within 0.1 %.
-- **Not byte-identical across processes.** Unlike the naive gate's exact zero,
-  the realistic allocation *count* jitters run to run: every warm step differs by
+  `NaiveFill`. The earlier figure recorded here (31 005 events, 2026-07) falls
+  inside that interval.
+- **Measurement platform.** macOS 26.6.2, Apple silicon (arm64), rustc 1.97.0
+  (2d8144b78 2026-07-07), `test` profile. CI runs the gate on `ubuntu-24.04`,
+  which has **not** been measured separately: allocation-event counts are
+  determined by the code path rather than by clock speed, and the 25 % headroom
+  is expected to cover any platform difference, but that expectation is an
+  argument, not a measurement.
+- **Not reproducible run to run.** Unlike the naive gate's exact zero, the
+  realistic allocation *count* moves between runs: every warm step differs by
   roughly ±10 events out of ≈ 560 (≈ 2 % per step), which averages out to a
-  0.08 % spread on the 55-step tail. The jitter comes from the upstream lock-free
-  structures (`crossbeam-skiplist` node heights, `crossbeam-epoch` deferred
-  reclamation), whose allocation *pattern* is timing-dependent. **The run's
+  **≈ 0.2 % spread** on the 55-step tail. It is **not** per-process seeding:
+  three identical back-to-back runs inside a *single* process gave 30 988 /
+  30 980 / 30 984, so address-space layout and per-process hash keying are ruled
+  out and the cause is process-global carried state — `crossbeam-epoch`'s global
+  collector and its deferred-reclamation bags, whose allocation *pattern* depends
+  on when reclamation fires. (Node height in `crossbeam-skiplist` 0.1.3 is *not*
+  a contributor: `random_height` draws from a per-list seed initialised to a
+  constant, and `Node::alloc` is one allocation whatever the height.) **The run's
   results are unaffected** — the `iron_condor_realistic` golden bundle is
   byte-frozen and passes — only the allocation-event count moves. This is why the
   gate is a ceiling with headroom and never an equality.
+- **Scope: a gated warm step is a book REFRESH with no fills.** The condor opens
+  once at `on_start` and the exit policy never triggers, so the run's only fills
+  land at step 0 (four opens) and at step 63 after the last sample (four `on_end`
+  closes) — both outside the measured window. Every warm step issues zero orders
+  of its own, so the ≈ 564 events are the per-step liquidity reseed alone and
+  **per-fill allocation in realistic mode is not gated here**.
 - **Why.** The per-step book refresh (#25) calls
   `OptionOrderBook::add_limit_order_full` for every reseed level, and each call
   returns an **owned `TradeResult` whose `symbol` `String` heap-allocates upstream
   even when nothing crosses** (the #25 P2-01 finding — see the
   `resting_seed_ids` doc comment in `src/execution/realistic.rs`). With ≈ 48
-  reseed orders + 48 cancels per step across the four legs, that upstream
+  reseed orders + 48 cancels per step across the four legs — a count that follows
+  from the fixture, `4 quotes × 2 sides × (1 + depth_levels)` with
+  `LiquidityProfile::depth_levels` defaulting to 5, and a ladder that stops early
+  if a level's size rounds to zero — that upstream
   per-call capture cost — the symbol `String` (~48–96 events) **plus the matching
   engine's internal per-order allocations**, which are the larger share — accounts
   for the ≈ 564 events. `ironcondor`'s own tracking state (`resting_seed_ids` /
@@ -274,14 +294,26 @@ honest, measured cost, not an oversight — so since #127 it is gated at a
 - **The gate (`tests/zero_alloc.rs`, module `realistic`).** Budget
   **705 events/warm step** = the measured 564 + 25 % headroom, rounded up — the
   same factor-with-headroom discipline as `scripts/bench_gate.sh`. The
-  measurement sits at ~80 % of the ceiling. A second assertion pins **linearity**:
-  the delta over the first 27 warm steps must match the delta over the last 27
-  within 5 %. Measured, the second window runs **2.47 %–2.77 % below** the first
-  (a warm-up decay from ≈ 660 events/step early to a ≈ 555 plateau) and each
-  window varies ≤ 0.25 % between processes, so 5 % carries ~1.8× margin while
-  still catching a leak — a leak makes the second window grow without bound. A
-  negative test injecting 400 allocations per step (≈ 2.8× the headroom) confirms
-  the ceiling bites.
+  measurement sits at ~80 % of the ceiling. Because the count is a function of
+  the fixture, **changing `common::condor_rows`' quote universe or the default
+  `LiquidityProfile` invalidates the budget** — it must then be re-measured, not
+  rescaled. Note too that `K = 8` is shared with the naive gate and sits inside
+  the book's own warm-up head (≈ 662 events at step 1, a ≈ 555 plateau only from
+  about step 37), so 564 is the **window average**, conservative for a ceiling.
+  A second assertion pins **linearity**,
+  **one-sided**: the delta over the last 27 warm steps may exceed the delta over
+  the first 27 by at most **2 %**, and a *smaller* second window is never a leak
+  so it is not bounded at all. The direction matters, because the measured second
+  window runs **2.47 %–2.77 % below** the first (a warm-up decay from ≈ 660
+  events/step early to a ≈ 555 plateau); a two-sided check would let a leak first
+  cancel that decay, needing ≈ 7.7 % of growth before firing, and would report a
+  false "leak" wherever the decay runs longer. One-sided, the tolerance only has
+  to absorb the ≤ 0.25 % inter-process jitter of a single window, so 2 % is 8×
+  that jitter and still fires on ≈ 11 extra events per step. Two negative tests
+  confirm both assertions bite: a constant 400 allocations per step (≈ 2.8× the
+  headroom) breaks the ceiling, and an allocation count that **grows with the
+  step index** (8 per index, a leak's shape) drives the second window 5635–5645
+  events above the first against a 399–400 tolerance, ~14× the margin.
 - **Consequence.** Realistic mode is **gated as a ceiling, not as zero**: gating
   it at zero would make the gate a lie (it would fail, or force a false
   invariant), and leaving it ungated let an upstream regression pass unseen. The

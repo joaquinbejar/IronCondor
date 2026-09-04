@@ -15,15 +15,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with `RealisticFill` instead of `NaiveFill`. Realistic fills route through the
   upstream matching engine, so their warm step cannot be zero-allocation; it is
   gated at a **measured ceiling** of 705 allocation events per warm step (the
-  measured ≈ 564 plus 25 % headroom) together with a **linearity** assertion that
-  the second half of the warm window matches the first within 5 %, so a per-step
-  leak fails the build even though the absolute count is non-zero. A negative
-  test injecting 400 allocations per step proves the ceiling bites. The
-  `zero-alloc` CI job now runs the file twice, with and without the `orderbook`
-  feature. `BENCH.md` records the 2026-09-04 re-measurement on the current
-  lockfile, including the ~0.08 % run-to-run jitter in the upstream allocation
-  count that motivates a ceiling rather than an equality. Test-only; no
-  production code changed.
+  measured ≈ 564 plus 25 % headroom) together with a **one-sided linearity**
+  assertion that the second half of the warm window exceeds the first by at most
+  2 %, so a per-step leak fails the build even though the absolute count is
+  non-zero. The check is one-sided because the measured second window sits
+  2.5 % *below* the first from the book's warm-up decay; bounding that direction
+  too would both mask a leak and false-fire on slower hardware. Two negative
+  tests prove the gate bites: a constant 400 allocations per step breaks the
+  ceiling, and an allocation count growing with the step index breaks the
+  linearity check. The `zero-alloc` CI job now runs the file twice, with and
+  without the `orderbook` feature. `BENCH.md` records the 2026-09-04
+  re-measurement on the current lockfile, the measurement platform, the ~0.2 %
+  run-to-run spread in the upstream allocation count that motivates a ceiling
+  rather than an equality, and the two scope limits worth knowing: a gated warm
+  step is a book refresh with no fills, so per-fill cost is not covered, and the
+  budget follows from the fixture's quote universe and the default liquidity
+  profile, so it must be re-measured if either moves. Test-only; no production
+  code changed.
 
 ### Fixed
 

@@ -79,6 +79,14 @@
 //! test proving the ceiling bites. See `BENCH.md`, PB-3's "Per-step allocation"
 //! block, for the measurement and the budget derivation.
 //!
+//! **Scope, stated honestly: a gated warm step is a book REFRESH with NO fills.**
+//! The condor opens once at `on_start` and the exit policy never triggers, so
+//! the only fills in the run land at step 0 (the four opens) and at step 63
+//! after the last sample (the four `on_end` closes) — both outside the measured
+//! window. Every warm step in `K..LAST` therefore issues zero orders of its own,
+//! and the ≈ 564 events it allocates are the per-step liquidity reseed alone.
+//! **Per-fill allocation in realistic mode is not covered by this gate.**
+//!
 //! # Test-only `unsafe`
 //!
 //! `ironcondor` itself is `#![forbid(unsafe_code)]`. A counting `GlobalAlloc`
@@ -166,6 +174,11 @@ const STEPS: u32 = 64;
 /// step 1. `K = 8` is well past
 /// that single entry and fully into steady state, so the delta `K..last`
 /// measures only warm per-step bodies.
+///
+/// The realistic gate deliberately shares this `K`, even though the order book
+/// has a longer warm-up of its own (its per-step allocation only plateaus around
+/// step 37). Including that head makes the realistic window average
+/// conservative for a ceiling; see `realistic::REALISTIC_WARM_STEP_BUDGET`.
 const K: usize = 8;
 
 /// The last step index on the tape.
@@ -606,44 +619,71 @@ fn non_triggering_exit() -> ExitPolicy {
 /// does not).
 ///
 /// The headroom exists to absorb upstream patch-level churn and the small
-/// run-to-run jitter documented on [`REALISTIC_JITTER_NUMERATOR`] — **never** a
-/// leak. If this gate starts failing, the answer is to find the new allocation,
-/// not to raise the budget.
+/// run-to-run jitter documented on [`realistic::REALISTIC_GROWTH_NUMERATOR`] —
+/// **never** a leak. If this gate starts failing, the answer is to find the new
+/// allocation, not to raise the budget.
 #[cfg(feature = "orderbook")]
 mod realistic {
     use super::{
-        BacktestConfig, BacktestError, ChainContext, K, LAST, OrderCommand, Path, Strategy, common,
-        real_iron_condor_adapter, sample_with, tail_delta,
+        BacktestConfig, BacktestError, ChainContext, K, LAST, OrderCommand, Path, STEPS, Strategy,
+        common, real_iron_condor_adapter, sample_with, tail_delta,
     };
     use ironcondor::{ExecutionMode, RealisticFill};
 
     /// Per-warm-step allocation-event ceiling for realistic mode.
     ///
-    /// Derived from a measurement on 2026-09-04 (lockfile identity
-    /// `option-chain-orderbook` 0.10.0 / `orderbook-rs` 0.12.1 / `pricelevel`
-    /// 0.9.1, 4-leg condor, seed 42): the steady-state tail delta over the 55
-    /// warm steps `K..LAST` was 30 970–30 996 events across eight processes, i.e.
-    /// **≈ 564 events per warm step**. The budget is that measured count plus
-    /// 25 % headroom, rounded up — the same factor-with-headroom discipline as
-    /// `scripts/bench_gate.sh`. The measurement therefore sits at ~80 % of this
-    /// ceiling.
+    /// Derived from a measurement on 2026-09-04 (macOS 26.6.2 arm64, rustc
+    /// 1.97.0; lockfile identity `option-chain-orderbook` 0.10.0 / `orderbook-rs`
+    /// 0.12.1 / `pricelevel` 0.9.1; 4-leg condor, seed 42): the steady-state tail
+    /// delta over the 55 warm steps `K..LAST` was **30 969–31 019 events observed
+    /// over 24 runs**, i.e. **≈ 564 events per warm step**. The budget is that
+    /// measured count plus 25 % headroom, rounded up — the same
+    /// factor-with-headroom discipline as `scripts/bench_gate.sh`. The
+    /// measurement therefore sits at ~80 % of this ceiling. CI runs the gate on
+    /// `ubuntu-24.04`, which has **not** been measured separately; the counts are
+    /// code-path determined and the headroom is expected to cover the difference.
+    ///
+    /// **564 is the window average, not the plateau.** `K = 8` is shared with the
+    /// naive gate and sits inside the book's own warm-up head: the per-step count
+    /// starts at ≈ 662 events at step 1 and only settles to a ≈ 555 plateau from
+    /// about step 37. Including that head makes the average conservative for a
+    /// ceiling, and it is also what produces the window asymmetry the linearity
+    /// check has to account for (see [`REALISTIC_GROWTH_NUMERATOR`]).
+    ///
+    /// **The number is a function of the fixture — re-measure if either input
+    /// moves.** The per-step cost is one liquidity reseed ladder per contract per
+    /// side: `common::condor_rows` puts 4 quotes on the tape and
+    /// `LiquidityProfile::depth_levels` defaults to 5, so the plan is nominally
+    /// `4 × 2 × (1 + 5) = 48` reseed orders plus 48 cancels per step (a ladder
+    /// stops early if a level's size rounds to zero). Changing the fixture's
+    /// quote universe or the default profile changes the measured count, and this
+    /// budget must then be re-measured rather than scaled.
     const REALISTIC_WARM_STEP_BUDGET: usize = 705;
 
-    /// Linearity tolerance numerator: the two half-window deltas may differ by
-    /// at most [`REALISTIC_JITTER_NUMERATOR`] / [`REALISTIC_JITTER_DENOMINATOR`]
-    /// of the first window.
+    /// Growth tolerance numerator: the second half-window may exceed the first
+    /// by at most [`REALISTIC_GROWTH_NUMERATOR`] /
+    /// [`REALISTIC_GROWTH_DENOMINATOR`] of the first window.
     ///
-    /// Justified by measurement, not chosen for comfort. Across eight processes
-    /// the second half sat 2.47 %–2.77 % **below** the first (the book's warm-up
-    /// decay: the per-step count falls from ≈ 660 early to a ≈ 555 plateau), and
-    /// each half-window itself varied by ≤ 0.25 % between processes because the
-    /// upstream lock-free structures allocate a slightly different number of
-    /// events per run. 5 % covers the worst observed spread with ~1.8× margin
-    /// while still catching a leak, which by definition makes the **second**
-    /// window grow without bound rather than settle.
-    const REALISTIC_JITTER_NUMERATOR: usize = 5;
-    /// Denominator of the linearity tolerance; see [`REALISTIC_JITTER_NUMERATOR`].
-    const REALISTIC_JITTER_DENOMINATOR: usize = 100;
+    /// **One-sided on purpose.** A *shrinking* second window is never a leak, so
+    /// only growth is bounded. Across eight runs the second half measured
+    /// 2.47 %–2.77 % **below** the first — the book's warm-up decay, the per-step
+    /// count falling from ≈ 660 early to a ≈ 555 plateau — so the observed value
+    /// of `second - first` is always negative and a two-sided check would both
+    /// hide a leak behind that decay and fire falsely wherever the decay runs
+    /// longer.
+    ///
+    /// **Why 2 % and not less.** The only noise the one-sided form has to absorb
+    /// is the run-to-run jitter of a single window, measured at ≤ 0.25 % (the
+    /// upstream allocation count is not reproducible run to run — see
+    /// [`REALISTIC_WARM_STEP_BUDGET`] and `BENCH.md`), plus any residual reversal
+    /// of the decay profile on other hardware. 2 % is 8× that jitter — enough
+    /// that CI cannot flake — while
+    /// still firing on ≈ 11 extra events per step in the second half. It is a
+    /// 4× tightening of the effective leak sensitivity versus the two-sided 5 %
+    /// it replaces, which needed ≈ 7.7 % of growth to fire at all.
+    const REALISTIC_GROWTH_NUMERATOR: usize = 2;
+    /// Denominator of the growth tolerance; see [`REALISTIC_GROWTH_NUMERATOR`].
+    const REALISTIC_GROWTH_DENOMINATOR: usize = 100;
 
     /// Deliberate per-step allocations injected by [`BadStepMany`].
     ///
@@ -651,6 +691,20 @@ mod realistic {
     /// margin far wider than the measured run-to-run jitter, so the negative
     /// test can never flip on upstream churn. 400 is ~2.8× that headroom.
     const EXCESS_ALLOCS_PER_STEP: usize = 400;
+
+    /// Slope of [`BadStepGrowing`]: it allocates `GROWING_ALLOCS_SLOPE *
+    /// step_index` boxes at step `step_index`, so the injected cost **grows with
+    /// step count** — the shape of a real leak, as opposed to [`BadStepMany`]'s
+    /// constant-per-step excess.
+    ///
+    /// Sized so the probe clears the tolerance by construction, not by luck. The
+    /// two 27-step windows receive `slope * 567` and `slope * 1323` injected
+    /// events (the sums of their step indices), a difference of `slope * 756`. At
+    /// slope 8 that is 6048 injected events of growth, which the baseline decay
+    /// nets down to a measured **5635–5645** against a tolerance of **399–400**
+    /// — roughly 14× the margin, so the probe stays decisive even if the upstream
+    /// baseline shifts.
+    const GROWING_ALLOCS_SLOPE: usize = 8;
 
     /// The naive [`common::condor_config`] fixture switched to realistic fills —
     /// the only difference between the two gates' configuration.
@@ -694,7 +748,7 @@ mod realistic {
         // A `Vec<u64>` would be one allocation for the whole step; this test
         // needs EXCESS_ALLOCS_PER_STEP separate allocation events.
         #[allow(clippy::vec_box)]
-        scratch: Vec<Box<u64>>,
+        scratch: Vec<Box<usize>>,
     }
 
     impl<S: Strategy> BadStepMany<S> {
@@ -728,7 +782,7 @@ mod realistic {
         ) -> Result<(), BacktestError> {
             self.scratch.clear();
             for value in 0..EXCESS_ALLOCS_PER_STEP {
-                self.scratch.push(Box::new(value as u64));
+                self.scratch.push(Box::new(value));
             }
             std::hint::black_box(&self.scratch);
             self.inner.on_snapshot(ctx, out)
@@ -763,16 +817,11 @@ mod realistic {
         );
     }
 
-    /// LINEARITY. The tail is a steady state, not a slow leak: the allocation
-    /// delta over the second half of the warm window must match the delta over
-    /// the first half within the measured tolerance. A leak grows step over step
-    /// and makes the second window strictly larger; the measured book instead
-    /// settles slightly *below* the first window.
-    #[test]
-    fn test_realistic_warm_step_allocation_is_flat_across_the_tail() {
-        let samples = sample_over_movefeed_realistic(real_iron_condor_adapter());
-        // Two disjoint windows of identical length, so the counts compare
-        // directly without a per-step division.
+    /// Split the warm window into two **disjoint windows of identical length**
+    /// and return `(window_len, first, second)` — the allocation-event deltas
+    /// over each. Equal lengths so the counts compare directly, with no per-step
+    /// division and no rounding.
+    fn half_windows(samples: &[usize]) -> (usize, usize, usize) {
         let half = (LAST - K) / 2;
         let (Some(&first_lo), Some(&first_hi), Some(&second_lo), Some(&second_hi)) = (
             samples.get(K),
@@ -788,18 +837,39 @@ mod realistic {
         ) else {
             panic!("cumulative allocation samples must be monotonically non-decreasing");
         };
+        (half, first, second)
+    }
+
+    /// The one-sided growth budget the second window must stay within, as a
+    /// fraction of the first; see [`REALISTIC_GROWTH_NUMERATOR`].
+    fn growth_tolerance(first: usize) -> usize {
         let Some(tolerance) = first
-            .checked_mul(REALISTIC_JITTER_NUMERATOR)
-            .map(|scaled| scaled.div_ceil(REALISTIC_JITTER_DENOMINATOR))
+            .checked_mul(REALISTIC_GROWTH_NUMERATOR)
+            .map(|scaled| scaled.div_ceil(REALISTIC_GROWTH_DENOMINATOR))
         else {
-            panic!("the linearity tolerance fits in usize");
+            panic!("the growth tolerance fits in usize");
         };
-        let spread = first.abs_diff(second);
+        tolerance
+    }
+
+    /// LINEARITY. The tail is a steady state, not a slow leak: the allocation
+    /// delta over the second half of the warm window must not **exceed** the
+    /// delta over the first half by more than [`growth_tolerance`]. The check is
+    /// **one-sided** — a leak grows step over step and makes the second window
+    /// strictly larger, while a smaller second window (which is what the book's
+    /// warm-up decay actually produces) can never be a leak, so bounding the
+    /// downward direction would only manufacture false failures.
+    #[test]
+    fn test_realistic_warm_step_allocation_does_not_grow_across_the_tail() {
+        let samples = sample_over_movefeed_realistic(real_iron_condor_adapter());
+        let (half, first, second) = half_windows(&samples);
+        let tolerance = growth_tolerance(first);
+        let growth = second.saturating_sub(first);
         assert!(
-            spread <= tolerance,
-            "realistic per-step allocation is not flat across the tail: the first {half}-step \
-             window allocated {first} event(s) and the second {second}, a spread of {spread} \
-             against a tolerance of {tolerance}. A growing second window means a per-step leak.",
+            growth <= tolerance,
+            "realistic per-step allocation grows across the tail: the first {half}-step window \
+             allocated {first} event(s) and the second {second}, a growth of {growth} against a \
+             tolerance of {tolerance}. A growing second window means a per-step leak.",
         );
     }
 
@@ -819,6 +889,90 @@ mod realistic {
             delta > ceiling,
             "the realistic gate failed to detect {EXCESS_ALLOCS_PER_STEP} deliberate per-step \
              allocations (tail delta {delta}, ceiling {ceiling})",
+        );
+    }
+
+    /// Wraps a strategy and allocates a number of boxes that **grows with the
+    /// step index** (`GROWING_ALLOCS_SLOPE * step_index`), the shape of a real
+    /// per-step leak: the ceiling alone would not necessarily catch it early,
+    /// but the second half-window allocates markedly more than the first. The
+    /// backing `Vec` is pre-sized for the largest step once at construction and
+    /// cleared in place, so the per-step cost is exactly the boxes.
+    struct BadStepGrowing<S: Strategy> {
+        inner: S,
+        step: usize,
+        // See BadStepMany: the Box is the point, one allocation event each.
+        #[allow(clippy::vec_box)]
+        scratch: Vec<Box<usize>>,
+    }
+
+    impl<S: Strategy> BadStepGrowing<S> {
+        fn new(inner: S) -> Self {
+            let capacity = GROWING_ALLOCS_SLOPE.saturating_mul(STEPS as usize);
+            Self {
+                inner,
+                step: 0,
+                scratch: Vec::with_capacity(capacity),
+            }
+        }
+    }
+
+    impl<S: Strategy> Strategy for BadStepGrowing<S> {
+        fn on_start(
+            &mut self,
+            ctx: &mut ChainContext,
+            out: &mut Vec<OrderCommand>,
+        ) -> Result<(), BacktestError> {
+            self.inner.on_start(ctx, out)
+        }
+        fn exits(
+            &mut self,
+            ctx: &ChainContext,
+            out: &mut Vec<OrderCommand>,
+        ) -> Result<(), BacktestError> {
+            self.inner.exits(ctx, out)
+        }
+        fn on_snapshot(
+            &mut self,
+            ctx: &mut ChainContext,
+            out: &mut Vec<OrderCommand>,
+        ) -> Result<(), BacktestError> {
+            self.scratch.clear();
+            let injected = GROWING_ALLOCS_SLOPE.saturating_mul(self.step);
+            for value in 0..injected {
+                self.scratch.push(Box::new(value));
+            }
+            std::hint::black_box(&self.scratch);
+            self.step = self.step.saturating_add(1);
+            self.inner.on_snapshot(ctx, out)
+        }
+        fn on_end(
+            &mut self,
+            ctx: &mut ChainContext,
+            out: &mut Vec<OrderCommand>,
+        ) -> Result<(), BacktestError> {
+            self.inner.on_end(ctx, out)
+        }
+    }
+
+    /// NEGATIVE (proves the LINEARITY assertion bites). An allocation cost that
+    /// grows with the step index — a leak's shape — makes the second half-window
+    /// exceed the first by far more than [`growth_tolerance`], so the one-sided
+    /// check above would fail on a real leak. This test PASSES by confirming the
+    /// bad case is detected.
+    #[test]
+    fn test_growing_per_step_allocations_break_the_realistic_linearity_check() {
+        let samples =
+            sample_over_movefeed_realistic(BadStepGrowing::new(real_iron_condor_adapter()));
+        let (half, first, second) = half_windows(&samples);
+        let tolerance = growth_tolerance(first);
+        let growth = second.saturating_sub(first);
+        assert!(
+            growth > tolerance,
+            "the linearity check failed to detect a per-step allocation growing at \
+             {GROWING_ALLOCS_SLOPE} event(s) per step index: the first {half}-step window \
+             allocated {first} event(s) and the second {second} (growth {growth}, tolerance \
+             {tolerance})",
         );
     }
 }
