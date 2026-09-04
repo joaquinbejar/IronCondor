@@ -47,7 +47,8 @@
 //! # DEVIATIONS from the v0.7.0-era spec (for architect review)
 //!
 //! The pinned [`docs/specs/option-chain-orderbook.md`] describes v0.7.0; the
-//! resolved crate is **0.9.1**. Two deliberate deviations:
+//! resolved crate is **0.10.0** (its `book.rs`, the whole seam this module
+//! touches, is byte-identical to 0.9.1). Two deliberate deviations:
 //!
 //! 1. **Capture via `add_limit_order_full`, not
 //!    `arm_trade_capture`/`last_trade_result`.** The `_full` methods (0.8.0+)
@@ -69,7 +70,7 @@
 //! # optionstratlib version shim (for architect review)
 //!
 //! `OptionOrderBook::new(symbol, OptionStyle)` takes an
-//! `optionstratlib::OptionStyle` **by value**, and the published crate (0.9.1)
+//! `optionstratlib::OptionStyle` **by value**, and the published crate (0.10.0)
 //! pins optionstratlib `^0.18` while `ironcondor` is on 0.21. The resolver
 //! keeps two optionstratlib copies; this module names the 0.18 `OptionStyle`
 //! (aliased [`ObOptionStyle`]) **only** to construct leaf books, converting from

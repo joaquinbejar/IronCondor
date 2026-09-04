@@ -22,7 +22,8 @@ crate-type = ["rlib", "cdylib"]
 [features]
 # default — engine + naive execution + historical feeds.
 default = []
-# orderbook — realistic execution via option-chain-orderbook (v0.2, #22).
+# orderbook — realistic execution via option-chain-orderbook (landed in this
+# crate's v0.2 milestone, #22; the crate pin itself is in `[dependencies]`).
 # Pulls the matching engine + the optionstratlib 0.18 boundary shim (see the
 # `[dependencies]` audit notes). Absent from the default build.
 orderbook = ["dep:option-chain-orderbook", "dep:optionstratlib_ob"]
