@@ -67,6 +67,18 @@
 //! trip this very gate. A zero per-step delta is therefore direct evidence that
 //! no such call runs on the steady-state step path.
 //!
+//! # Realistic mode is gated too — at a ceiling, not at zero (#127)
+//!
+//! Everything above describes the **naive** step body, whose gate is an exact
+//! zero. Realistic fills route every order through the upstream
+//! `option-chain-orderbook` matching engine, so their warm step allocates by
+//! construction (≈ 564 events/step, measured). The `realistic` module at the
+//! bottom of this file — behind `--features orderbook` — reuses the same
+//! harness with `RealisticFill` in place of `NaiveFill` and gates that path at a
+//! **measured per-step ceiling** plus a **linearity** assertion, with a negative
+//! test proving the ceiling bites. See `BENCH.md`, PB-3's "Per-step allocation"
+//! block, for the measurement and the budget derivation.
+//!
 //! # Test-only `unsafe`
 //!
 //! `ironcondor` itself is `#![forbid(unsafe_code)]`. A counting `GlobalAlloc`
@@ -85,8 +97,8 @@ use std::rc::Rc;
 
 use ironcondor::{
     BacktestConfig, BacktestEngine, BacktestError, ChainContext, ChainSnapshot, DataFeed,
-    DataSourceSpec, NaiveFill, OptStratAdapter, OrderCommand, OrderIntent, ParquetFeed,
-    PositionAction, Quantity, ResourceLimits, Strategy, TapeMeta, TimeInForce,
+    DataSourceSpec, ExecutionModel, NaiveFill, OptStratAdapter, OrderCommand, OrderIntent,
+    ParquetFeed, PositionAction, Quantity, ResourceLimits, Strategy, TapeMeta, TimeInForce,
 };
 use optionstratlib::simulation::ExitPolicy;
 use optionstratlib::strategies::IronCondor;
@@ -394,13 +406,37 @@ impl Strategy for BadStep {
 /// cumulative allocation-count samples (one per step, recorded at each
 /// `on_snapshot` start).
 fn sample_over_movefeed<S: Strategy>(inner: S) -> Vec<usize> {
+    sample_with(
+        config,
+        |cfg| NaiveFill::new(cfg.slippage.clone(), cfg.fees),
+        inner,
+    )
+}
+
+/// The shared measurement harness behind every sampler in this file: write the
+/// canonical condor fixture into a fresh tempdir, build the config with
+/// `make_config` and the fill model with `make_execution`, then run `inner`
+/// (wrapped in a [`SamplingStrategy`]) over the alloc-free [`MoveFeed`] view of
+/// that fixture. Returns the per-step cumulative allocation-count samples (one
+/// per step, recorded at each `on_snapshot` start).
+///
+/// Parameterising the execution model is what lets the naive gate and the
+/// realistic budget gate share one tempdir/feed/config plumbing, so the two
+/// measurements differ **only** in the fill model under test.
+fn sample_with<S, X, C, E>(make_config: C, make_execution: E, inner: S) -> Vec<usize>
+where
+    S: Strategy,
+    X: ExecutionModel,
+    C: FnOnce(&Path) -> BacktestConfig,
+    E: FnOnce(&BacktestConfig) -> X,
+{
     let Ok(dir) = tempfile::tempdir() else {
         panic!("create a tempdir for the fixture");
     };
     let path = dir.path().join("condor_chain.parquet");
     let feed = move_feed(&path);
-    let cfg = config(&path);
-    let execution = NaiveFill::new(cfg.slippage.clone(), cfg.fees);
+    let cfg = make_config(&path);
+    let execution = make_execution(&cfg);
 
     // Pre-size the sample buffer BEFORE the run so recording never allocates.
     let samples: Rc<[Cell<usize>]> = (0..STEPS).map(|_| Cell::new(0)).collect();
@@ -552,4 +588,237 @@ fn test_parquet_feed_snapshot_handoff_is_one_alloc_per_step_outside_the_body() {
 /// exercises the exit seam's repricing path (matching `common::run_condor`).
 fn non_triggering_exit() -> ExitPolicy {
     ExitPolicy::TimeSteps(1_000_000)
+}
+
+// --- realistic mode: the measured-ceiling budget gate (#127) ------------------
+
+/// The realistic fill model's per-step allocation gate.
+///
+/// Realistic mode routes every order through the upstream
+/// `option-chain-orderbook` matching engine, so its warm step **cannot** be
+/// zero-allocation the way the naive step is: each per-step book reseed calls
+/// `OptionOrderBook::add_limit_order_full`, which returns an owned `TradeResult`
+/// whose `symbol` `String` heap-allocates upstream even when nothing crosses,
+/// and the matching engine allocates internally per order. Gating realistic mode
+/// at zero would be a lie, so it is gated at a **measured ceiling** instead:
+/// the tail must stay under a per-step budget derived from a real measurement
+/// plus a fixed headroom, and it must be **flat** (a leak grows; a steady state
+/// does not).
+///
+/// The headroom exists to absorb upstream patch-level churn and the small
+/// run-to-run jitter documented on [`REALISTIC_JITTER_NUMERATOR`] — **never** a
+/// leak. If this gate starts failing, the answer is to find the new allocation,
+/// not to raise the budget.
+#[cfg(feature = "orderbook")]
+mod realistic {
+    use super::{
+        BacktestConfig, BacktestError, ChainContext, K, LAST, OrderCommand, Path, Strategy, common,
+        real_iron_condor_adapter, sample_with, tail_delta,
+    };
+    use ironcondor::{ExecutionMode, RealisticFill};
+
+    /// Per-warm-step allocation-event ceiling for realistic mode.
+    ///
+    /// Derived from a measurement on 2026-09-04 (lockfile identity
+    /// `option-chain-orderbook` 0.10.0 / `orderbook-rs` 0.12.1 / `pricelevel`
+    /// 0.9.1, 4-leg condor, seed 42): the steady-state tail delta over the 55
+    /// warm steps `K..LAST` was 30 970–30 996 events across eight processes, i.e.
+    /// **≈ 564 events per warm step**. The budget is that measured count plus
+    /// 25 % headroom, rounded up — the same factor-with-headroom discipline as
+    /// `scripts/bench_gate.sh`. The measurement therefore sits at ~80 % of this
+    /// ceiling.
+    const REALISTIC_WARM_STEP_BUDGET: usize = 705;
+
+    /// Linearity tolerance numerator: the two half-window deltas may differ by
+    /// at most [`REALISTIC_JITTER_NUMERATOR`] / [`REALISTIC_JITTER_DENOMINATOR`]
+    /// of the first window.
+    ///
+    /// Justified by measurement, not chosen for comfort. Across eight processes
+    /// the second half sat 2.47 %–2.77 % **below** the first (the book's warm-up
+    /// decay: the per-step count falls from ≈ 660 early to a ≈ 555 plateau), and
+    /// each half-window itself varied by ≤ 0.25 % between processes because the
+    /// upstream lock-free structures allocate a slightly different number of
+    /// events per run. 5 % covers the worst observed spread with ~1.8× margin
+    /// while still catching a leak, which by definition makes the **second**
+    /// window grow without bound rather than settle.
+    const REALISTIC_JITTER_NUMERATOR: usize = 5;
+    /// Denominator of the linearity tolerance; see [`REALISTIC_JITTER_NUMERATOR`].
+    const REALISTIC_JITTER_DENOMINATOR: usize = 100;
+
+    /// Deliberate per-step allocations injected by [`BadStepMany`].
+    ///
+    /// Must exceed the budget's headroom (`705 - 564 = 141` events/step) by a
+    /// margin far wider than the measured run-to-run jitter, so the negative
+    /// test can never flip on upstream churn. 400 is ~2.8× that headroom.
+    const EXCESS_ALLOCS_PER_STEP: usize = 400;
+
+    /// The naive [`common::condor_config`] fixture switched to realistic fills —
+    /// the only difference between the two gates' configuration.
+    fn realistic_config(path: &Path) -> BacktestConfig {
+        let mut config = common::condor_config(path, 42);
+        config.mode = ExecutionMode::Realistic;
+        config
+    }
+
+    /// The realistic analogue of `sample_over_movefeed`: the same [`MoveFeed`],
+    /// the same `K` / `STEPS`, the same [`SamplingStrategy`], with
+    /// [`RealisticFill`] built exactly as the realistic golden builds it
+    /// (`tests/bundle_golden.rs`). Every strike's book is first seeded at step 0,
+    /// which is outside the measured window `K..LAST` by construction.
+    ///
+    /// [`MoveFeed`]: super::MoveFeed
+    /// [`SamplingStrategy`]: super::SamplingStrategy
+    fn sample_over_movefeed_realistic<S: Strategy>(inner: S) -> Vec<usize> {
+        sample_with(
+            realistic_config,
+            |config| {
+                RealisticFill::with_liquidity_profile(
+                    config.fees,
+                    config.marketable_cap_ticks,
+                    config.seed,
+                    config.liquidity_profile,
+                )
+            },
+            inner,
+        )
+    }
+
+    /// Wraps a strategy and allocates [`EXCESS_ALLOCS_PER_STEP`] boxes inside the
+    /// step body, keeping them alive for the whole step — the injected regression
+    /// the negative test proves the realistic ceiling catches. The backing `Vec`
+    /// is pre-sized once at construction and cleared in place each step, so the
+    /// per-step cost is exactly the boxes and nothing else.
+    struct BadStepMany<S: Strategy> {
+        inner: S,
+        // `clippy::vec_box` is exactly backwards here: the `Box` IS the point.
+        // A `Vec<u64>` would be one allocation for the whole step; this test
+        // needs EXCESS_ALLOCS_PER_STEP separate allocation events.
+        #[allow(clippy::vec_box)]
+        scratch: Vec<Box<u64>>,
+    }
+
+    impl<S: Strategy> BadStepMany<S> {
+        fn new(inner: S) -> Self {
+            Self {
+                inner,
+                scratch: Vec::with_capacity(EXCESS_ALLOCS_PER_STEP),
+            }
+        }
+    }
+
+    impl<S: Strategy> Strategy for BadStepMany<S> {
+        fn on_start(
+            &mut self,
+            ctx: &mut ChainContext,
+            out: &mut Vec<OrderCommand>,
+        ) -> Result<(), BacktestError> {
+            self.inner.on_start(ctx, out)
+        }
+        fn exits(
+            &mut self,
+            ctx: &ChainContext,
+            out: &mut Vec<OrderCommand>,
+        ) -> Result<(), BacktestError> {
+            self.inner.exits(ctx, out)
+        }
+        fn on_snapshot(
+            &mut self,
+            ctx: &mut ChainContext,
+            out: &mut Vec<OrderCommand>,
+        ) -> Result<(), BacktestError> {
+            self.scratch.clear();
+            for value in 0..EXCESS_ALLOCS_PER_STEP {
+                self.scratch.push(Box::new(value as u64));
+            }
+            std::hint::black_box(&self.scratch);
+            self.inner.on_snapshot(ctx, out)
+        }
+        fn on_end(
+            &mut self,
+            ctx: &mut ChainContext,
+            out: &mut Vec<OrderCommand>,
+        ) -> Result<(), BacktestError> {
+            self.inner.on_end(ctx, out)
+        }
+    }
+
+    /// THE REALISTIC GATE (build-failing). Driving the real
+    /// `OptStratAdapter<IronCondor>` with [`RealisticFill`] over the alloc-free
+    /// feed, the steady-state tail must stay under
+    /// [`REALISTIC_WARM_STEP_BUDGET`] allocation events per warm step.
+    #[test]
+    fn test_realistic_warm_step_allocation_stays_under_budget() {
+        let samples = sample_over_movefeed_realistic(real_iron_condor_adapter());
+        let delta = tail_delta(&samples);
+        let warm_steps = LAST - K;
+        let Some(ceiling) = REALISTIC_WARM_STEP_BUDGET.checked_mul(warm_steps) else {
+            panic!("the realistic ceiling fits in usize");
+        };
+        assert!(
+            delta <= ceiling,
+            "realistic per-step allocation budget exceeded: {delta} event(s) across the \
+             steady-state tail (step {K}..{LAST}, {warm_steps} warm steps) vs a ceiling of \
+             {ceiling} ({REALISTIC_WARM_STEP_BUDGET}/step). The headroom absorbs upstream \
+             patch-level churn, never a leak — find the new allocation, do not raise the budget.",
+        );
+    }
+
+    /// LINEARITY. The tail is a steady state, not a slow leak: the allocation
+    /// delta over the second half of the warm window must match the delta over
+    /// the first half within the measured tolerance. A leak grows step over step
+    /// and makes the second window strictly larger; the measured book instead
+    /// settles slightly *below* the first window.
+    #[test]
+    fn test_realistic_warm_step_allocation_is_flat_across_the_tail() {
+        let samples = sample_over_movefeed_realistic(real_iron_condor_adapter());
+        // Two disjoint windows of identical length, so the counts compare
+        // directly without a per-step division.
+        let half = (LAST - K) / 2;
+        let (Some(&first_lo), Some(&first_hi), Some(&second_lo), Some(&second_hi)) = (
+            samples.get(K),
+            samples.get(K + half),
+            samples.get(LAST - half),
+            samples.get(LAST),
+        ) else {
+            panic!("samples cover both halves of the warm window");
+        };
+        let (Some(first), Some(second)) = (
+            first_hi.checked_sub(first_lo),
+            second_hi.checked_sub(second_lo),
+        ) else {
+            panic!("cumulative allocation samples must be monotonically non-decreasing");
+        };
+        let Some(tolerance) = first
+            .checked_mul(REALISTIC_JITTER_NUMERATOR)
+            .map(|scaled| scaled.div_ceil(REALISTIC_JITTER_DENOMINATOR))
+        else {
+            panic!("the linearity tolerance fits in usize");
+        };
+        let spread = first.abs_diff(second);
+        assert!(
+            spread <= tolerance,
+            "realistic per-step allocation is not flat across the tail: the first {half}-step \
+             window allocated {first} event(s) and the second {second}, a spread of {spread} \
+             against a tolerance of {tolerance}. A growing second window means a per-step leak.",
+        );
+    }
+
+    /// NEGATIVE (proves the realistic ceiling bites). Injecting
+    /// [`EXCESS_ALLOCS_PER_STEP`] allocations into the step body pushes the tail
+    /// delta above the ceiling, so a real regression of that size would fail the
+    /// gate above. This test PASSES by confirming the bad case is detected.
+    #[test]
+    fn test_deliberate_per_step_allocations_exceed_the_realistic_budget() {
+        let samples = sample_over_movefeed_realistic(BadStepMany::new(real_iron_condor_adapter()));
+        let delta = tail_delta(&samples);
+        let warm_steps = LAST - K;
+        let Some(ceiling) = REALISTIC_WARM_STEP_BUDGET.checked_mul(warm_steps) else {
+            panic!("the realistic ceiling fits in usize");
+        };
+        assert!(
+            delta > ceiling,
+            "the realistic gate failed to detect {EXCESS_ALLOCS_PER_STEP} deliberate per-step \
+             allocations (tail delta {delta}, ceiling {ceiling})",
+        );
+    }
 }
