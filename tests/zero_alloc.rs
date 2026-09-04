@@ -809,6 +809,19 @@ mod realistic {
         let samples = sample_over_movefeed_realistic(real_iron_condor_adapter());
         let delta = tail_delta(&samples);
         let warm_steps = LAST - K;
+        // Opt-in measurement report (`ZERO_ALLOC_REPORT=1`, with `--nocapture`):
+        // the gate is silent on success, so this is how a runner's observed
+        // count reaches `BENCH.md` (the CI `zero-alloc` job sets it). Test-only,
+        // off by default, stderr.
+        if std::env::var_os("ZERO_ALLOC_REPORT").is_some() {
+            eprintln!(
+                "ZERO_ALLOC_REPORT realistic tail_delta={delta} warm_steps={warm_steps} \
+                 per_step={} budget={REALISTIC_WARM_STEP_BUDGET} os={} arch={}",
+                delta / warm_steps,
+                std::env::consts::OS,
+                std::env::consts::ARCH,
+            );
+        }
         let Some(ceiling) = REALISTIC_WARM_STEP_BUDGET.checked_mul(warm_steps) else {
             panic!("the realistic ceiling fits in usize");
         };
