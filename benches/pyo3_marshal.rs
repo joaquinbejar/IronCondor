@@ -91,11 +91,12 @@ use std::cell::RefCell;
 use std::sync::Once;
 use std::time::{Duration, Instant};
 
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 use hdrhistogram::Histogram;
 use ironcondor::python::ironcondor as ic_module;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyModule};
+use std::hint::black_box;
 
 /// Un-recorded warmup marshals before the measured phase.
 const WARMUP: usize = 64;

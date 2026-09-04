@@ -1623,7 +1623,7 @@ mod tests {
 
     use chrono::DateTime;
     use optionstratlib::{ExpirationDate, OptionStyle, Side};
-    use rand_chacha::rand_core::RngCore;
+    use rand_chacha::rand_core::Rng;
     use rust_decimal_macros::dec;
 
     use super::{BacktestEngine, BacktestRun, vwap_cents};

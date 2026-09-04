@@ -52,8 +52,9 @@
 use std::cell::RefCell;
 use std::time::{Duration, Instant};
 
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use hdrhistogram::Histogram;
+use std::hint::black_box;
 
 use ironcondor::{
     PriceCents, Quantity, RawQuote, SimTime, SnapshotMeta, StepIndex, Underlying,

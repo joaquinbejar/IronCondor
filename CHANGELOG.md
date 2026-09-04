@@ -10,6 +10,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Every direct dependency at its latest stable, `optionstratlib` 0.18 → 0.21
+  (2026-09-04).** The refresh moves seven direct requirements across a
+  semver-incompatible boundary — `optionstratlib` 0.18 → 0.21, `rand_chacha`
+  0.3 → 0.10, `sha2` 0.10 → 0.11, `reqwest` 0.12 → 0.13,
+  `option-chain-orderbook` 0.9 → 0.10, and the dev-only `positive` 0.5 → 0.6
+  and `criterion` 0.5 → 0.8 — and the lockfile gains 46 entries and loses 21
+  (`arrow`/`parquet` 59.1 → 59.3 among the in-range moves; the TLS stack swap
+  below accounts for most of the additions). Each bump carries a dated
+  audit note in `Cargo.toml` (what, why, licence, gates), and each claim below
+  was measured rather than assumed:
+
+  - **No table value moved.** All 20 committed Parquet tables were decoded and
+    compared column by column before and after the re-bless: the only column
+    whose bytes changed is `fills.strategy_run_id`; `equity_curve`, `positions`
+    and `greeks_attribution` are byte-identical in every scenario and in the
+    shared conformance fixture. The lockfile bump moves `lockfile_sha256` and
+    therefore every `run_id`, which is why the five frozen bundles are
+    re-blessed — the sanctioned identity-only event.
+  - **`manifest.metrics` changed wire TYPE, not value.** `optionstratlib` 0.21
+    serialises some `backtesting` fields as strings where 0.18 wrote JSON
+    numbers (drawdown durations, holding periods, and the `volatility` /
+    `downside_deviation` ratios). Across the five manifests that is 50 leaf
+    fields: 40 integers now written as the same integer in a string, 10 floats
+    now written as the same value in `Decimal` form (equal to 1e-15). `metrics`
+    is versioned-opaque to consumers by contract ([05 §12.5](docs/05-analytics-and-reporting.md#125-equality-oracle-and-the-metrics-clause)),
+    and ChainView holds it as an opaque `serde_json::Value` excluded from its
+    equality oracle, so no consumer parses those fields; the change is
+    announced here so it is a known fact, not a surprise.
+  - **The seeded RNG stream is identical.** `rand_chacha` 0.10's
+    `seed_from_u64` + `next_u64` produce the same stream as 0.3 (probed: the
+    same four `u64`s for seed 42), so no seeded output moves; `rand_core` 0.10
+    renamed `RngCore` → `Rng`, a two-import change.
+  - **Every `optionstratlib` symbol this crate uses exists unchanged**, with
+    `IronCondor::new` / `ShortStrangle::new` arities identical; `ExpirationDate`
+    0.3's serde form is unchanged (its only diff is a `Positive` API call); and
+    `option-chain-orderbook` 0.10.0's `book.rs` is byte-identical to 0.9.1.
+  - **The `orderbook` shim stays, moved 0.17 → 0.18.** `option-chain-orderbook`
+    0.10.0 still pins `optionstratlib ^0.18`, so the resolver keeps two copies
+    (and two of `positive`, `expiration_date`, `option_type`, `rand_chacha`
+    beneath them); the 30 `duplicate` warnings `cargo deny` prints are that tree.
+    Retiring it needs `option-chain-orderbook` to republish on 0.21.
+  - **`reqwest` 0.13 changes the simulator client's TLS stack — an owner
+    decision, not a rename.** 0.13's `rustls` feature selects `aws-lc-rs` as the
+    crypto provider (`aws-lc-sys`: C + assembly, built through `cmake`) in place
+    of `ring`, and verifies certificates through `rustls-platform-verifier` —
+    the **operating-system trust store** at runtime — in place of a compiled-in
+    Mozilla root bundle, which 0.13 no longer offers at all. Consequences: a host
+    C toolchain and `cmake` are build requirements of the `simulator` feature
+    (the manylinux wheel job now installs `cmake` in its container); a host with
+    no CA store fails TLS where 0.12 succeeded; and the former "pure-Rust TLS,
+    no system OpenSSL" posture is retired for that feature. The default build
+    still links no TLS. The alternatives (holding `reqwest` at 0.12, or a
+    hand-built `rustls` `ClientConfig` with `ring` + `webpki-roots` through
+    `use_preconfigured_tls`) were weighed and declined by the owner.
+
 - **A leg set now resolves a relative `Days(n)` expiry instead of rejecting it
   (#120).** #117 shipped a rejection, which was the honest short-term call: the
   fallback it replaced silently filled a leg at whatever contract shared its
@@ -77,7 +132,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cheap now and expensive after the 1.0 freeze. Inside this repo the whole
   fallout was four `match`es on `BatchRunOutcome` in `tests/scenario_batch.rs`,
   which is an external crate to the library and now handles the unknown case.
-
 
 ### Added
 
@@ -157,16 +211,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- **`RUSTSEC-2026-0235` (`rkyv` 0.7.46) suppressed with a documented note.**
-  The advisory (insufficient archive validation causing out-of-bounds reads,
-  fixed in rkyv 0.8.17) reaches `Cargo.lock` only as an **optional**
-  dependency of `rust_decimal` 1.42.1; no feature combination of this crate
-  enables it, so rkyv is never compiled into the crate, the wheel, or the test
-  binaries (`cargo tree -i rkyv --all-features --target all` prints nothing).
-  `rust_decimal` 1.42.1 is the latest release and still declares rkyv 0.7, so
-  there is no upgrade path; the ignore is mirrored in `.cargo/audit.toml` and
-  `deny.toml` and is dropped as soon as upstream moves to rkyv >= 0.8.17. No
-  dependency, lockfile entry, or compiled code changed.
+- **Zero ignored advisories.** Both long-standing `cargo audit` / `cargo deny`
+  ignores are retired because the crates they excused left the resolved graph
+  with this refresh: `paste` (RUSTSEC-2024-0436, unmaintained) and `rkyv 0.7`
+  (RUSTSEC-2026-0235, only ever reachable through `rust_decimal`'s optional
+  feature). `cargo tree -i <crate> --all-features --target all` prints nothing
+  for either. Both gates are green with `ignore = []`, so a genuinely new
+  advisory in any dependency now fails CI without exception.
+
+
 
 ## [0.5.0] - 2026-07-19
 

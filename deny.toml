@@ -18,35 +18,14 @@
 # Yanked crates are a hard failure — the pinned lockfile must resolve to live
 # crates only.
 yanked = "deny"
-# Ignored advisory 1 of 2. RUSTSEC-2024-0436: `paste 1.0.15` is unmaintained
-# (author archived the repo) — an UNMAINTAINED notice, NOT a vulnerability.
-# It is transitive through optionstratlib's numeric stack
-# (optionstratlib -> statrs -> nalgebra -> simba -> paste) and also via
-# parquet; it cannot be dropped without dropping optionstratlib. `paste` is a
-# stable, widely-used compile-time proc-macro in maintenance-only mode with no
-# known security impact. Revisit when optionstratlib's numeric stack migrates
-# off it (e.g. to `pastey`).
-#
-# Ignored advisory 2 of 2.
-# RUSTSEC-2026-0235: `rkyv 0.7.46` — insufficient archive validation can cause
-# out-of-bounds reads in archives containing `Rc`/`Arc`; fixed in rkyv >= 0.8.17.
-# It reaches `Cargo.lock` ONLY as an OPTIONAL dependency of `rust_decimal`
-# 1.42.1 (that crate's `rkyv` feature), which NO ironcondor feature combination
-# enables: `cargo tree -i rkyv --all-features --target all` prints nothing, so
-# rkyv is never compiled into the crate, the wheel, or the test binaries.
-# cargo-audit scans the LOCKFILE, not the compiled graph, hence the hit. There
-# is no upgrade path today: `rust_decimal` 1.42.1 is the latest release and
-# still declares rkyv 0.7. DROP this ignore as soon as `rust_decimal` ships a
-# release whose optional rkyv is >= 0.8.17.
-#
-# cargo-deny resolves the ACTUAL graph, where rkyv never appears, so it prints
-# `no crate matched advisory criteria` for this id and passes. That warning is
-# the mirror-keeping cost and doubles as evidence for the note above: the entry
-# exists so the two files stay identical, not because cargo-deny needs it.
-#
-# No other advisory is ignored, so a genuinely new vulnerability in compiled
-# code still fails the gate.
-ignore = ["RUSTSEC-2024-0436", "RUSTSEC-2026-0235"]
+# NO advisory is ignored (mirrors .cargo/audit.toml). The two former ignores —
+# `paste` (RUSTSEC-2024-0436) and `rkyv 0.7` (RUSTSEC-2026-0235) — were retired
+# on 2026-09-04 when the optionstratlib 0.18 -> 0.21 refresh dropped both crates
+# from the resolved graph (`cargo tree -i <crate> --all-features --target all`
+# prints nothing). cargo-deny resolves the ACTUAL graph, so an ignore for an
+# absent crate is itself a warning (`advisory-not-detected`); keep this list
+# empty until a real, documented exception exists.
+ignore = []
 
 # ---------------------------------------------------------------------------
 # Licences — explicit permissive allow-list (SPDX). No blanket allow.

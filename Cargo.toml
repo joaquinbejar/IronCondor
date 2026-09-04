@@ -22,8 +22,9 @@ crate-type = ["rlib", "cdylib"]
 [features]
 # default — engine + naive execution + historical feeds.
 default = []
-# orderbook — realistic execution via option-chain-orderbook (v0.2, #22).
-# Pulls the matching engine + the optionstratlib 0.17 boundary shim (see the
+# orderbook — realistic execution via option-chain-orderbook (landed in this
+# crate's v0.2 milestone, #22; the crate pin itself is in `[dependencies]`).
+# Pulls the matching engine + the optionstratlib 0.18 boundary shim (see the
 # `[dependencies]` audit notes). Absent from the default build.
 orderbook = ["dep:option-chain-orderbook", "dep:optionstratlib_ob"]
 # simulator — synthetic chain sessions via OptionChain-Simulator over HTTP.
@@ -46,8 +47,35 @@ simulator = ["dep:reqwest", "dep:tokio"]
 python = ["dep:pyo3"]
 
 [dependencies]
+# DEPENDENCY REFRESH 2026-09-04 (every direct dep at its latest stable). Audit
+# note per CLAUDE.md: what / why / licence / gates.
+#   optionstratlib 0.18 -> 0.21 (MIT). Every symbol this crate uses exists
+#     unchanged (IronCondor::new / ShortStrangle::new arities identical); it
+#     drags rand 0.10, positive 0.6, expiration_date 0.3. The ONLY observable
+#     change is the JSON wire TYPE of some `manifest.metrics` fields (upstream
+#     `backtesting` structs now serialise durations / holding periods and two
+#     ratios as strings): 50 leaf fields across the 5 frozen bundles, all the
+#     same value (40 integers, 10 floats equal to 1e-15). No table value moved.
+#   rand_chacha 0.3 -> 0.10 (MIT/Apache-2.0). `seed_from_u64` + `next_u64`
+#     produce the IDENTICAL stream (probed: same four u64s for seed 42), so no
+#     seeded output moves. rand_core 0.10 renamed `RngCore` -> `Rng` (2 imports).
+#   sha2 0.10 -> 0.11 (MIT/Apache-2.0): same `Digest` API; SHA-256 is SHA-256.
+#   reqwest 0.12 -> 0.13 (MIT/Apache-2.0): NOT a rename — provider ring ->
+#     aws-lc-rs (C, cmake) and trust store bundled-Mozilla -> OS store; see the
+#     reqwest entry below for the owner decision and its consequences.
+#   option-chain-orderbook 0.9 -> 0.10 (MIT): `book.rs` byte-identical; still
+#     pins optionstratlib ^0.18, so the shim below moves 0.17 -> 0.18.
+#   positive 0.5 -> 0.6, criterion 0.5 -> 0.8 (dev-only).
+#   Lockfile: 46 entries added, 21 removed (the TLS stack swap above accounts
+#     for most additions: aws-lc-rs, aws-lc-sys, cmake, rustls-platform-verifier,
+#     rustls-native-certs, security-framework, schannel, openssl-probe, jni …;
+#     `webpki-roots` and `ring` left).
+#   Gates: cargo audit + cargo deny green with an EMPTY ignore list — `paste`
+#   and `rkyv 0.7` both left the graph, so their two long-standing ignores are
+#   retired. The lockfile bump moves `lockfile_sha256` -> every `run_id`, so the
+#   five frozen bundles are re-blessed (identity-only, proven column by column).
 chrono = "0.4"
-optionstratlib = { version = "0.18", default-features = false }
+optionstratlib = { version = "0.21", default-features = false }
 rust_decimal = { version = "1", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
@@ -68,7 +96,7 @@ parquet = { version = "59", default-features = false, features = ["arrow", "snap
 csv = "1"
 # Streaming file sha256 = the tape data-identity for file feeds. Licence:
 # MIT OR Apache-2.0.
-sha2 = "0.10"
+sha2 = "0.11"
 # Structured logging — the repo-mandated logging crate (`rules/global_rules.md`
 # "Logging & Observability"; docs/05 §13 "tracing on write milestones"). Used by
 # the P&L attribution (#31) to emit the advisory `WARN` when a step's residual
@@ -83,12 +111,26 @@ tracing = "0.1"
 # from config.seed so `(seed, config, data)` is byte-reproducible. Never
 # `thread_rng`. `ChaCha8Rng` + its re-exported `rand_core::SeedableRng` are the
 # only surface used; no `rand` facade is pulled. Licence: MIT OR Apache-2.0.
-rand_chacha = { version = "0.3", default-features = false }
+rand_chacha = { version = "0.10", default-features = false }
 # simulator feed transport — feature-gated, absent from the default build.
-# reqwest: pure-Rust rustls TLS (no system OpenSSL, reproducible CI) + json.
-reqwest = { version = "0.12", default-features = false, features = [
+# reqwest 0.13 + rustls + json. OWNER DECISION 2026-09-04 (dependency refresh):
+# reqwest 0.13's `rustls` feature is NOT the 0.12 `rustls-tls` under a new
+# name. It (a) selects `aws-lc-rs` as the crypto provider — `aws-lc-sys` is C +
+# assembly built through `cmake`, so a HOST C TOOLCHAIN AND cmake ARE BUILD
+# REQUIREMENTS for the `simulator` feature (the manylinux wheel job installs
+# cmake in its container; GitHub's ubuntu/macOS runners already have it) — and
+# (b) verifies server certificates through `rustls-platform-verifier`, i.e. the
+# OPERATING SYSTEM TRUST STORE at runtime, not a compiled-in Mozilla root
+# bundle (reqwest 0.13 offers no bundled-roots feature at all). A host with no
+# CA store fails TLS where 0.12 succeeded. Licences: aws-lc-rs ISC AND
+# (Apache-2.0 OR ISC); aws-lc-sys ISC AND (Apache-2.0 OR ISC) AND Apache-2.0 AND
+# MIT AND BSD-3-Clause AND OpenSSL; rustls-platform-verifier and cmake MIT OR
+# Apache-2.0 — all on the deny.toml allow-list, `cargo deny` green. The former
+# "pure-Rust TLS, no system OpenSSL" posture is therefore RETIRED for the
+# simulator feature; the default build still links no TLS at all.
+reqwest = { version = "0.13", default-features = false, features = [
     "json",
-    "rustls-tls",
+    "rustls",
 ], optional = true }
 # tokio: only the pieces the async client + its test harness need.
 tokio = { version = "1", default-features = false, features = [
@@ -114,19 +156,22 @@ serde_json = "1"
 # matching leaf the realistic fill routes through; why — order-book-level fills
 # are the crate differentiator; licence — MIT. `cargo audit` / `cargo deny`
 # stay green (allow-list extended for any new transitive licence).
-option-chain-orderbook = { version = "0.9", default-features = false, optional = true }
-# optionstratlib 0.17 boundary shim — feature `orderbook` only. UNAVOIDABLE
-# version bridge: published `option-chain-orderbook` (0.9.1) pins optionstratlib
-# `^0.17`, while this crate is on optionstratlib 0.18, so the resolver keeps two
-# semver-incompatible optionstratlib copies. `OptionOrderBook::new(symbol,
-# OptionStyle)` takes an `optionstratlib::OptionStyle` **by value** and the crate
-# does not re-export it, so the leaf constructor must be handed the 0.17 type.
-# This renamed dep names that one enum (a trivial `Call`/`Put`) at the seam in
+option-chain-orderbook = { version = "0.10", default-features = false, optional = true }
+# optionstratlib 0.18 boundary shim — feature `orderbook` only. UNAVOIDABLE
+# version bridge: published `option-chain-orderbook` (0.10.0) pins optionstratlib
+# `^0.18`, while this crate is on optionstratlib 0.21, so the resolver keeps two
+# semver-incompatible optionstratlib copies (and, beneath them, two of
+# `positive`, `expiration_date`, `option_type` and `rand_chacha` — the 30
+# `duplicate` warnings cargo-deny reports are exactly this tree, and are
+# warnings, not errors). `OptionOrderBook::new(symbol, OptionStyle)` takes an
+# `optionstratlib::OptionStyle` **by value** and the crate does not re-export
+# it, so the leaf constructor must be handed the 0.18 type. This renamed dep
+# names that one enum (a trivial `Call`/`Put`) at the seam in
 # `src/execution/realistic.rs` and nowhere else; the whole crate otherwise uses
-# optionstratlib 0.18. Licence: MIT. DEVIATION for architect review — remove
-# this shim once `option-chain-orderbook` republishes on optionstratlib 0.18 (or
+# optionstratlib 0.21. Licence: MIT. DEVIATION for architect review — remove
+# this shim once `option-chain-orderbook` republishes on optionstratlib 0.21 (or
 # re-exports `OptionStyle`); see the module docs in `realistic.rs`.
-optionstratlib_ob = { package = "optionstratlib", version = "0.17", default-features = false, optional = true }
+optionstratlib_ob = { package = "optionstratlib", version = "0.18", default-features = false, optional = true }
 # PyO3 — the Rust↔Python FFI layer, feature `python` only (#38, ADR-0005),
 # absent from the default / crates.io build. `abi3-py310` targets the stable
 # ABI from Python 3.10, so ONE `cp310-abi3` wheel serves 3.10+ instead of one
@@ -155,7 +200,7 @@ optionstratlib_ob = { package = "optionstratlib", version = "0.17", default-feat
 pyo3 = { version = "0.29", features = ["abi3-py310"], optional = true }
 
 [dev-dependencies]
-positive = "0.5"
+positive = "0.6"
 proptest = "1"
 rust_decimal_macros = "1"
 serde_json = "1"
@@ -174,7 +219,7 @@ tempfile = "3"
 # `criterion` with `default-features = false` drops the optional
 # `plotters`/HTML-report and `rayon` stacks; `cargo_bench_support` is kept so
 # `cargo bench` still drives the harness. Keeps the added surface minimal.
-criterion = { version = "0.5", default-features = false, features = [
+criterion = { version = "0.8", default-features = false, features = [
     "cargo_bench_support",
 ] }
 hdrhistogram = "7"

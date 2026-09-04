@@ -43,7 +43,7 @@
     "path": "iron_condor.parquet",
     "sha256": ""
   },
-  "lockfile_sha256": "d765e17297f9e56c2f23919305379d1582e6d69948cd4915abbc0db236424bbe",
+  "lockfile_sha256": "818a0d442af234ae6d5fc81654104b0f33b55bb9f5bf7b764a2167622a34d442",
   "metrics": {
     "capital_utilization": {
       "avg_capital_used": "0",
@@ -72,7 +72,7 @@
       "drawdowns": [
         {
           "bottom_date": "2025-06-26T00:00:00",
-          "duration": 7,
+          "duration": "7",
           "magnitude": "0.0005320000000000000292890712",
           "recovery_date": null,
           "recovery_duration": null,
@@ -80,10 +80,10 @@
         }
       ],
       "max_drawdown": "0.0005320000000000000292890712",
-      "max_drawdown_duration": 7,
+      "max_drawdown_duration": "7",
       "recovery_duration": null,
-      "time_to_max_drawdown": 0,
-      "total_underwater_days": 7,
+      "time_to_max_drawdown": "0",
+      "total_underwater_days": "7",
       "underwater_percentage": "1"
     },
     "general_performance": {
@@ -91,13 +91,13 @@
       "avg_gain": null,
       "avg_loss": "-11.65",
       "calmar_ratio": null,
-      "downside_deviation": 0.00010056530019030508,
+      "downside_deviation": "0.0001005653001903050649395999",
       "gain_loss_ratio": null,
       "profit_factor": "0",
       "sharpe_ratio": "-0.4082482904638630172300395315",
       "sortino_ratio": "-0.3779644730092272530974639721",
       "total_return": "-0.000532",
-      "volatility": 0.00009310537625584482,
+      "volatility": "0.0000931053762558448235169689",
       "win_rate": "0"
     },
     "options_metrics": {
@@ -128,7 +128,7 @@
       "value_at_risk_99": null
     },
     "trade_statistics": {
-      "average_holding_period": 7,
+      "average_holding_period": "7",
       "average_trade_return": "-11.65",
       "break_even": 0,
       "call_trades": 2,
@@ -136,10 +136,10 @@
       "largest_win": null,
       "long_trades": 2,
       "losers": 4,
-      "max_holding_period": 7,
-      "median_holding_period": 7,
+      "max_holding_period": "7",
+      "median_holding_period": "7",
       "median_trade_return": "-11.65",
-      "min_holding_period": 7,
+      "min_holding_period": "7",
       "number_of_trades": 4,
       "put_trades": 2,
       "short_trades": 2,
@@ -153,7 +153,7 @@
     "greeks_attribution": 8,
     "positions": 32
   },
-  "run_id": "26e4cfd41484c2488dae3662abd66a612d1913b28d874ced173f4afd66181bfc",
+  "run_id": "b6bbf4f307dc75492d258d5ca8f97c433a4debfbac2c74135005a487959cb49d",
   "schema": "ironcondor.bundle.v1",
   "seed": 42,
   "strategy": {
