@@ -256,11 +256,20 @@ honest, measured cost, not an oversight — so since #127 it is gated at a
   which has **not** been measured separately: allocation-event counts are
   determined by the code path rather than by clock speed, and the 25 % headroom
   is expected to cover any platform difference, but that expectation is an
-  argument, not a measurement.
+  argument, not a measurement. **This is the open gap in this entry**: the
+  `ubuntu-24.04` count should be recorded here once observed. The gate prints
+  nothing on success, so obtaining it needs a one-off run on that image with a
+  temporary print (or a deliberately failing assert) rather than a green CI run.
 - **Not reproducible run to run.** Unlike the naive gate's exact zero, the
-  realistic allocation *count* moves between runs: every warm step differs by
-  roughly ±10 events out of ≈ 560 (≈ 2 % per step), which averages out to a
-  **≈ 0.2 % spread** on the 55-step tail. It is **not** per-process seeding:
+  realistic allocation *count* moves between runs, at both scales, and the two
+  scales were recorded separately. **Per step:** the full 63-step sample series
+  was captured in three processes, and **all 55 warm steps differ** across them,
+  by a median of **6** and at most **14** events out of ≈ 560 (worst case step 12
+  at 583 / 587 / 573). **Per tail:** those same three runs summed to 30 975 /
+  30 982 / 30 991, and the 24-run range above spans 50 events — a **≈ 0.2 %
+  spread**, far narrower than independent per-step noise would give, so the
+  per-step deviations largely cancel rather than accumulate. It is **not**
+  per-process seeding:
   three identical back-to-back runs inside a *single* process gave 30 988 /
   30 980 / 30 984, so address-space layout and per-process hash keying are ruled
   out and the cause is process-global carried state — `crossbeam-epoch`'s global
@@ -531,7 +540,7 @@ does not record new baselines; it wraps this one
 
 ---
 
-## H1 / PB-1 — Zero-steady-state-allocation replay-loop gate (invariant, #19)
+## H1 / PB-1 — Zero-steady-state-allocation replay-loop gate, naive mode (invariant, #19)
 
 This is **not a throughput measurement** — it is an **invariant gate** and is
 recorded here only to distinguish it from the PB-2 baseline above. It gates like

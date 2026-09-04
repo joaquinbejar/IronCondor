@@ -176,7 +176,8 @@ jobs:
       # the SAME `tests/zero_alloc.rs` invariant inside the perf-gate stage so the
       # zero-steady-state-allocation guarantee is reaffirmed alongside the
       # percentile/linearity gates (#51 acceptance criterion). A non-zero per-step
-      # allocation delta fails here too.
+      # allocation delta fails here too. Default features only; the realistic
+      # ceiling gate runs only in the `zero-alloc` job.
       - name: "PB-1 — zero-alloc replay-loop gate (reaffirmation)"
         run: cargo test --test zero_alloc
 

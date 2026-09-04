@@ -75,8 +75,8 @@
 //! construction (≈ 564 events/step, measured). The `realistic` module at the
 //! bottom of this file — behind `--features orderbook` — reuses the same
 //! harness with `RealisticFill` in place of `NaiveFill` and gates that path at a
-//! **measured per-step ceiling** plus a **linearity** assertion, with a negative
-//! test proving the ceiling bites. See `BENCH.md`, PB-3's "Per-step allocation"
+//! **measured per-step ceiling** plus a one-sided **linearity** assertion, with
+//! one negative test per assertion proving each bites. See `BENCH.md`, PB-3's "Per-step allocation"
 //! block, for the measurement and the budget derivation.
 //!
 //! **Scope, stated honestly: a gated warm step is a book REFRESH with NO fills.**
@@ -619,7 +619,7 @@ fn non_triggering_exit() -> ExitPolicy {
 /// does not).
 ///
 /// The headroom exists to absorb upstream patch-level churn and the small
-/// run-to-run jitter documented on [`realistic::REALISTIC_GROWTH_NUMERATOR`] —
+/// run-to-run jitter documented on `REALISTIC_GROWTH_NUMERATOR` below —
 /// **never** a leak. If this gate starts failing, the answer is to find the new
 /// allocation, not to raise the budget.
 #[cfg(feature = "orderbook")]
@@ -674,13 +674,15 @@ mod realistic {
     ///
     /// **Why 2 % and not less.** The only noise the one-sided form has to absorb
     /// is the run-to-run jitter of a single window, measured at ≤ 0.25 % (the
-    /// upstream allocation count is not reproducible run to run — see
+    /// upstream allocation count is not reproducible run to run: recorded
+    /// per-step samples move by a median of 6 and at most 14 events, yet the
+    /// 55-step sum moves far less, so the deviations largely cancel — see
     /// [`REALISTIC_WARM_STEP_BUDGET`] and `BENCH.md`), plus any residual reversal
     /// of the decay profile on other hardware. 2 % is 8× that jitter — enough
     /// that CI cannot flake — while
     /// still firing on ≈ 11 extra events per step in the second half. It is a
-    /// 4× tightening of the effective leak sensitivity versus the two-sided 5 %
-    /// it replaces, which needed ≈ 7.7 % of growth to fire at all.
+    /// 4× tightening of the effective leak sensitivity versus a two-sided 5 %
+    /// form, which would need ≈ 7.7 % of growth to fire at all.
     const REALISTIC_GROWTH_NUMERATOR: usize = 2;
     /// Denominator of the growth tolerance; see [`REALISTIC_GROWTH_NUMERATOR`].
     const REALISTIC_GROWTH_DENOMINATOR: usize = 100;
