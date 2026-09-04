@@ -48,9 +48,13 @@
 //! (write = encode-time build, read = decode target) and removes the previous
 //! duplication where the sort order lived inline in the writer and again in the
 //! reader; the produced Parquet bytes are unchanged.
-//! - Parquet is written with a **pinned codec** ([`Compression::SNAPPY`]) and a
-//!   **pinned `created_by`** string, so the file bytes do not vary with the
-//!   `parquet` crate version or a per-run timestamp.
+//! - Parquet is written with **fully pinned writer settings** (#131): every
+//!   `parquet` setting that affects the byte layout — writer version, codec,
+//!   `created_by`, dictionary on plus its explicit `PLAIN` fallback, the page
+//!   and row-group limits, the write batch size, statistics level and
+//!   truncation lengths, bloom filters off — is named on the builder in
+//!   `writer_properties()`, so the file bytes do not vary with a `parquet`
+//!   default change or a per-run timestamp.
 //! - `run_id` is [`RunId::derive`]d from the reproducibility tuple; the manifest
 //!   is canonical JSON (sorted keys, [`Decimal`](rust_decimal::Decimal)s as
 //!   lossless strings) via a single `serde_json::Value` round-trip.
@@ -98,8 +102,8 @@ use chrono::Utc;
 use optionstratlib::backtesting::ExitReason;
 use optionstratlib::{OptionStyle, Side};
 use parquet::arrow::ArrowWriter;
-use parquet::basic::Compression;
-use parquet::file::properties::WriterProperties;
+use parquet::basic::{Compression, Encoding};
+use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterVersion};
 use sha2::{Digest, Sha256};
 
 use crate::analytics::metrics::Metrics;
@@ -125,6 +129,81 @@ const WRITE_BATCH_ROWS: usize = 8_192;
 /// with the `parquet` crate version (reproducibility,
 /// [docs/05 §11](../../../docs/05-analytics-and-reporting.md#11-atomic-writes-and-determinism)).
 const PARQUET_CREATED_BY: &str = "ironcondor result bundle v1";
+
+// ---------------------------------------------------------------------------
+// Pinned Parquet writer settings (#131)
+//
+// Every `parquet` writer setting that can move the encoded bytes is named
+// explicitly here and set on the builder in `writer_properties()`, pinned to
+// the value that was the crate default when the goldens were blessed. The
+// point is that a `parquet` upgrade which changes one of those defaults can
+// no longer move our bundle bytes silently: the pin holds the old behaviour,
+// and `test_writer_properties_pin_every_layout_setting` fails loudly if a
+// setter or getter is renamed. Two settings are deliberately absent because
+// they are unreachable under this configuration: the bloom-filter position
+// (bloom filters are pinned off) and the Data Page v2 compression-ratio
+// threshold (the writer version is pinned to 1.0, which has no v2 pages).
+// ---------------------------------------------------------------------------
+
+/// Pinned Parquet writer version. 1.0 also fixes the dictionary **fallback**
+/// encoding family: under 2.0 the fallback would become the `DELTA_*` codecs.
+const PARQUET_WRITER_VERSION: WriterVersion = WriterVersion::PARQUET_1_0;
+
+/// Pinned compression codec for every column.
+const PARQUET_COMPRESSION: Compression = Compression::SNAPPY;
+
+/// Pinned dictionary encoding, on for every column that supports it.
+const PARQUET_DICTIONARY_ENABLED: bool = true;
+
+/// Pinned **fallback** encoding used once a dictionary page overflows
+/// [`PARQUET_DICTIONARY_PAGE_SIZE_LIMIT`]. Setting it explicitly takes
+/// precedence over the writer-version-dependent default.
+const PARQUET_FALLBACK_ENCODING: Encoding = Encoding::PLAIN;
+
+/// Pinned dictionary page size limit, in bytes.
+const PARQUET_DICTIONARY_PAGE_SIZE_LIMIT: usize = 1 << 20;
+
+/// Pinned data page size limit, in bytes.
+const PARQUET_DATA_PAGE_SIZE_LIMIT: usize = 1 << 20;
+
+/// Pinned data page row-count limit, in rows.
+const PARQUET_DATA_PAGE_ROW_COUNT_LIMIT: usize = 20_000;
+
+/// Pinned internal write batch size, in rows — the granularity at which the
+/// column writer re-estimates page sizes, so it moves page boundaries.
+const PARQUET_WRITE_BATCH_SIZE: usize = 1024;
+
+/// Pinned maximum row-group row count, in rows.
+const PARQUET_MAX_ROW_GROUP_ROW_COUNT: usize = 1 << 20;
+
+/// Pinned maximum row-group size in bytes — `None` = unlimited, so the row
+/// count above is the only row-group boundary.
+const PARQUET_MAX_ROW_GROUP_BYTES: Option<usize> = None;
+
+/// Pinned statistics level: page-level min/max/null counts.
+const PARQUET_STATISTICS: EnabledStatistics = EnabledStatistics::Page;
+
+/// Pinned page-header statistics: off (statistics live in the column index).
+const PARQUET_WRITE_PAGE_HEADER_STATISTICS: bool = false;
+
+/// Pinned bloom filters: off, so no bloom pages reach the file.
+const PARQUET_BLOOM_FILTER_ENABLED: bool = false;
+
+/// Pinned offset index: enabled (i.e. **not** disabled).
+const PARQUET_OFFSET_INDEX_DISABLED: bool = false;
+
+/// Pinned truncation length for column-index min/max values, in bytes.
+const PARQUET_COLUMN_INDEX_TRUNCATE_LENGTH: Option<usize> = Some(64);
+
+/// Pinned truncation length for statistics min/max values, in bytes.
+const PARQUET_STATISTICS_TRUNCATE_LENGTH: Option<usize> = Some(64);
+
+/// Pinned Arrow-to-Parquet type coercion: off, so the schema is written as the
+/// bundle declares it.
+const PARQUET_COERCE_TYPES: bool = false;
+
+/// Pinned `path_in_schema` in the Thrift column metadata: written.
+const PARQUET_WRITE_PATH_IN_SCHEMA: bool = true;
 
 /// The `ironcondor` crate version — the build identity's `code_version` hashed
 /// into `run_id` and recorded in the manifest.
@@ -326,12 +405,43 @@ fn write_manifest(manifest: &Manifest, path: &Path) -> Result<(), BacktestError>
 // batches with pinned writer properties.
 // ---------------------------------------------------------------------------
 
-/// The pinned Parquet writer properties — a fixed codec and `created_by`, so two
-/// identical runs produce byte-identical files (no per-run metadata).
+/// The pinned Parquet writer properties.
+///
+/// **The rule: every `parquet` setting that affects the byte layout is named
+/// here.** Each one is set explicitly, to the value that was the crate default
+/// when the goldens were blessed, so a `parquet` version bump that changes a
+/// default cannot move our bundle bytes silently — and a renamed setter breaks
+/// the build instead of the contract. Nothing per-run enters the file: the
+/// codec and `created_by` are fixed, and the only wall-clock value in the whole
+/// system (`created_utc`) lives in the JSON manifest, never in Parquet metadata
+/// ([docs/02 §7](../../../docs/02-engine-architecture.md#7-determinism-and-reproducibility),
+/// [docs/05 §11](../../../docs/05-analytics-and-reporting.md#11-atomic-writes-and-determinism)).
+///
+/// The two settings not pinned here are unreachable under this configuration:
+/// the bloom-filter position (bloom filters are off) and the Data Page v2
+/// compression-ratio threshold (the writer version is 1.0).
 fn writer_properties() -> WriterProperties {
     WriterProperties::builder()
-        .set_compression(Compression::SNAPPY)
+        .set_writer_version(PARQUET_WRITER_VERSION)
+        .set_compression(PARQUET_COMPRESSION)
         .set_created_by(PARQUET_CREATED_BY.to_string())
+        .set_dictionary_enabled(PARQUET_DICTIONARY_ENABLED)
+        .set_encoding(PARQUET_FALLBACK_ENCODING)
+        .set_dictionary_page_size_limit(PARQUET_DICTIONARY_PAGE_SIZE_LIMIT)
+        .set_data_page_size_limit(PARQUET_DATA_PAGE_SIZE_LIMIT)
+        .set_data_page_row_count_limit(PARQUET_DATA_PAGE_ROW_COUNT_LIMIT)
+        .set_write_batch_size(PARQUET_WRITE_BATCH_SIZE)
+        .set_max_row_group_row_count(Some(PARQUET_MAX_ROW_GROUP_ROW_COUNT))
+        .set_max_row_group_bytes(PARQUET_MAX_ROW_GROUP_BYTES)
+        .set_statistics_enabled(PARQUET_STATISTICS)
+        .set_write_page_header_statistics(PARQUET_WRITE_PAGE_HEADER_STATISTICS)
+        .set_bloom_filter_enabled(PARQUET_BLOOM_FILTER_ENABLED)
+        .set_offset_index_disabled(PARQUET_OFFSET_INDEX_DISABLED)
+        .set_column_index_truncate_length(PARQUET_COLUMN_INDEX_TRUNCATE_LENGTH)
+        .set_statistics_truncate_length(PARQUET_STATISTICS_TRUNCATE_LENGTH)
+        .set_coerce_types(PARQUET_COERCE_TYPES)
+        .set_write_path_in_schema(PARQUET_WRITE_PATH_IN_SCHEMA)
+        .set_content_defined_chunking(None)
         .build()
 }
 
@@ -1107,6 +1217,197 @@ mod tests {
         assert_eq!(
             exit_reason_str(&ExitReason::Other("end_of_data".to_string())),
             "end_of_data"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Pinned Parquet writer settings (#131)
+    // -----------------------------------------------------------------------
+
+    /// Reads every pinned setting back off the built [`WriterProperties`] and
+    /// compares it with the constant it was pinned to. This is the guard the
+    /// pin exists for: a `parquet` bump that renames a setter breaks the build,
+    /// and one that silently changes a default without renaming anything fails
+    /// here rather than moving the bundle bytes.
+    #[test]
+    fn test_writer_properties_pin_every_layout_setting() {
+        use parquet::schema::types::ColumnPath;
+
+        use super::{
+            PARQUET_BLOOM_FILTER_ENABLED, PARQUET_COERCE_TYPES,
+            PARQUET_COLUMN_INDEX_TRUNCATE_LENGTH, PARQUET_COMPRESSION,
+            PARQUET_DATA_PAGE_ROW_COUNT_LIMIT, PARQUET_DATA_PAGE_SIZE_LIMIT,
+            PARQUET_DICTIONARY_ENABLED, PARQUET_DICTIONARY_PAGE_SIZE_LIMIT,
+            PARQUET_FALLBACK_ENCODING, PARQUET_MAX_ROW_GROUP_BYTES,
+            PARQUET_MAX_ROW_GROUP_ROW_COUNT, PARQUET_OFFSET_INDEX_DISABLED, PARQUET_STATISTICS,
+            PARQUET_STATISTICS_TRUNCATE_LENGTH, PARQUET_WRITE_BATCH_SIZE,
+            PARQUET_WRITE_PAGE_HEADER_STATISTICS, PARQUET_WRITE_PATH_IN_SCHEMA,
+            PARQUET_WRITER_VERSION, writer_properties,
+        };
+
+        let props = writer_properties();
+        // A column that was never named individually, so every getter resolves
+        // through the pinned defaults.
+        let col = ColumnPath::from("any_column");
+
+        assert_eq!(props.writer_version(), PARQUET_WRITER_VERSION);
+        assert_eq!(props.compression(&col), PARQUET_COMPRESSION);
+        assert_eq!(props.created_by(), super::PARQUET_CREATED_BY);
+        assert_eq!(props.dictionary_enabled(&col), PARQUET_DICTIONARY_ENABLED);
+        assert_eq!(props.encoding(&col), Some(PARQUET_FALLBACK_ENCODING));
+        assert_eq!(
+            props.dictionary_page_size_limit(),
+            PARQUET_DICTIONARY_PAGE_SIZE_LIMIT
+        );
+        assert_eq!(props.data_page_size_limit(), PARQUET_DATA_PAGE_SIZE_LIMIT);
+        assert_eq!(
+            props.data_page_row_count_limit(),
+            PARQUET_DATA_PAGE_ROW_COUNT_LIMIT
+        );
+        assert_eq!(props.write_batch_size(), PARQUET_WRITE_BATCH_SIZE);
+        assert_eq!(
+            props.max_row_group_row_count(),
+            Some(PARQUET_MAX_ROW_GROUP_ROW_COUNT)
+        );
+        assert_eq!(props.max_row_group_bytes(), PARQUET_MAX_ROW_GROUP_BYTES);
+        assert_eq!(props.statistics_enabled(&col), PARQUET_STATISTICS);
+        assert_eq!(
+            props.write_page_header_statistics(&col),
+            PARQUET_WRITE_PAGE_HEADER_STATISTICS
+        );
+        assert_eq!(
+            props.bloom_filter_properties(&col).is_some(),
+            PARQUET_BLOOM_FILTER_ENABLED,
+            "bloom filters are pinned off, so no column carries bloom properties"
+        );
+        assert_eq!(props.offset_index_disabled(), PARQUET_OFFSET_INDEX_DISABLED);
+        assert_eq!(
+            props.column_index_truncate_length(),
+            PARQUET_COLUMN_INDEX_TRUNCATE_LENGTH
+        );
+        assert_eq!(
+            props.statistics_truncate_length(),
+            PARQUET_STATISTICS_TRUNCATE_LENGTH
+        );
+        assert_eq!(props.coerce_types(), PARQUET_COERCE_TYPES);
+        assert_eq!(props.write_path_in_schema(), PARQUET_WRITE_PATH_IN_SCHEMA);
+        assert!(
+            props.content_defined_chunking().is_none(),
+            "content-defined chunking is pinned off"
+        );
+        // Not written by this configuration, so they are not pinned: no
+        // key-value metadata and no sorting columns are set by the writer.
+        assert!(props.key_value_metadata().is_none());
+        assert!(props.sorting_columns().is_none());
+    }
+
+    /// The SHA-256 of the dictionary-overflow fixture written by
+    /// [`test_dictionary_fallback_is_plain_and_byte_stable`].
+    ///
+    /// It moves **only** when `parquet` changes its byte layout under the
+    /// settings pinned in [`writer_properties`] — which is exactly the event
+    /// this issue exists to make loud. Re-blessing it is a one-line edit,
+    /// sanctioned the same way a golden re-bless is: driven by a lockfile
+    /// change, recorded in `docs/SEMVER.md`, and reviewed as a contract move.
+    const DICT_FALLBACK_FIXTURE_SHA256: &str =
+        "aa8b9b2cd79f65010ab171c5d066baae3da2f33da11222142b37c13452b54434";
+
+    /// Rows in the dictionary-overflow fixture. 40 000 distinct 40-byte values
+    /// is ~1.6 MiB of dictionary, comfortably past the 1 MiB dictionary page
+    /// limit, so the column writer is forced onto the fallback encoding.
+    const DICT_FALLBACK_ROWS: usize = 40_000;
+
+    /// Writes a single non-null `Utf8` column of [`DICT_FALLBACK_ROWS`]
+    /// distinct values through the module's own pinned writer path, and
+    /// returns the file bytes.
+    fn write_dict_fallback_fixture(path: &Path) -> Result<Vec<u8>, BacktestError> {
+        use std::sync::Arc;
+
+        use arrow::array::{ArrayRef, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+
+        use super::{close_writer, open_writer, write_batch};
+
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Utf8,
+            false,
+        )]));
+        let values: Vec<String> = (0..DICT_FALLBACK_ROWS)
+            .map(|i| format!("{i:040}"))
+            .collect();
+
+        let mut writer = open_writer(&schema, path)?;
+        for chunk in values.chunks(super::WRITE_BATCH_ROWS) {
+            let array: ArrayRef = Arc::new(StringArray::from_iter_values(chunk));
+            write_batch(&mut writer, &schema, vec![array])?;
+        }
+        close_writer(writer)?;
+        std::fs::read(path).map_err(|e| super::bundle_err("read fixture back", &e))
+    }
+
+    /// The dictionary fallback is `PLAIN` and the bytes are frozen.
+    ///
+    /// Three claims in one fixture: the dictionary really does overflow (the
+    /// chunk carries both `RLE_DICTIONARY` and the fallback), the fallback is
+    /// `PLAIN` and not one of the `DELTA_*` codecs a writer-version bump would
+    /// select, and the produced file is byte-stable run to run and equal to a
+    /// frozen digest.
+    #[test]
+    fn test_dictionary_fallback_is_plain_and_byte_stable() {
+        use parquet::basic::Encoding;
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+        use sha2::{Digest, Sha256};
+
+        let Ok(dir) = tempfile::tempdir() else {
+            panic!("tempdir");
+        };
+        let first_path = dir.path().join("dict_fallback_a.parquet");
+        let second_path = dir.path().join("dict_fallback_b.parquet");
+
+        let Ok(first) = write_dict_fallback_fixture(&first_path) else {
+            panic!("write the first fixture");
+        };
+        let Ok(second) = write_dict_fallback_fixture(&second_path) else {
+            panic!("write the second fixture");
+        };
+        assert_eq!(
+            first, second,
+            "two writes of the same rows under the pinned settings are byte-identical"
+        );
+
+        let Ok(file) = std::fs::File::open(&first_path) else {
+            panic!("open the fixture");
+        };
+        let Ok(reader) = SerializedFileReader::new(file) else {
+            panic!("read the fixture footer");
+        };
+        let metadata = reader.metadata();
+        assert_eq!(
+            metadata.num_row_groups(),
+            1,
+            "{DICT_FALLBACK_ROWS} rows fit in one pinned row group"
+        );
+        let encodings: Vec<Encoding> = metadata.row_group(0).column(0).encodings().collect();
+        assert!(
+            encodings.contains(&Encoding::RLE_DICTIONARY),
+            "the column starts dictionary-encoded, encodings: {encodings:?}"
+        );
+        assert!(
+            encodings.contains(&Encoding::PLAIN),
+            "the dictionary overflowed and fell back to PLAIN, encodings: {encodings:?}"
+        );
+        assert!(
+            !encodings.contains(&Encoding::DELTA_BYTE_ARRAY),
+            "the fallback is never a writer-version-2.0 DELTA codec, encodings: {encodings:?}"
+        );
+
+        let digest = super::to_hex(&Sha256::digest(&first));
+        assert_eq!(
+            digest,
+            DICT_FALLBACK_FIXTURE_SHA256,
+            "the pinned-settings fixture is {} bytes with sha256 {digest}, encodings: {encodings:?}",
+            first.len()
         );
     }
 }

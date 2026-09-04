@@ -8,6 +8,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Every byte-affecting Parquet writer setting is now pinned explicitly.**
+  `writer_properties()` pinned only the compression codec and `created_by`,
+  so the rest of the bundle's byte layout rode on the `parquet` crate's
+  defaults: a minor upgrade that changed the dictionary fallback encoding, a
+  page limit or the statistics level would have moved the bundle bytes with
+  no diff in this repository, which is not what "pinned writer settings"
+  promises in the determinism contract. The builder now names every setting
+  that affects the byte layout — writer version `PARQUET_1_0`, `SNAPPY`, the
+  fixed `created_by`, dictionary on with an explicit `PLAIN` fallback, the
+  dictionary and data page size limits, the data page row-count limit, the
+  write batch size, the row-group limits, page-level statistics with the
+  64-byte truncation lengths, page-header statistics and bloom filters off,
+  the offset index on, Arrow type coercion off, `path_in_schema` written, and
+  content-defined chunking off — each set to the value that was the crate
+  default when the goldens were blessed. The bloom-filter position and the
+  Data Page v2 compression-ratio threshold are deliberately not pinned:
+  neither is reachable with bloom filters off and writer version 1.0.
+  **No bundle byte moved**: all five golden suites pass unchanged without
+  `BLESS=1`, which is the proof the pins equal today's defaults. Two new unit
+  tests guard the pin — one reads every value back off the built properties,
+  so a renamed setter breaks the build and a changed default fails the test;
+  the other writes a fixture whose dictionary deliberately overflows the
+  1 MiB limit, asserts the fallback is `PLAIN` and never a `DELTA_*` codec,
+  and freezes the file's SHA-256. Documented in
+  `docs/02-engine-architecture.md` §7 and `docs/05-analytics-and-reporting.md`
+  §11. (#131)
+
 ### Fixed
 
 - **macOS wheel builds target live GitHub runners.** The `release` workflow
