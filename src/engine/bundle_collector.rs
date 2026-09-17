@@ -19,10 +19,10 @@
 //!
 //! Two **flat** `Vec`s, never a `Vec`-of-`Vec`:
 //!
-//! - [`BundleCollector::fills`] — one [`FillRecord`] per executed fill. Fills are
+//! - `BundleCollector::fills` — one [`FillRecord`] per executed fill. Fills are
 //!   **sparse** (an open/close event, never a warm revaluation-only step), so a
 //!   push happens only on a fill.
-//! - [`BundleCollector::positions`] — one [`PositionSnapshot`] per open leg per
+//! - `BundleCollector::positions` — one [`PositionSnapshot`] per open leg per
 //!   step (plus a terminal row per leg on full close). Pushed once per open leg
 //!   per step, reserved to `step_count × leg_count` once the opening leg count is
 //!   known, exactly like [`crate::engine::substrate`]'s leg buffer.

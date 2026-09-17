@@ -8,12 +8,12 @@
 //!
 //! - [`ExecutionModel`] — the command→fill seam the engine drives
 //!   ([docs/04 §2](../../../docs/04-execution-models.md), [docs/02 §5](../../../docs/02-engine-architecture.md)).
-//! - [`assemble_fill`] — the **single** place a [`Fill`] is stamped with its
+//! - `assemble_fill` — the **single** place a [`Fill`] is stamped with its
 //!   [`ExecutionMode`], its signed `slippage` (via
 //!   [`crate::domain::execution::sign_convention::slippage_cents`], never
 //!   reinvented), and its `fees`. Both modes call it, so the two are
 //!   byte-shape identical and only their values differ.
-//! - [`fee_for_fill`] — the shared fee rule
+//! - `fee_for_fill` — the shared fee rule
 //!   ([docs/04 §10](../../../docs/04-execution-models.md)): `per_contract_cents ×
 //!   quantity` on every fill, plus `per_order_cents` once on the order's first
 //!   fill, integer cents, always `≥ 0`.
@@ -64,7 +64,7 @@ use optionstratlib::Side;
 /// [`ExecutionModel::fill_groups`] and consumed by the engine's fill-correlation
 /// pass, then discarded — it never rides on the [`Fill`] / bundle `FillRecord`,
 /// so the analytics-facing fill report stays byte-shape identical across modes
-/// (exactly the reason `fill_seq` and [`FeeCharge`] live off the domain [`Fill`]).
+/// (exactly the reason `fill_seq` and `FeeCharge` live off the domain [`Fill`]).
 ///
 /// Each `FillGroup` describes one **contiguous run** of fills in the last
 /// `fill` call's `out_fills` produced by the `Submit` at `command_index`:
@@ -121,7 +121,7 @@ pub struct CarryGroup {
 /// ([docs/04 §2](../../../docs/04-execution-models.md)).
 ///
 /// Both modes emit the identical [`Fill`] shape (assembled by
-/// [`assemble_fill`]) so analytics is mode-agnostic — the invariant v0.2
+/// `assemble_fill`) so analytics is mode-agnostic — the invariant v0.2
 /// cross-mode parity leans on.
 pub trait ExecutionModel {
     /// Process the step's `commands` against `snap`, **appending** any

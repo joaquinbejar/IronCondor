@@ -54,7 +54,7 @@ pub enum ScenarioType {
 ///   re-seed never perturbs which synthetic tape a run requests.
 /// - `walk_volatility_factor` / `walk_drift_delta` — the
 ///   [`ScenarioType::StressTest`] parameter-shock knobs, applied **only** to a
-///   [`crate::data::DataSourceSpec::Simulator`] source's walk (see
+///   `crate::data::DataSourceSpec::Simulator` source's walk (see
 ///   [`expand`]); ignored for file feeds, which carry fixed recorded data with
 ///   no walk to shift.
 ///
@@ -416,7 +416,7 @@ const MAX_RUNS: usize = 1_000_000;
 ///
 /// - `config.seed = override.seed.unwrap_or(child_seed(base_seed, i))` — the
 ///   deterministic engine seed, or the override's explicit pin.
-/// - For a [`crate::data::DataSourceSpec::Simulator`] source (feature
+/// - For a `crate::data::DataSourceSpec::Simulator` source (feature
 ///   `simulator`): the walk seed `session.seed` / `data_seed` is set to
 ///   [`child_data_seed`]`(base_seed, i)`, `tape_sha256` is cleared (re-pinned at
 ///   materialisation), and any `walk_volatility_factor` / `walk_drift_delta`

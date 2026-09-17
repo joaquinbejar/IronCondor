@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Dependencies updated to latest stable versions (`arrow`/`parquet` 59 -> 60,
+  `optionstratlib` 0.21.1 in the lockfile). The `lockfile_sha256` build identity
+  changed, so the golden bundles (`tests/golden/*/expected/`) and the conformance
+  fixture (`tests/fixtures/conformance/`) were re-blessed; table values are
+  unchanged, only `run_id`/`lockfile_sha256` moved. Rustdoc intra-doc links to
+  private or feature-gated items were turned into plain code spans so
+  `cargo doc --document-private-items` is warning-free.
+
 ## [0.7.0] - 2026-09-04
 
 ### Added

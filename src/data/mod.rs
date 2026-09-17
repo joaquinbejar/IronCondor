@@ -44,7 +44,7 @@ use crate::data::simulator::CreateSessionRequest;
 /// ([docs/03 §2](../../../docs/03-data-layer.md#2-the-datafeed-trait)).
 ///
 /// `Eq` is **not** derived: the `Simulator` variant embeds a
-/// [`CreateSessionRequest`], whose wire `f64` fields are not `Eq`. The design
+/// `CreateSessionRequest`, whose wire `f64` fields are not `Eq`. The design
 /// pins exactly `Debug + Clone + PartialEq + Serialize + Deserialize`
 /// ([docs/03 §2](../../../docs/03-data-layer.md#2-the-datafeed-trait)).
 // The `Simulator` variant is intentionally larger than the file variants — the

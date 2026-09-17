@@ -137,8 +137,8 @@ thiserror = "2"
 # read and write. `default-features = false` drops parquet's async path
 # (tokio/futures); `arrow` enables the record-batch reader, `snap` the
 # ubiquitous Snappy page codec. Licence: Apache-2.0.
-arrow = { version = "59", default-features = false }
-parquet = { version = "59", default-features = false, features = ["arrow", "snap"] }
+arrow = { version = "60", default-features = false }
+parquet = { version = "60", default-features = false, features = ["arrow", "snap"] }
 # CSV historical feed parser (#27, v0.2 breadth) — a streaming, bounded record
 # reader for the integer-cents per-step chain files. Audit note: what — the CSV
 # parser behind the default-feature `CsvFeed`; why — the CSV feed is v0.2

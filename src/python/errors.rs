@@ -25,15 +25,15 @@
 //! ```
 //!
 //! `IOError` is a Python-3 alias of `OSError`, so `except IOError` and `except
-//! OSError` both catch [`DataError`]/[`BundleError`].
+//! OSError` both catch `DataError`/`BundleError`.
 //!
 //! # Multiple inheritance in PyO3 0.29
 //!
 //! PyO3's `create_exception!` and `PyErr::new_type` each take a **single** base
 //! type, so they build the base and the single-base subclasses
 //! ([`IronCondorError`], [`ExecutionError`], [`StrategyError`], [`EngineError`]).
-//! The three double-based classes ([`ConfigError`], [`DataError`],
-//! [`BundleError`]) cannot: a Python exception needs `(IronCondorError,
+//! The three double-based classes (`ConfigError`, `DataError`,
+//! `BundleError`) cannot: a Python exception needs `(IronCondorError,
 //! ValueError)` / `(IronCondorError, OSError)` as **two** bases. They are built
 //! at module init with Python's `type(name, bases, namespace)` builtin — the
 //! fully-safe, `#![forbid(unsafe_code)]`-clean path that accepts a bases tuple —
@@ -115,15 +115,15 @@ pyo3::create_exception!(
      the FFI boundary."
 );
 
-/// Docstring for [`ConfigError`], created at module init.
+/// Docstring for `ConfigError`, created at module init.
 const CONFIG_ERROR_DOC: &str = "An invalid configuration or input value \
     (BacktestError::Config / InvalidQuantity / CrossedQuote / \
     PriceNotTickAligned). Also a ValueError.";
-/// Docstring for [`DataError`], created at module init.
+/// Docstring for `DataError`, created at module init.
 const DATA_ERROR_DOC: &str = "A data-source, conversion, tape, or session \
     failure (BacktestError::DataIo / Data / Conversion / DataOutOfOrder / \
     TapeTooLarge / Session). Also an OSError (IOError).";
-/// Docstring for [`BundleError`], created at module init.
+/// Docstring for `BundleError`, created at module init.
 const BUNDLE_ERROR_DOC: &str = "A result-bundle write or read-back failure \
     (BacktestError::Bundle). Also an OSError (IOError).";
 

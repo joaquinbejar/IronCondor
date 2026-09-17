@@ -5,7 +5,7 @@
 //! ([CLAUDE.md](../../CLAUDE.md) module boundaries,
 //! [docs/06 §2](../../docs/06-python-bindings.md)). This scaffold (#38) wires
 //! the *shape*, not the API: the `#[pymodule]` entry point plus stub submodules
-//! ([`config`], [`run`], [`bundle`], [`errors`]) that #39/#40 fill in.
+//! (`config`, `run`, `bundle`, `errors`) that #39/#40 fill in.
 //!
 //! ## What the `python` feature gates
 //!
@@ -21,19 +21,19 @@
 //!
 //! ## `__version__` parity
 //!
-//! The module reports [`crate_version`] (`env!("CARGO_PKG_VERSION")`) as
+//! The module reports `crate_version` (`env!("CARGO_PKG_VERSION")`) as
 //! `ironcondor.__version__`, so the Python surface and the crate share **one**
 //! source of truth for the version — parity is structural, never hand-copied
 //! ([docs/06 §9](../../docs/06-python-bindings.md)).
 //!
 //! ## No panic across the FFI boundary (#40)
 //!
-//! Every fallible boundary entry point ([`run::run`], [`bundle::load_bundle`],
-//! the [`bundle::Bundle`] accessors, the fallible [`config`] builders) drives
+//! Every fallible boundary entry point (`run::run`, `bundle::load_bundle`,
+//! the `bundle::Bundle` accessors, the fallible `config` builders) drives
 //! the pure-Rust API — which returns [`Result`]s — and maps every error to its
-//! **typed** Python exception through [`errors::to_pyerr`] (the single mapping
+//! **typed** Python exception through `errors::to_pyerr` (the single mapping
 //! seam) with `?` / `map_err`, never `.unwrap()` / `.expect()`. Each boundary
-//! body is additionally wrapped in [`errors::guard_boundary`], a `catch_unwind`
+//! body is additionally wrapped in `errors::guard_boundary`, a `catch_unwind`
 //! that converts an *unexpected* Rust panic into `ic.EngineError` — so no panic
 //! crosses the boundary, whether foreseen (typed) or not (a bug).
 //!
@@ -48,9 +48,9 @@
 //!
 //! ## What is exposed (and what is deferred)
 //!
-//! #39 fills the working surface: [`config::PyBacktestConfig`] (Python
-//! `BacktestConfig`) with integer-cents builders, [`run::run`], and
-//! [`bundle::Bundle`] with lazy DataFrame accessors + [`bundle::load_bundle`].
+//! #39 fills the working surface: `config::PyBacktestConfig` (Python
+//! `BacktestConfig`) with integer-cents builders, `run::run`, and
+//! `bundle::Bundle` with lazy DataFrame accessors + `bundle::load_bundle`.
 //! The exposed surface is a **Parquet** source and the **iron condor** strategy.
 //! A CSV source is still a deferred composition-root dispatch, so no `data_csv`
 //! builder exists. A short strangle and an explicit leg set are **not**: since

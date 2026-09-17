@@ -23,7 +23,7 @@ use crate::error::BacktestError;
 /// mis-scales cash by a factor.
 ///
 /// Deserialisation is routed through [`InstrumentSpec::new`] via the private
-/// [`InstrumentSpecWire`] `try_from` target, so a wire `tick_size_cents` /
+/// `InstrumentSpecWire` `try_from` target, so a wire `tick_size_cents` /
 /// `contract_multiplier` of `0` is a typed [`BacktestError::Conversion`] — the
 /// derived-`Deserialize` path would otherwise set the public fields directly and
 /// bypass the zero guard. In-crate construction always goes through
