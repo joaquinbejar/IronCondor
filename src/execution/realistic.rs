@@ -18,25 +18,25 @@
 //! marketable-limit conversion, submission + per-level fill capture, and the
 //! `option_chain_orderbook::Error` → [`BacktestError`] mapping. Per-strike book
 //! **seeding from a snapshot** (#023) and queue/impact goldens (#024) build on
-//! top; the **between-snapshot refresh** (#025, [`RealisticFill::refresh_books`])
+//! top; the **between-snapshot refresh** (#025, `RealisticFill::refresh_books`)
 //! rebuilds the seeded liquidity every step and captures refresh-generated fills;
 //! the mode switch (#026) is next. [`RealisticFill::seed_maker_limit`] and
-//! [`RealisticFill::next_maker_order_id`] are the seeding primitives #023
+//! `RealisticFill::next_maker_order_id` are the seeding primitives #023
 //! consumes.
 //!
 //! # Both modes emit the identical [`Fill`] shape
 //!
-//! Every fill is stamped by the shared [`assemble_fill`] exactly as the naive
+//! Every fill is stamped by the shared `assemble_fill` exactly as the naive
 //! model's is, so a naive fill and a realistic fill of the same intent are
 //! byte-shape identical and only their values differ. A marketable order that
 //! walks several price levels yields **one [`Fill`] per level** (each at that
 //! level's executed price and size), the first carrying the once-per-order fee
-//! ([`FeeCharge::FirstFill`]) and every later level only per-contract fees
-//! ([`FeeCharge::LaterFill`]) — this is `LaterFill`'s first production use.
+//! (`FeeCharge::FirstFill`) and every later level only per-contract fees
+//! (`FeeCharge::LaterFill`) — this is `LaterFill`'s first production use.
 //!
 //! # Determinism
 //!
-//! `OrderId`s come from **seeded [`Id::Sequential`] counters**, never
+//! `OrderId`s come from **seeded `Id::Sequential` counters**, never
 //! `Id::new`/`new_uuid` (which are random —
 //! [rules/global_rules.md](../../../rules/global_rules.md) "Determinism"). Leaf
 //! books live in a `BTreeMap` (never a `HashMap`), submission order is fixed,
@@ -46,7 +46,7 @@
 //!
 //! # DEVIATIONS from the v0.7.0-era spec (for architect review)
 //!
-//! The pinned [`docs/specs/option-chain-orderbook.md`] describes 0.11.0, the
+//! The pinned `docs/specs/option-chain-orderbook.md` describes 0.11.0, the
 //! resolved crate (its published `src/` tree is byte-identical to 0.10.0, whose
 //! `book.rs` — the whole seam this module touches — was in turn byte-identical
 //! to 0.9.1). Two deliberate deviations:
@@ -902,7 +902,7 @@ impl ExecutionModel for RealisticFill {
     /// appends any refresh-generated fills of resting strategy limits the reseed
     /// crosses — **before** the step's own command fills — so a resting order the
     /// market moved onto fills exactly once, in this step, ahead of the new
-    /// intents. See [`Self::refresh_books`].
+    /// intents. See `Self::refresh_books`.
     ///
     /// **`Cancel`/`Replace` are live (#110).** A `Cancel` resolves the engine
     /// [`OrderId`] through the id bridge and cancels the resting order in its
@@ -917,8 +917,8 @@ impl ExecutionModel for RealisticFill {
     ///
     /// # Errors
     ///
-    /// Propagates every error from [`Self::refresh_books`],
-    /// [`Self::fill_submit`], and [`Self::cancel_resting`], and returns
+    /// Propagates every error from `Self::refresh_books`,
+    /// `Self::fill_submit`, and `Self::cancel_resting`, and returns
     /// [`BacktestError::Execution`] when `submit_ids` under-covers the step's
     /// `Submit`/`Replace` commands.
     fn fill(

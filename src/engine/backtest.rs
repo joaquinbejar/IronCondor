@@ -992,7 +992,7 @@ struct PendingEntry {
 
 struct CloseReasons {
     /// One past the last exit-policy close index — closes below it are the
-    /// applied [`ExitPolicy`]'s.
+    /// applied `ExitPolicy`'s.
     exits_end: usize,
     /// The first `on_end` (terminal) close index — closes at or after it are
     /// end-of-data closes. Equal to `cmds.len()` on a non-terminal step.
@@ -1093,7 +1093,7 @@ fn aggregate_fills(fills: &[Fill]) -> Result<FillAggregate, BacktestError> {
 /// divisor, ties to the even quotient). The two implementations **must produce
 /// the same cents for the same mathematical value**; the half-to-even tie
 /// branch is locked to the policy by
-/// [`tests::test_vwap_cents_half_to_even_ties_match_money_policy`].
+/// `tests::test_vwap_cents_half_to_even_ties_match_money_policy`.
 ///
 /// # Errors
 ///

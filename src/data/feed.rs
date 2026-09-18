@@ -65,7 +65,7 @@ impl TapeMeta {
     /// allowed and preserved); the non-empty guarantee is established here so
     /// the loop never has to re-check it.
     ///
-    /// The tape's [`StepIndex`](crate::domain::StepIndex) is **0-based and
+    /// The tape's [`StepIndex`] is **0-based and
     /// consecutive** (`+1` per snapshot); this is validated here, in the shared
     /// core every feed funnels through, so a duplicate, reordered, or gapped
     /// `step` can never masquerade as a shorter run (a step equal to a prior one

@@ -223,7 +223,7 @@ const NANOS_PER_DAY: i128 = 86_400_000_000_000;
 /// guarded by `entered`; exit evaluation applies the configured [`ExitPolicy`]
 /// over snapshot-derived scalars. In v0.1 no policy reads `inner`'s repriced
 /// state, so `exits` skips the per-step `OptionChain` rebuild and the reprice of
-/// `inner` (deferred to [`Self::reprice_inner`] until a Greek-driven policy is
+/// `inner` (deferred to `Self::reprice_inner` until a Greek-driven policy is
 /// wired, gated by `policy_reads_inner`).
 ///
 /// # `IronCondor` `Optimizable` bound (resolved)
@@ -694,7 +694,7 @@ impl<S: PositionableStrategy> Strategy for OptStratAdapter<S> {
 ///
 /// # Determinism
 ///
-/// Entry iterates the legs in **canonical** order — [`Self::new`] sorts them by
+/// Entry iterates the legs in **canonical** order — `Self::new` sorts them by
 /// [`LegSpec::canonical_cmp`], the same order [`StrategySpec::canonical`] gives
 /// the `run_id` hash and the manifest — resolves any relative expiry against the
 /// tape anchor, and matches each leg by exact [`ContractKey`] identity.
@@ -1224,7 +1224,7 @@ fn close_command_qty(
 
 /// Total contracts already scheduled for close of `position_id` in `out` — the
 /// checked sum over every `Submit(Close(position_id))` already appended this
-/// step. Lets [`OptStratAdapter::close_all`] flatten only a leg's remaining size
+/// step. Lets `OptStratAdapter::close_all` flatten only a leg's remaining size
 /// (or skip a fully-closed leg) so the terminal step never double-closes (F11).
 ///
 /// # Errors

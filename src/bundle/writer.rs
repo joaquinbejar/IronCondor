@@ -76,9 +76,9 @@
 //!
 //! Each table is encoded in a single O(rows) pass: its wire rows are sorted
 //! through the pinned sort-key helpers, then streamed to Parquet in fixed-size
-//! row-group batches ([`WRITE_BATCH_ROWS`]). Two footprints, kept distinct: the
+//! row-group batches (`WRITE_BATCH_ROWS`). Two footprints, kept distinct: the
 //! **per-batch Arrow encode buffer** is bounded by one batch
-//! ([`WRITE_BATCH_ROWS`]) independent of run length, but each table is first
+//! (`WRITE_BATCH_ROWS`) independent of run length, but each table is first
 //! materialised and sorted into a `Vec` of wire rows, so the writer's **total
 //! peak is O(rows) — linear, not quadratic** (measured #37,
 //! [docs/07 §3](../../../docs/07-performance-and-security.md#3-budgets-design-targets--pending-the-v01-bench-suite)).
@@ -954,7 +954,7 @@ fn i32_from_u32(value: u32) -> Result<i32, BacktestError> {
 }
 
 /// Guard a derived analytic `f64` before it enters a Parquet column — a `NaN` or
-/// `±∞` is a typed error, never written ([`rules/global_rules.md`] float
+/// `±∞` is a typed error, never written (`rules/global_rules.md` float
 /// discipline).
 fn guard_finite(value: f64, column: &str) -> Result<f64, BacktestError> {
     if value.is_finite() {

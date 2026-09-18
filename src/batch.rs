@@ -11,7 +11,7 @@
 //! The **generator** (seed derivation, walk presets, `ScenarioParams → configs`
 //! expansion) is a pure, downward-only function and lives in
 //! [`crate::engine::scenario`]. The **runner** must call the analytics core
-//! ([`crate::run::run_spec_with_feed`]) and the bundle writer
+//! (`crate::run::run_spec_with_feed`) and the bundle writer
 //! ([`crate::bundle::write_bundle`]) — both **upstream** of the engine layer.
 //! Placing it inside `src/engine/` would make the engine import `analytics` /
 //! `bundle`, inverting the layering the module boundaries forbid
@@ -25,7 +25,7 @@
 //!
 //! [`crate::run::run_backtest`] dispatches only a [`DataSourceSpec::Parquet`]
 //! source — its fixed `(config, strategy, exit)` signature cannot open a
-//! [`SimulatorFeed`], because a synthetic session needs the tick grid, the
+//! `SimulatorFeed`, because a synthetic session needs the tick grid, the
 //! per-quote depth, and a network timeout that are deliberately **not** in
 //! [`BacktestConfig`] (adding them would change the manifest / `run_id` /
 //! bundle schema — out of scope here). Those three materialisation inputs are
@@ -33,7 +33,7 @@
 //! they live in [`SimulatorMaterialisation`], which the runner owns. The runner
 //! therefore does the per-run feed dispatch itself — `Parquet → ParquetFeed`,
 //! `Simulator → SimulatorFeed::open` — then delegates the identical run +
-//! analytics + bundle pipeline through the shared [`crate::run::run_spec_with_feed`]
+//! analytics + bundle pipeline through the shared `crate::run::run_spec_with_feed`
 //! core, which builds whichever strategy the spec names (both named kinds and an
 //! explicit [`StrategySpec::Legs`] leg set, #117). `Csv` stays deferred exactly
 //! as `run_backtest` defers it (a typed [`BacktestError::Config`]).

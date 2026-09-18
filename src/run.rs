@@ -117,7 +117,7 @@ pub fn run_backtest(
 /// **already-opened** feed `F` — the spec → strategy factory shared by
 /// [`run_backtest`] (Parquet) and the scenario batch runner
 /// ([`crate::batch::run_scenario_batch`], which opens a [`ParquetFeed`] or a
-/// simulator [`SimulatorFeed`](crate::data::SimulatorFeed) per run).
+/// simulator `SimulatorFeed` per run).
 ///
 /// Every kind goes through the **same** engine seam: the two named kinds wrap a
 /// constructed `optionstratlib` strategy in the generic
@@ -184,7 +184,7 @@ pub(crate) fn run_spec_with_feed<F: DataFeed>(
 /// core whose only callers had already validated: as a public entry point it
 /// takes a raw [`BacktestConfig`] from an arbitrary caller, and skipping the
 /// check would let an over-cap `liquidity_profile.depth_levels` reach the
-/// per-contract seeding loop of a [`RealisticFill`] — a hard resource ceiling
+/// per-contract seeding loop of a `RealisticFill` — a hard resource ceiling
 /// bypassed by a safe-looking call. The cost is one validation per **run**, off
 /// every step path. [`run_backtest`] validates before opening its feed, so it
 /// pays it twice and harmlessly.

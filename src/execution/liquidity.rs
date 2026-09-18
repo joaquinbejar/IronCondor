@@ -32,7 +32,7 @@
 //! a **fixed order** — ascending [`ContractKey`] (the snapshot's `BTreeMap`
 //! iteration order), and within each contract bid side before ask side, touch
 //! before deeper levels — and every seed `OrderId` is drawn from the
-//! seeded-maker range via [`RealisticFill::seed_maker_limit`] (disjoint from
+//! seeded-maker range via `RealisticFill::seed_maker_limit` (disjoint from
 //! strategy ids, #022). So two seedings of the same snapshot produce
 //! byte-identical depth.
 

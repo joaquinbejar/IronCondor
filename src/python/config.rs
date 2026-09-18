@@ -4,7 +4,7 @@
 //! ([docs/06 §4](../../docs/06-python-bindings.md)). Each builder mutates the
 //! wrapper **in place and returns it** for fluent chaining
 //! (`ic.BacktestConfig(...).data_parquet(...).strategy_iron_condor(...)`); the
-//! wrapper carries no business logic — [`BacktestConfig::to_rust`] marshals the
+//! wrapper carries no business logic — `BacktestConfig::to_rust` marshals the
 //! accumulated state into the real Rust config + strategy + exit policy and runs
 //! [`crate::BacktestConfig::validate`] **once, at the boundary**.
 //!
@@ -25,11 +25,11 @@
 //! The **strategy** side is no longer deferred: since #117 `run_backtest`
 //! accepts every [`crate::StrategySpec`] kind, including a short strangle and an
 //! explicit leg set. This wrapper still exposes only
-//! [`BacktestConfig::strategy_iron_condor`], so the missing
+//! `BacktestConfig::strategy_iron_condor`, so the missing
 //! `strategy_short_strangle` / `strategy_legs` builders are a **binding not yet
 //! written**, not a Rust capability that is missing. Keeping the Python surface
 //! to what it genuinely wraps. Both execution modes **do** work
-//! ([`BacktestConfig::execution_naive`] / [`BacktestConfig::execution_realistic`],
+//! (`BacktestConfig::execution_naive` / `BacktestConfig::execution_realistic`,
 //! #26), so both are exposed; realistic mode needs a wheel built with the
 //! `orderbook` feature or [`crate::run_backtest`] returns a typed config error.
 

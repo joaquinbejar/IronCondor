@@ -28,7 +28,7 @@
 //!   expiry anchoring, analytic NaN rejection, and `BTreeMap` assembly. The
 //!   Parquet feed (issue #9) reads integer-cents money directly and reuses
 //!   this same core — there is **no second validation path**.
-//! - [`chain_response_to_snapshot`] is the **DTO-facing** entry (feature
+//! - `chain_response_to_snapshot` is the **DTO-facing** entry (feature
 //!   `simulator`). It performs only the `f64`-dollar price death and the DTO
 //!   field/timestamp parsing the simulator wire shape needs, then delegates
 //!   to the core. Because the simulator's price fields are behind the
@@ -36,7 +36,7 @@
 //!
 //! # Relative expiry
 //!
-//! An [`ExpirationDate::Days(n)`] is resolved to one absolute
+//! An `ExpirationDate::Days(n)` is resolved to one absolute
 //! `expiration_ns` against the tape's **first** timestamp `ts_0`
 //! (`TapeMeta.first_ts`), **not** the current snapshot's `ts`, so a
 //! contract's identity is fixed for its whole lifecycle
