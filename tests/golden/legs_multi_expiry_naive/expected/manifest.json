@@ -1,5 +1,5 @@
 {
-  "code_version": "0.7.0",
+  "code_version": "0.8.0",
   "config": {
     "data_source": {
       "kind": "parquet",
@@ -43,7 +43,7 @@
     "path": "legs_multi_expiry.parquet",
     "sha256": ""
   },
-  "lockfile_sha256": "cdd1db90e2167ab354be7328cc54c7a19f2844cce523d67f6b0e8df5d7c9e1d8",
+  "lockfile_sha256": "e849cee39389430377ab4001720d3aa2606cf387ed52930603b315fac78742c3",
   "metrics": {
     "capital_utilization": {
       "avg_capital_used": "0",
@@ -153,7 +153,7 @@
     "greeks_attribution": 8,
     "positions": 32
   },
-  "run_id": "860155219986c6047041f1fdb4d9212e520cc8467918a68c4439309066c91f7f",
+  "run_id": "f153026e31b03aa00e14f74960e379f60fa51b5a4a5671112378783ca5d6009d",
   "schema": "ironcondor.bundle.v1",
   "seed": 42,
   "strategy": {

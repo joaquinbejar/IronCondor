@@ -1,6 +1,6 @@
 [package]
 name = "ironcondor"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 authors = ["Joaquin Bejar <jb@taunais.com>"]
 description = "High-performance backtesting engine for options trading strategies with order-book-level fill simulation. Built on OptionStratLib."
@@ -93,6 +93,37 @@ python = ["dep:pyo3"]
 #   retired. The lockfile bump moves `lockfile_sha256` -> every `run_id`, so the
 #   five frozen bundles are re-blessed (identity-only, proven column by column).
 
+# DEPENDENCY REFRESH 2026-09-18 (v0.8.0). Audit note per CLAUDE.md: what / why /
+# licence / gates.
+#   option-chain-orderbook 0.11 -> 0.12 (MIT). What: the option-chain matching
+#     leaf the realistic fill routes through. Why: upstream republished on
+#     `orderbook-rs ^0.13` (from ^0.12.1; pricelevel ^0.9 and optionstratlib
+#     ^0.21 unchanged). The published `src/` tree differs from 0.11.0 in TWO
+#     lines of `book.rs`: the bid/ask level counters now read
+#     `levels_with_cumulative_depth(side).count()` instead of `get_bids()` /
+#     `get_asks()` `.len()`, the orderbook-rs 0.13 spelling of the same
+#     quantity. `OptionOrderBook::new`, `OrderId`, `Side`, `TradeResult` and
+#     `Error` (the four symbols `src/execution/realistic.rs` / `src/error.rs`
+#     import) are unchanged, so no code moved here; `cargo check
+#     --all-targets --all-features` compiles the 0.11-era call sites as-is.
+#     Public-dependency rule (docs/SEMVER.md, CHANGELOG 0.7.0): `src/error.rs`
+#     carries `impl From<option_chain_orderbook::Error> for BacktestError`, so
+#     a downstream that co-pins 0.11 with the `orderbook` feature enabled must
+#     move to 0.12 in the same update; this lands in a MINOR (0.7 -> 0.8),
+#     never a patch, even though `cargo semver-checks` (196 pass, 58 skip
+#     against crates.io 0.7.0) sees no change in this crate's own items.
+#   Lockfile (`cargo update`, 11 entries moved, none entered or left by name):
+#     option-chain-orderbook 0.11.0 -> 0.12.0, orderbook-rs 0.12.1 -> 0.13.1,
+#     pricelevel 0.9.1 -> 0.9.2, ulid 1.2.1 -> 3.0.0 (orderbook-rs's id leaf),
+#     positive 0.6.0 -> 0.6.1, expiration_date 0.3.0 -> 0.3.1, option_type
+#     0.3.0 -> 0.3.1, financial_types 0.2.2 -> 0.2.3, pretty-simple-display
+#     0.1.0 -> 0.1.1, cc 1.4.6 -> 1.4.7, find-msvc-tools 0.1.12 -> 0.1.13.
+#     Every requirement in this manifest is unchanged except the one above.
+#   Gates: make pre-push green; cargo audit / cargo deny run in CI. The
+#     lockfile edit moves `lockfile_sha256` -> every `run_id`, and the version
+#     bump moves `code_version`, so the five frozen bundles (four goldens + the
+#     conformance fixture) are re-blessed in this same commit (tests/bundle_golden.rs
+#     §Regenerating the goldens).
 # SHIM RETIREMENT 2026-09-04 (#128). Audit note per CLAUDE.md: what / why /
 # licence / gates.
 #   option-chain-orderbook 0.10 -> 0.11 (MIT). What: the option-chain matching
@@ -206,7 +237,7 @@ serde_json = "1"
 # default build (#22, ADR-0002). `default-features = false` disables its `nats`
 # (async-nats/tokio) and `sequencer` (tokio/journal) optional stacks, so nothing
 # async is pulled and the book is driven in-process/synchronously. Transitive:
-# orderbook-rs ~0.12.1 (special_orders), pricelevel ~0.9, dashmap 6, uuid,
+# orderbook-rs ~0.13 (special_orders), pricelevel ~0.9, dashmap 6, uuid,
 # crossbeam-skiplist — all MIT/Apache-2.0. Since 0.11 it pins
 # `optionstratlib ^0.21`, the same range this crate itself uses, so the seam
 # needs no version bridge (see the SHIM RETIREMENT note above). Audit note:
@@ -214,7 +245,7 @@ serde_json = "1"
 # why — order-book-level fills are the crate differentiator; licence — MIT.
 # `cargo audit` / `cargo deny` stay green (allow-list extended for any new
 # transitive licence).
-option-chain-orderbook = { version = "0.11", default-features = false, optional = true }
+option-chain-orderbook = { version = "0.12", default-features = false, optional = true }
 # PyO3 — the Rust↔Python FFI layer, feature `python` only (#38, ADR-0005),
 # absent from the default / crates.io build. `abi3-py310` targets the stable
 # ABI from Python 3.10, so ONE `cp310-abi3` wheel serves 3.10+ instead of one
