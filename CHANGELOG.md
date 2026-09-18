@@ -8,15 +8,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-09-18
+
 ### Changed
 
+- **`option-chain-orderbook` moves 0.11 -> 0.12 (public dependency, hence a
+  minor).** Upstream republished the matching leaf on `orderbook-rs ^0.13`
+  (from ^0.12.1); its published source differs from 0.11.0 in two lines of
+  `book.rs` (the bid/ask level counters now use orderbook-rs 0.13's
+  `levels_with_cumulative_depth(side).count()`), and every symbol this crate
+  imports (`OptionOrderBook`, `OrderId`, `Side`, `TradeResult`, `Error`) is
+  unchanged, so no code moved here. Because `src/error.rs` carries
+  `impl From<option_chain_orderbook::Error> for BacktestError` under the
+  `orderbook` feature, a downstream that co-pins `option-chain-orderbook` 0.11
+  with that feature enabled must move to 0.12 in the same update; per
+  `docs/SEMVER.md` a public-dependency bump lands in a minor, never a patch,
+  even though `cargo semver-checks` against crates.io 0.7.0 reports no change
+  in this crate's own items (196 pass, 58 skip).
 - Dependencies updated to latest stable versions (`arrow`/`parquet` 59 -> 60,
-  `optionstratlib` 0.21.1 in the lockfile). The `lockfile_sha256` build identity
-  changed, so the golden bundles (`tests/golden/*/expected/`) and the conformance
-  fixture (`tests/fixtures/conformance/`) were re-blessed; table values are
-  unchanged, only `run_id`/`lockfile_sha256` moved. Rustdoc intra-doc links to
-  private or feature-gated items were turned into plain code spans so
-  `cargo doc --document-private-items` is warning-free.
+  `optionstratlib` 0.21.1 in the lockfile; `cargo update` on the release cut
+  also moved `orderbook-rs` 0.12.1 -> 0.13.1, `pricelevel` 0.9.1 -> 0.9.2,
+  `ulid` 1.2.1 -> 3.0.0, `positive` 0.6.0 -> 0.6.1, `expiration_date` 0.3.0 ->
+  0.3.1, `option_type` 0.3.0 -> 0.3.1, `financial_types` 0.2.2 -> 0.2.3,
+  `pretty-simple-display` 0.1.0 -> 0.1.1, `cc` 1.4.6 -> 1.4.7 and
+  `find-msvc-tools` 0.1.12 -> 0.1.13). The `lockfile_sha256` build identity
+  and `code_version` changed, so the golden bundles (`tests/golden/*/expected/`)
+  and the conformance fixture (`tests/fixtures/conformance/`) were re-blessed;
+  table values are unchanged, only `run_id`/`lockfile_sha256`/`code_version`
+  moved. Rustdoc intra-doc links to private or feature-gated items were turned
+  into plain code spans so `cargo doc --document-private-items` is warning-free.
 
 ## [0.7.0] - 2026-09-04
 
@@ -1105,5 +1125,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   yet; `src/lib.rs` carries crate-level docs only. The roadmap begins at
   v0.1.0.
 
-[Unreleased]: https://github.com/joaquinbejar/IronCondor/compare/v0.0.1...HEAD
+[Unreleased]: https://github.com/joaquinbejar/IronCondor/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/joaquinbejar/IronCondor/compare/v0.7.0...v0.8.0
 [0.0.1]: https://github.com/joaquinbejar/IronCondor/releases/tag/v0.0.1
