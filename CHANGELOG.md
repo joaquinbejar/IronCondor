@@ -8,6 +8,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-10-10
+
+### Changed
+
+- **`optionstratlib` moves 0.21 -> 0.22 (public dependency, hence a minor).**
+  0.22 splits the library into component crates behind a facade on
+  `positive` 0.8, `expiration_date` 0.5 and `option_type` 0.5. This crate
+  keeps `default-features = false` and now enables exactly the two
+  capabilities it uses: `backtest` (backtesting results and exit reasons,
+  exit policies and walk types, the `IronCondor` / `ShortStrangle`
+  strategies) and `io` (`OptionChain::load_from_csv`). Every path imported
+  here still resolves in 0.22, so no source line moved. `ExpirationDate`,
+  `OptionStyle`, `Side` and the backtesting types are part of this crate's
+  API, so a downstream must move to optionstratlib 0.22 (and its positive
+  0.8 / expiration_date 0.5 / option_type 0.5 line) in the same update.
+- **`option-chain-orderbook` moves 0.12 -> 0.13** (the `orderbook` feature),
+  republished on optionstratlib 0.22; every symbol imported here is
+  unchanged. It must move together with optionstratlib so the build holds a
+  single optionstratlib.
+- `positive` 0.6 -> 0.8 (dev-dependency). 0.8 removes the `non-zero`
+  feature, which this crate never enabled.
+- The 0.21 monolith's unused dependencies leave the graph, among them
+  `utoipa` 5.5, `prettytable-rs` and `indicatif`. `yoke-derive` 0.8.3, yanked
+  since 0.8.0, moves to 0.8.4 so `cargo audit` and `cargo deny` pass.
+- No backtest result moves. The lockfile and version changed, so the
+  `lockfile_sha256` and `code_version` build identity and therefore every
+  `run_id` moved, and the five frozen bundles (`tests/golden/*/expected/` and
+  `tests/fixtures/conformance/`) were re-blessed: in `fills` every column but
+  `strategy_run_id` is equal, `equity_curve`, `positions` and
+  `greeks_attribution` are byte-identical, and the manifests differ only in
+  `run_id`, `lockfile_sha256` and `code_version`. The bundle format
+  (`ironcondor.bundle.v1`) is unchanged.
+
 ## [0.8.0] - 2026-09-18
 
 ### Changed
@@ -1125,6 +1158,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   yet; `src/lib.rs` carries crate-level docs only. The roadmap begins at
   v0.1.0.
 
-[Unreleased]: https://github.com/joaquinbejar/IronCondor/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/joaquinbejar/IronCondor/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/joaquinbejar/IronCondor/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/joaquinbejar/IronCondor/compare/v0.7.0...v0.8.0
 [0.0.1]: https://github.com/joaquinbejar/IronCondor/releases/tag/v0.0.1
