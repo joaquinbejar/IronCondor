@@ -1,6 +1,6 @@
 [package]
 name = "ironcondor"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2024"
 authors = ["Joaquin Bejar <jb@taunais.com>"]
 description = "High-performance backtesting engine for options trading strategies with order-book-level fill simulation. Built on OptionStratLib."
@@ -52,6 +52,46 @@ simulator = ["dep:reqwest", "dep:tokio"]
 python = ["dep:pyo3"]
 
 [dependencies]
+# DEPENDENCY REFRESH 2026-10-10 (v0.9.0). Audit note per CLAUDE.md: what / why /
+# licence / gates.
+#   optionstratlib 0.21 -> 0.22 (MIT). What: the domain, strategy, simulation
+#     and backtesting library this crate is built on. Why: 0.22 is the split
+#     into component crates behind a facade (`optionstratlib-core`, -math,
+#     -pricing, -simulation, -market, -analytics, -strategies, -backtest), on
+#     positive 0.8 / expiration_date 0.5 / option_type 0.5. With
+#     `default-features = false` the facade exposes only enabled capabilities:
+#     `backtest` (implies strategies, analytics, market, pricing, simulation:
+#     `backtesting::{BacktestResult, ExitReason}`, `simulation::{ExitPolicy,
+#     WalkType, check_exit_policy}`, `strategies::{IronCondor, ShortStrangle}`)
+#     and `io` (`OptionChain::load_from_csv`). Every path this crate imports
+#     still resolves in 0.22, so no source line moved. Public-dependency rule
+#     (docs/SEMVER.md): `ExpirationDate`, `OptionStyle`, `Side` and the
+#     backtesting types are in this crate's API, so a MINOR (0.8 -> 0.9).
+#   option-chain-orderbook 0.12 -> 0.13 (MIT): republished on optionstratlib
+#     0.22 (`pricing` only); `OptionOrderBook`, `OrderId`, `Side`,
+#     `TradeResult`, `Error` unchanged. Must move with optionstratlib so the
+#     graph holds one optionstratlib.
+#   positive 0.6 -> 0.8 (MIT; dev-only): 0.8 removes the `non-zero` feature,
+#     never enabled here.
+#   Lockfile: optionstratlib 0.21.1 -> 0.22.1 plus its eight component crates
+#     (core, math, pricing, simulation, market, analytics, strategies,
+#     backtest) entered; option-chain-orderbook 0.12.0 -> 0.13.0, orderbook-rs
+#     0.13.1 -> 0.15.0, pricelevel 0.9.2 -> 0.10.2, positive 0.6.1 -> 0.8.0,
+#     expiration_date 0.3.1 -> 0.5.0, option_type 0.3.1 -> 0.5.0,
+#     financial_types 0.2.3 -> 0.3.0, uuid 1.26.1 -> 1.28.0, thiserror 1.0.69
+#     left (single 2.0.21), yoke-derive 0.8.3 -> 0.8.4 (0.8.3 was yanked after
+#     v0.8.0; `cargo audit` / `cargo deny` reject a yanked crate). Left the graph with 0.21's monolith: utoipa /
+#     utoipa-gen 5.5, prettytable-rs, term, indicatif, console, unit-prefix,
+#     pretty-simple-display, dirs-next, dirs-sys-next, redox_users, libredox,
+#     encode_unicode, is-terminal, hermit-abi, unicode-width.
+#   Gates: make pre-push green. The lockfile edit moves `lockfile_sha256` and
+#     the version bump moves `code_version`, so every `run_id` moves and the
+#     five frozen bundles (four goldens + the conformance fixture) are
+#     re-blessed in this commit: identity-only, proven column by column
+#     (fills: every column but `strategy_run_id` equal; equity_curve,
+#     positions, greeks_attribution byte-identical; manifest: only `run_id`,
+#     `lockfile_sha256`, `code_version`).
+
 # DEPENDENCY REFRESH 2026-09-04 (v0.6.0) — every direct dep at its latest
 # stable. Audit
 # note per CLAUDE.md: what / why / licence / gates.
@@ -159,7 +199,7 @@ python = ["dep:pyo3"]
 #     proven column by column: only `fills.strategy_run_id` and the manifest
 #     `run_id` / `lockfile_sha256` move).
 chrono = "0.4"
-optionstratlib = { version = "0.21", default-features = false }
+optionstratlib = { version = "0.22", default-features = false, features = ["backtest", "io"] }
 rust_decimal = { version = "1", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
@@ -245,7 +285,7 @@ serde_json = "1"
 # why — order-book-level fills are the crate differentiator; licence — MIT.
 # `cargo audit` / `cargo deny` stay green (allow-list extended for any new
 # transitive licence).
-option-chain-orderbook = { version = "0.12", default-features = false, optional = true }
+option-chain-orderbook = { version = "0.13", default-features = false, optional = true }
 # PyO3 — the Rust↔Python FFI layer, feature `python` only (#38, ADR-0005),
 # absent from the default / crates.io build. `abi3-py310` targets the stable
 # ABI from Python 3.10, so ONE `cp310-abi3` wheel serves 3.10+ instead of one
@@ -274,7 +314,7 @@ option-chain-orderbook = { version = "0.12", default-features = false, optional 
 pyo3 = { version = "0.29", features = ["abi3-py310"], optional = true }
 
 [dev-dependencies]
-positive = "0.6"
+positive = "0.8"
 proptest = "1"
 rust_decimal_macros = "1"
 serde_json = "1"
