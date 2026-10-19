@@ -8,6 +8,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-10-19
+
+### Changed
+
+- **`optionstratlib` moves 0.22 -> 0.23 (public dependency, hence a minor).**
+  0.23's only breaking change is PNG/SVG export (`static_export`), which this
+  crate does not enable; it keeps `default-features = false` with `backtest`
+  and `io`, and every path imported here resolves unchanged, so no source
+  line moved. `BacktestResult`, `ExitReason`, `ExitPolicy`, `OptionChain` and
+  the `IronCondor` / `ShortStrangle` strategies are part of this crate's API
+  and are now 0.23 types, so a downstream must move to optionstratlib 0.23 in
+  the same update. `ExpirationDate`, `OptionStyle`, `Side` and `Positive`
+  keep their identity (`expiration_date` 0.5, `option_type` 0.5, `positive`
+  0.8).
+- **`option-chain-orderbook` moves 0.13 -> 0.14** (the `orderbook` feature):
+  same API as 0.13, republished on optionstratlib 0.23. It must move together
+  with optionstratlib so the build holds a single optionstratlib; a
+  downstream that uses `impl From<option_chain_orderbook::Error> for
+  BacktestError` moves to 0.14 as well.
+- Through optionstratlib's `io` feature, `zip` moves 8.6 -> 9.0 and brings
+  `nix` 0.31 into the lockfile, with `zstd` 0.14, `lzma-rust2` 0.22 and
+  `constant_time_eq` 0.6. Every licence was already allowed by `deny.toml`.
+- No backtest result moves. The lockfile and version changed, so the
+  `lockfile_sha256` and `code_version` build identity and therefore every
+  `run_id` moved, and the five frozen bundles (`tests/golden/*/expected/` and
+  `tests/fixtures/conformance/`) were re-blessed: in `fills` every column but
+  `strategy_run_id` is equal, `equity_curve`, `positions` and
+  `greeks_attribution` are byte-identical, and the manifests differ only in
+  `run_id`, `lockfile_sha256` and `code_version`. The bundle format
+  (`ironcondor.bundle.v1`) is unchanged.
+
+### Security
+
+- `rustls` 0.23.45 -> 0.23.46 in the lockfile (reached through `reqwest` by
+  the `simulator` feature): RUSTSEC-2026-0346, 0347, 0348 and 0349, published
+  2026-10-14, are fixed in 0.23.46 and failed `cargo audit` and `cargo deny`.
+
 ## [0.9.0] - 2026-10-10
 
 ### Changed
@@ -1158,7 +1195,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   yet; `src/lib.rs` carries crate-level docs only. The roadmap begins at
   v0.1.0.
 
-[Unreleased]: https://github.com/joaquinbejar/IronCondor/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/joaquinbejar/IronCondor/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/joaquinbejar/IronCondor/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/joaquinbejar/IronCondor/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/joaquinbejar/IronCondor/compare/v0.7.0...v0.8.0
 [0.0.1]: https://github.com/joaquinbejar/IronCondor/releases/tag/v0.0.1

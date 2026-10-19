@@ -1,6 +1,6 @@
 [package]
 name = "ironcondor"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2024"
 authors = ["Joaquin Bejar <jb@taunais.com>"]
 description = "High-performance backtesting engine for options trading strategies with order-book-level fill simulation. Built on OptionStratLib."
@@ -52,6 +52,40 @@ simulator = ["dep:reqwest", "dep:tokio"]
 python = ["dep:pyo3"]
 
 [dependencies]
+# DEPENDENCY REFRESH 2026-10-19 (v0.10.0). Audit note per CLAUDE.md: what / why /
+# licence / gates.
+#   optionstratlib 0.22 -> 0.23 (MIT). What: the same library, all ten crates of
+#     the family republished at 0.23.0. Why: its only breaking change is PNG/SVG
+#     export (`static_export`, `GraphError`), which this crate does not enable;
+#     pricing, strategies, simulation, market data and backtesting give the same
+#     results as 0.22. Features stay `backtest` + `io`, and every path imported
+#     here resolves unchanged, so no source line moved. Public-dependency rule
+#     (docs/SEMVER.md): `BacktestResult`, `ExitReason`, `ExitPolicy`,
+#     `OptionChain` and the `IronCondor` / `ShortStrangle` strategies reach this
+#     crate's API and are 0.23 types now, so a MINOR (0.9 -> 0.10).
+#     `ExpirationDate`, `OptionStyle`, `Side` and `Positive` are re-exports of
+#     `expiration_date` 0.5, `option_type` 0.5 and `positive` 0.8, unchanged.
+#   option-chain-orderbook 0.13 -> 0.14 (MIT): same API as 0.13, republished on
+#     optionstratlib 0.23; it must move with optionstratlib so the graph holds a
+#     single optionstratlib.
+#   Lockfile: optionstratlib 0.22.1 -> 0.23.0 with its eight component crates;
+#     option-chain-orderbook 0.13.0 -> 0.14.0. Through `optionstratlib-market`'s
+#     `io` feature, zip 8.6.0 -> 9.0.5 (MIT), which brings nix 0.31.3 (MIT, new
+#     entry), zstd 0.13.3 -> 0.14.3, zstd-safe 7.3.0 -> 8.2.0, zstd-sys 2.1.0 ->
+#     2.1.2 (BSD-3-Clause), lzma-rust2 0.16.5 -> 0.22.0 (Apache-2.0) and
+#     constant_time_eq 0.4.2 -> 0.6.1 (CC0-1.0 OR MIT-0 OR Apache-2.0); every
+#     licence is already on the `deny.toml` allow-list. rustls 0.23.45 ->
+#     0.23.46 (via reqwest, `simulator` feature): RUSTSEC-2026-0346 to 0349,
+#     published 2026-10-14, fail `cargo audit` / `cargo deny` on 0.23.45.
+#   Gates: fmt, clippy, the full test suite, doc, `cargo audit` and
+#     `cargo deny` green. The lockfile edit moves `lockfile_sha256` and the
+#     version bump moves `code_version`, so every `run_id` moves and the five
+#     frozen bundles (four goldens + the conformance fixture) are re-blessed in
+#     this commit: identity-only, proven column by column (fills: every column
+#     but `strategy_run_id` equal; equity_curve, positions, greeks_attribution
+#     byte-identical; manifest: only `run_id`, `lockfile_sha256`,
+#     `code_version`).
+
 # DEPENDENCY REFRESH 2026-10-10 (v0.9.0). Audit note per CLAUDE.md: what / why /
 # licence / gates.
 #   optionstratlib 0.21 -> 0.22 (MIT). What: the domain, strategy, simulation
@@ -199,7 +233,7 @@ python = ["dep:pyo3"]
 #     proven column by column: only `fills.strategy_run_id` and the manifest
 #     `run_id` / `lockfile_sha256` move).
 chrono = "0.4"
-optionstratlib = { version = "0.22", default-features = false, features = ["backtest", "io"] }
+optionstratlib = { version = "0.23", default-features = false, features = ["backtest", "io"] }
 rust_decimal = { version = "1", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
@@ -285,7 +319,7 @@ serde_json = "1"
 # why — order-book-level fills are the crate differentiator; licence — MIT.
 # `cargo audit` / `cargo deny` stay green (allow-list extended for any new
 # transitive licence).
-option-chain-orderbook = { version = "0.13", default-features = false, optional = true }
+option-chain-orderbook = { version = "0.14", default-features = false, optional = true }
 # PyO3 — the Rust↔Python FFI layer, feature `python` only (#38, ADR-0005),
 # absent from the default / crates.io build. `abi3-py310` targets the stable
 # ABI from Python 3.10, so ONE `cp310-abi3` wheel serves 3.10+ instead of one
