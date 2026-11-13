@@ -233,10 +233,6 @@
 //! [OrderBook-rs](https://github.com/joaquinbejar/OrderBook-rs) ·
 //! [OptionChain-Simulator](https://github.com/joaquinbejar/OptionChain-Simulator) ·
 //! [ChainView](https://github.com/joaquinbejar/ChainView)
-//!
-//! ## Contact
-//!
-//! Joaquin Bejar — <jb@taunais.com>
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]

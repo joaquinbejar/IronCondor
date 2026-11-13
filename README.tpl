@@ -48,8 +48,8 @@ Repositories by the same author that this project depends on, and repositories t
 
 | Repository | Description |
 |------------|-------------|
-| [Option-Chain-OrderBook](https://github.com/joaquinbejar/Option-Chain-OrderBook) · [crates.io](https://crates.io/crates/option-chain-orderbook) | Option chain order book system (underlying, expiration, strike) built on OrderBook-rs, PriceLevel and OptionStratLib. |
-| [OptionStratLib](https://github.com/joaquinbejar/OptionStratLib) · [crates.io](https://crates.io/crates/optionstratlib) | Options pricing, Greeks, strategies and simulation library. |
-| [positive](https://github.com/joaquinbejar/positive) · [crates.io](https://crates.io/crates/positive) | Type-safe wrapper for guaranteed non-negative Decimal values. *(dev-dependency)* |
+| [Option-Chain-OrderBook](https://github.com/joaquinbejar/Option-Chain-OrderBook) | Option chain order book used to simulate fills against order-book depth during backtests. |
+| [OptionStratLib](https://github.com/joaquinbejar/OptionStratLib) | Options pricing, Greeks and strategy definitions used to build and value the backtested positions. |
+| [positive](https://github.com/joaquinbejar/positive) | Type-safe positive `Decimal` wrapper used for prices, strikes and quantities. |
 
 <!-- related-projects:end -->
